@@ -12,6 +12,7 @@
 - 游戏下载目录默认挂载为 `tmpfs` 内存盘，避免反复写硬盘；下载完成后默认删除目录，再进入下一轮循环。
 - Web 控制台包含实时 Mbps 曲线、10/60 秒均值、今日累计流量和源健康表。
 - Docker Compose 默认使用 macvlan，容器 LAN IP 优先为 `192.168.1.233`，部署脚本会在 `.233-.240` 中自动顺移，网关为 `192.168.1.1`。
+- 多线路支持两种出口方式：`single_ip` 为一个容器 IP 依赖爱快按新建连接数分流；`multi_ip` 会生成与线路数相同数量的 LAN IP，并让公共 HTTP worker 按线路绑定源 IP，便于在爱快中手动配置一对一分流。
 
 ## 快速部署
 
@@ -36,6 +37,28 @@ cd steam-download-pumper
 ```bash
 TARGET_MBPS=800 LINE_COUNT=2 CONNECTIONS_PER_LINE=6 MAX_CONNECTIONS_PER_LINE=12 ./install.sh
 ```
+
+启用多 IP 一对一模式：
+
+```bash
+EGRESS_MODE=multi_ip LINE_COUNT=4 TARGET_MBPS=1600 ./install.sh
+```
+
+脚本会写入类似下面的配置：
+
+```text
+LAN_IP=192.168.1.233
+LAN_IPS=192.168.1.233,192.168.1.234,192.168.1.235,192.168.1.236
+EGRESS_MODE=multi_ip
+```
+
+然后在爱快中按顺序手动做源 IP 到 WAN 的一对一分流，例如 `192.168.1.233 -> wan1`、`192.168.1.234 -> wan2`。如果你想固定 IP 列表，也可以直接传入：
+
+```bash
+EGRESS_MODE=multi_ip LINE_COUNT=4 LAN_IPS=192.168.1.233,192.168.1.234,192.168.1.235,192.168.1.236 ./install.sh
+```
+
+单 IP 模式自动扫描 `192.168.1.233-192.168.1.240`。多 IP 模式会从 `.233` 开始凑齐 `LINE_COUNT` 个地址；当线路数超过 8 时会继续向后取，例如 `.241/.242`，也可以用 `LAN_IPS` 明确指定。
 
 `MAX_CONNECTIONS_PER_LINE` 硬上限为 `12`，用于避免 worker 数无限扩张占用 CPU 和内存。
 
@@ -67,6 +90,8 @@ cp .env.example .env
 
 - `LAN_PARENT`: 宿主机连接局域网的网卡名，例如 `ens18`。
 - `LAN_IP`: 容器局域网 IP，部署脚本会自动选择 `192.168.1.233-192.168.1.240`。
+- `EGRESS_MODE`: `single_ip` 或 `multi_ip`。`single_ip` 使用一个源 IP，交给爱快按新建连接数负载均衡；`multi_ip` 为每条外线准备一个源 IP。
+- `LAN_IPS`: `multi_ip` 模式下的源 IP 列表，数量必须等于 `LINE_COUNT`，第 1 个 IP 也是 Web 控制台访问 IP。
 - `TARGET_MBPS`: 目标下载带宽 Mbps。源池和线路可承载时，60 秒均值目标为该值的 90% 以上。
 - `LINE_COUNT`: 外部线路条数。
 - `CONNECTIONS_PER_LINE`: 每条线路创建多少个 worker。
@@ -131,7 +156,12 @@ docker compose down
 
 Steam 匿名下载不适用于所有游戏。默认 AppID `90` 已在匿名模式下验证可下载；如果你需要下载账号拥有的游戏，需要后续改为账号登录模式并妥善处理 Steam Guard 和凭据。
 
-多线路均衡依赖你的网关/路由器按新建连接分流。容器内会创建多个独立 worker，但最终是否均匀落到各外线由上游设备策略决定。
+多线路均衡有两种使用方式：
+
+- `single_ip`: 只有一个容器源 IP，容器内会创建多个独立 worker，最终是否均匀落到各外线由爱快“新建连接数”策略决定。
+- `multi_ip`: 容器会把 `LAN_IPS` 中的地址加到 macvlan 网卡，公共 HTTP worker 会按线路绑定源 IP。你需要在爱快中手动把这些源 IP 分别绑定到不同 WAN，这种方式更适合追求连续、均匀分流。
+
+`multi_ip` 绑定源 IP 目前作用于默认的 `public_http` 下载模式。`steam_tmpfs` 使用 SteamCMD，不能像 Go `discarder` 一样直接给每个 worker 绑定本地源 IP。
 
 默认验收口径：
 

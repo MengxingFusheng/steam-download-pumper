@@ -5,6 +5,7 @@ import urllib.request
 from http.server import ThreadingHTTPServer
 
 from steam_pumper.web import Handler
+from steam_pumper.web import HTML
 
 
 class DummyController:
@@ -21,6 +22,12 @@ class DummyController:
 
 
 class WebTests(unittest.TestCase):
+    def test_config_form_exposes_egress_mode_and_lan_ips(self):
+        self.assertIn('name="egress_mode"', HTML)
+        self.assertIn('name="lan_ips"', HTML)
+        self.assertIn("单 IP", HTML)
+        self.assertIn("多 IP", HTML)
+
     def test_metrics_and_sources_api_endpoints(self):
         Handler.controller = DummyController()
         server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)

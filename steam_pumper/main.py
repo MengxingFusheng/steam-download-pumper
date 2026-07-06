@@ -7,6 +7,7 @@ import sys
 
 from .config import PumperConfig, save_config
 from .controller import PumperController
+from .networking import apply_lan_ips
 from .web import run_web
 
 
@@ -16,6 +17,7 @@ def main() -> int:
         save_config(config_path, PumperConfig())
     controller = PumperController(config_path)
     logging.basicConfig(level=getattr(logging, controller.cfg.log_level.upper(), logging.INFO), format="%(asctime)s %(levelname)s %(message)s")
+    apply_lan_ips(controller.cfg, controller.log)
 
     def stop(_signum: int, _frame: object) -> None:
         controller.shutdown()

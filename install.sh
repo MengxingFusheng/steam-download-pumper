@@ -103,6 +103,10 @@ ip_available() {
 
 pick_lan_ip() {
   local ip
+  if [ -n "${LAN_IPS:-}" ]; then
+    printf '%s\n' "${LAN_IPS%%,*}"
+    return
+  fi
   if [ -n "${LAN_IP:-}" ]; then
     printf '%s\n' "$LAN_IP"
     return
@@ -118,22 +122,99 @@ pick_lan_ip() {
   exit 1
 }
 
+contains_ip() {
+  local needle="$1"
+  shift
+  local item
+  for item in "$@"; do
+    if [ "$item" = "$needle" ]; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+join_csv() {
+  local IFS=,
+  printf '%s\n' "$*"
+}
+
+normalize_egress_mode() {
+  case "${1:-single_ip}" in
+    single|single_ip|connection_balance|connection_count) printf 'single_ip\n' ;;
+    multi|multi_ip|one_to_one|one-to-one) printf 'multi_ip\n' ;;
+    *)
+      log "EGRESS_MODE 只能是 single_ip 或 multi_ip。"
+      exit 1
+      ;;
+  esac
+}
+
+pick_lan_ips() {
+  local count="$1"
+  local ips=()
+  local ip raw last scan_end min_end provided
+  if [ -n "${LAN_IPS:-}" ]; then
+    raw="${LAN_IPS//[[:space:]]/}"
+    IFS=',' read -r -a provided <<< "$raw"
+    if (( ${#provided[@]} != count )); then
+      log "LAN_IPS 数量必须等于 LINE_COUNT=${count}。"
+      exit 1
+    fi
+    printf '%s\n' "$raw"
+    return
+  fi
+  if [ -n "${LAN_IP:-}" ]; then
+    ips+=("$LAN_IP")
+  fi
+  min_end=$((232 + count))
+  scan_end="${LAN_IP_SCAN_END:-240}"
+  if (( scan_end < min_end )); then
+    scan_end="$min_end"
+  fi
+  for ((last=233; last<=scan_end; last++)); do
+    ip="192.168.1.${last}"
+    if contains_ip "$ip" "${ips[@]}"; then
+      continue
+    fi
+    if ip_available "$ip"; then
+      ips+=("$ip")
+    fi
+    if (( ${#ips[@]} >= count )); then
+      join_csv "${ips[@]:0:count}"
+      return
+    fi
+  done
+  log "无法为 multi_ip 模式找到 ${count} 个可用 IP。可通过 LAN_IPS=ip1,ip2,... 手动指定。"
+  exit 1
+}
+
 write_env() {
-  local parent subnet selected_ip
+  local parent subnet selected_ip selected_ips line_count egress_mode
   parent="${LAN_PARENT:-$(default_parent)}"
   parent="${parent:-ens18}"
   subnet="${LAN_SUBNET:-$(default_subnet "$parent")}"
   subnet="${subnet:-192.168.1.0/24}"
-  selected_ip="$(pick_lan_ip)"
+  line_count="${LINE_COUNT:-2}"
+  egress_mode="$(normalize_egress_mode "${EGRESS_MODE:-single_ip}")"
+  if [ "$egress_mode" = "multi_ip" ] && [ "$line_count" -gt 1 ]; then
+    selected_ips="$(pick_lan_ips "$line_count")"
+    selected_ip="${selected_ips%%,*}"
+  else
+    selected_ip="$(pick_lan_ip)"
+    selected_ips="$selected_ip"
+  fi
 
   cat > .env <<EOF
 LAN_PARENT=${parent}
 LAN_SUBNET=${subnet}
 LAN_GATEWAY=${LAN_GATEWAY:-192.168.1.1}
 LAN_IP=${selected_ip}
+LAN_IPS=${selected_ips}
+EGRESS_MODE=${egress_mode}
 
 TARGET_MBPS=${TARGET_MBPS:-800}
-LINE_COUNT=${LINE_COUNT:-2}
+LINE_COUNT=${line_count}
 CONNECTIONS_PER_LINE=${CONNECTIONS_PER_LINE:-6}
 MAX_CONNECTIONS_PER_LINE=${MAX_CONNECTIONS_PER_LINE:-12}
 RATE_LIMIT_ENABLED=${RATE_LIMIT_ENABLED:-true}
@@ -163,7 +244,15 @@ main() {
   mkdir -p data
   docker compose up -d --build
   selected_ip="$(awk -F= '$1 == "LAN_IP" {print $2}' .env)"
+  egress_mode="$(awk -F= '$1 == "EGRESS_MODE" {print $2}' .env)"
+  selected_ips="$(awk -F= '$1 == "LAN_IPS" {print $2}' .env)"
   log "部署完成: http://${selected_ip}/"
+  if [ "$egress_mode" = "multi_ip" ]; then
+    log "多 IP 一对一模式已启用，IP 列表: ${selected_ips}"
+    log "请在爱快中按顺序将这些源 IP 分别绑定到 wan1..wanN。"
+  else
+    log "单 IP 模式已启用，将依赖爱快按新建连接数分流。"
+  fi
   log "如果宿主机无法访问 macvlan 容器，请用同局域网其他设备打开。"
 }
 

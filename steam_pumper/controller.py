@@ -13,6 +13,7 @@ from urllib.parse import urlparse
 from .config import PumperConfig, load_config, save_config
 from .ikuai import fetch_interfaces_status
 from .metrics import ThroughputTracker, next_worker_count, theoretical_window_bytes
+from .networking import apply_lan_ips
 from .worker import DownloadWorker, SourceEndpoint, WorkerState, bootstrap_steamcmd, build_worker_plan
 
 
@@ -93,7 +94,10 @@ class PumperController:
             merged.update(clean)
             if isinstance(merged.get("app_ids"), str):
                 merged["app_ids"] = [item.strip() for item in merged["app_ids"].split(",") if item.strip()]
+            if isinstance(merged.get("lan_ips"), str):
+                merged["lan_ips"] = [item.strip() for item in merged["lan_ips"].replace("\n", ",").split(",") if item.strip()]
             new_cfg = PumperConfig(**merged).validate()
+            apply_lan_ips(new_cfg, self.log)
             save_config(self.config_path, new_cfg)
             running = bool(self.workers)
             if running:
@@ -253,7 +257,7 @@ class PumperController:
             if spec.worker_id in self.workers:
                 continue
             stop_event = threading.Event()
-            state = WorkerState(worker_id=spec.worker_id, line_index=spec.line_index, target=spec.target)
+            state = WorkerState(worker_id=spec.worker_id, line_index=spec.line_index, target=spec.target, source_ip=spec.source_ip)
             self.worker_states[spec.worker_id] = state
             worker = DownloadWorker(self.cfg, spec, state, stop_event, self.log)
             self.workers[spec.worker_id] = worker

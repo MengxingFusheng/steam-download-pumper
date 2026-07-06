@@ -19,6 +19,7 @@ type options struct {
 	minSessionSeconds    int
 	restartJitterSeconds float64
 	readTimeoutSeconds   int
+	bindIP               string
 	urls                 []string
 }
 
@@ -38,6 +39,7 @@ func parseOptions() options {
 	flag.IntVar(&opts.minSessionSeconds, "min-session-seconds", 300, "minimum intended worker session duration")
 	flag.Float64Var(&opts.restartJitterSeconds, "restart-jitter-seconds", 3, "maximum jitter after each short download")
 	flag.IntVar(&opts.readTimeoutSeconds, "read-timeout-seconds", 30, "HTTP client timeout per request")
+	flag.StringVar(&opts.bindIP, "bind-ip", "", "local IPv4 address to bind outbound connections")
 	flag.Parse()
 	opts.urls = flag.Args()
 	if len(opts.urls) == 0 {
@@ -49,7 +51,7 @@ func parseOptions() options {
 
 func run(ctx context.Context, opts options) error {
 	timeout := time.Duration(opts.readTimeoutSeconds) * time.Second
-	client := newHTTPClient(timeout)
+	client := newHTTPClient(timeout, opts.bindIP)
 	urlIndex := 0
 	failures := 0
 	for {
@@ -84,10 +86,18 @@ func run(ctx context.Context, opts options) error {
 	}
 }
 
-func newHTTPClient(timeout time.Duration) *http.Client {
+func newHTTPClient(timeout time.Duration, bindIP string) *http.Client {
 	dialer := &net.Dialer{
 		Timeout:   timeout,
 		KeepAlive: 30 * time.Second,
+	}
+	if bindIP != "" {
+		parsedIP := net.ParseIP(bindIP)
+		if parsedIP == nil || parsedIP.To4() == nil {
+			fmt.Fprintf(os.Stderr, "invalid bind-ip %q\n", bindIP)
+			os.Exit(2)
+		}
+		dialer.LocalAddr = &net.TCPAddr{IP: parsedIP}
 	}
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 	transport.DialContext = func(ctx context.Context, _network, address string) (net.Conn, error) {

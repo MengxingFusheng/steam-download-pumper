@@ -7,6 +7,8 @@ services:
     networks:
       steam_lan:
         ipv4_address: ${LAN_IP:-192.168.1.233}
+    cap_add:
+      - NET_ADMIN
     dns:
       - 223.5.5.5
       - 119.29.29.29
@@ -32,6 +34,10 @@ services:
       TZ: Asia/Shanghai
       CONFIG_PATH: /data/config.json
       WEB_PORT: "80"
+      LAN_IP: "${LAN_IP:-192.168.1.233}"
+      LAN_IPS: "${LAN_IPS:-}"
+      LAN_SUBNET: "${LAN_SUBNET:-192.168.1.0/24}"
+      EGRESS_MODE: "${EGRESS_MODE:-single_ip}"
       TARGET_MBPS: "${TARGET_MBPS:-900}"
       LINE_COUNT: "${LINE_COUNT:-2}"
       CONNECTIONS_PER_LINE: "${CONNECTIONS_PER_LINE:-12}"

@@ -15,13 +15,21 @@ func TestDownloadOnceDiscardsBodyAndReturnsByteCount(t *testing.T) {
 	}))
 	defer server.Close()
 
-	got, err := downloadOnce(context.Background(), newHTTPClient(5*time.Second), server.URL, "1")
+	got, err := downloadOnce(context.Background(), newHTTPClient(5*time.Second, ""), server.URL, "1")
 	if err != nil {
 		t.Fatalf("downloadOnce returned error: %v", err)
 	}
 
 	if got != 6 {
 		t.Fatalf("downloadOnce bytes = %d, want 6", got)
+	}
+}
+
+func TestNewHTTPClientAcceptsBindIP(t *testing.T) {
+	client := newHTTPClient(5*time.Second, "127.0.0.1")
+
+	if client == nil {
+		t.Fatal("newHTTPClient returned nil")
 	}
 }
 

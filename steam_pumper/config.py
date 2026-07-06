@@ -5,6 +5,7 @@ import os
 import re
 from dataclasses import asdict, dataclass, field
 from datetime import time
+from ipaddress import ip_address
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -54,6 +55,8 @@ class PumperConfig:
     steam_password: str = ""
     steam_guard_code: str = ""
     lan_ip: str = "192.168.1.233"
+    lan_ips: list[str] = field(default_factory=lambda: ["192.168.1.233"])
+    egress_mode: str = "single_ip"
     gateway: str = "192.168.1.1"
     log_level: str = "INFO"
 
@@ -64,6 +67,28 @@ class PumperConfig:
             self.download_mode = "steam_tmpfs"
         if self.line_count < 2 or self.line_count > 10:
             raise ValueError("line_count must be between 2 and 10")
+        self.egress_mode = str(self.egress_mode).strip().lower()
+        if self.egress_mode in {"single", "connection_balance", "connection_count"}:
+            self.egress_mode = "single_ip"
+        elif self.egress_mode in {"multi", "one_to_one", "one-to-one"}:
+            self.egress_mode = "multi_ip"
+        if self.egress_mode not in {"single_ip", "multi_ip"}:
+            raise ValueError("egress_mode must be single_ip or multi_ip")
+        self.lan_ip = str(self.lan_ip).strip()
+        self.lan_ips = [str(ip).strip() for ip in self.lan_ips if str(ip).strip()]
+        if not self.lan_ips:
+            self.lan_ips = [self.lan_ip]
+        self._validate_ipv4(self.lan_ip, "lan_ip")
+        for index, lan_ip in enumerate(self.lan_ips, start=1):
+            self._validate_ipv4(lan_ip, f"lan_ips[{index}]")
+        if len(set(self.lan_ips)) != len(self.lan_ips):
+            raise ValueError("lan_ips must not contain duplicates")
+        if self.egress_mode == "multi_ip":
+            if len(self.lan_ips) != self.line_count:
+                raise ValueError("lan_ips must contain exactly line_count addresses in multi_ip mode")
+            self.lan_ip = self.lan_ips[0]
+        else:
+            self.lan_ips = [self.lan_ip]
         if self.connections_per_line < 1:
             raise ValueError("connections_per_line must be at least 1")
         if self.connections_per_line > MAX_CONNECTIONS_PER_LINE_CAP:
@@ -135,6 +160,15 @@ class PumperConfig:
             raise ValueError(f"{name} must be a valid 24-hour time")
         return time(hour, minute)
 
+    @staticmethod
+    def _validate_ipv4(value: str, name: str) -> None:
+        try:
+            parsed = ip_address(value)
+        except ValueError as exc:
+            raise ValueError(f"{name} must be a valid IPv4 address") from exc
+        if parsed.version != 4:
+            raise ValueError(f"{name} must be a valid IPv4 address")
+
 
 ENV_MAP = {
     "LINE_COUNT": ("line_count", int),
@@ -162,6 +196,8 @@ ENV_MAP = {
     "STEAM_PASSWORD": ("steam_password", str),
     "STEAM_GUARD_CODE": ("steam_guard_code", str),
     "LAN_IP": ("lan_ip", str),
+    "LAN_IPS": ("lan_ips", lambda value: [item.strip() for item in str(value).split(",") if item.strip()]),
+    "EGRESS_MODE": ("egress_mode", str),
     "GATEWAY": ("gateway", str),
     "LOG_LEVEL": ("log_level", str),
 }

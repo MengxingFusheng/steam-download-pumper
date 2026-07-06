@@ -83,6 +83,10 @@ HTML = """<!doctype html>
         <label>外部线路条数 <input name="line_count" type="number" min="2" max="10"></label>
         <label>每条线路连接数 <input name="connections_per_line" type="number" min="1"></label>
         <label>最大每线连接数 <input name="max_connections_per_line" type="number" min="1" max="12"></label>
+        <label>出口 IP 模式
+          <select name="egress_mode"><option value="single_ip">单 IP：新建连接数分流</option><option value="multi_ip">多 IP：一线一 IP</option></select>
+        </label>
+        <label>容器主 IP <input name="lan_ip" placeholder="192.168.1.233"></label>
         <label>是否限速
           <select name="rate_limit_enabled"><option value="true">是</option><option value="false">否</option></select>
         </label>
@@ -96,6 +100,7 @@ HTML = """<!doctype html>
           <select name="delete_after_cycle"><option value="true">是</option><option value="false">否</option></select>
         </label>
       </div>
+      <label style="margin-top:12px">多 IP 列表 <textarea name="lan_ips" placeholder="multi_ip 模式下每行或逗号分隔一个 IP"></textarea></label>
       <label style="margin-top:12px">公共源 URL 池 <textarea name="source_pool" placeholder="每行或逗号分隔一个 http/https URL"></textarea></label>
       <div class="actions"><button class="primary" type="submit">保存并应用</button></div>
     </form>
@@ -111,7 +116,7 @@ HTML = """<!doctype html>
   </section>
   <section>
     <h2>Worker</h2>
-    <table><thead><tr><th>ID</th><th>线路</th><th>目标</th><th>状态</th><th>次数</th><th>PID</th><th>错误</th></tr></thead><tbody id="workers"></tbody></table>
+    <table><thead><tr><th>ID</th><th>线路</th><th>源 IP</th><th>目标</th><th>状态</th><th>次数</th><th>PID</th><th>错误</th></tr></thead><tbody id="workers"></tbody></table>
   </section>
   <section>
     <h2>日志</h2>
@@ -186,7 +191,7 @@ async function refresh() {
   while (chartSamples.length > 120) chartSamples.shift();
   drawChart(metrics.target_mbps);
   document.getElementById('workers').innerHTML = status.workers.map(w =>
-    `<tr><td>${w.worker_id}</td><td>${w.line_index}</td><td>${w.target || w.app_id || ''}</td><td>${w.status}</td><td>${w.cycles}</td><td>${w.current_pid || ''}</td><td>${w.last_error || ''}</td></tr>`
+    `<tr><td>${w.worker_id}</td><td>${w.line_index}</td><td>${w.source_ip || ''}</td><td>${w.target || w.app_id || ''}</td><td>${w.status}</td><td>${w.cycles}</td><td>${w.current_pid || ''}</td><td>${w.last_error || ''}</td></tr>`
   ).join('');
   document.getElementById('sources').innerHTML = sources.map(s =>
     `<tr><td>${s.url}</td><td>${s.ip || ''}</td><td>${s.healthy ? '是' : '否'}</td><td>${s.failures || 0}</td></tr>`
@@ -205,7 +210,7 @@ document.getElementById('configForm').addEventListener('submit', async (event) =
     if (['target_mbps','line_count','connections_per_line','max_connections_per_line'].includes(key)) data[key] = Number(value);
     else if (['rate_limit_enabled','delete_after_cycle'].includes(key)) data[key] = value === 'true';
     else if (key === 'app_ids') data[key] = value.split(',').map(v => v.trim()).filter(Boolean);
-    else if (key === 'source_pool') data[key] = value.split(/[\\n,]+/).map(v => v.trim()).filter(Boolean);
+    else if (key === 'source_pool' || key === 'lan_ips') data[key] = value.split(/[\\n,]+/).map(v => v.trim()).filter(Boolean);
     else data[key] = value;
   }
   await api('/api/config', { method: 'POST', headers: {'content-type':'application/json'}, body: JSON.stringify(data) });

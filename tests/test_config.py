@@ -12,6 +12,8 @@ class ConfigTests(unittest.TestCase):
         cfg = PumperConfig()
 
         self.assertEqual(cfg.lan_ip, "192.168.1.233")
+        self.assertEqual(cfg.egress_mode, "single_ip")
+        self.assertEqual(cfg.lan_ips, ["192.168.1.233"])
         self.assertEqual(cfg.gateway, "192.168.1.1")
         self.assertEqual(cfg.line_count, 2)
         self.assertEqual(cfg.target_mbps, 900)
@@ -45,10 +47,15 @@ class ConfigTests(unittest.TestCase):
                     "APP_IDS": "740,90",
                     "SOURCE_POOL": "https://a.test/file,https://b.test/file",
                     "MAX_CONNECTIONS_PER_LINE": "99",
+                    "EGRESS_MODE": "multi_ip",
+                    "LAN_IPS": "192.168.1.233,192.168.1.234,192.168.1.235,192.168.1.236",
                 },
             )
 
         self.assertEqual(cfg.line_count, 4)
+        self.assertEqual(cfg.egress_mode, "multi_ip")
+        self.assertEqual(cfg.lan_ip, "192.168.1.233")
+        self.assertEqual(cfg.lan_ips, ["192.168.1.233", "192.168.1.234", "192.168.1.235", "192.168.1.236"])
         self.assertEqual(cfg.target_mbps, 1200)
         self.assertEqual(cfg.rate_limit_mbps, 1200)
         self.assertEqual(cfg.app_ids, ["740", "90"])
@@ -72,6 +79,12 @@ class ConfigTests(unittest.TestCase):
             PumperConfig(connections_per_line=13).validate()
         with self.assertRaises(ValueError):
             PumperConfig(target_mbps=0).validate()
+        with self.assertRaises(ValueError):
+            PumperConfig(egress_mode="multi_ip", line_count=3, lan_ips=["192.168.1.233", "192.168.1.234"]).validate()
+        with self.assertRaises(ValueError):
+            PumperConfig(egress_mode="multi_ip", line_count=2, lan_ips=["192.168.1.233", "192.168.1.233"]).validate()
+        with self.assertRaises(ValueError):
+            PumperConfig(egress_mode="invalid").validate()
 
     def test_download_mode_aliases_keep_existing_configs_working(self):
         self.assertEqual(PumperConfig(download_mode="null").validate().download_mode, "public_http")

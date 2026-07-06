@@ -58,6 +58,36 @@ class WorkerPlanTests(unittest.TestCase):
         self.assertIn("https://example.test/file.bin", command)
         self.assertNotIn("steamcmd", " ".join(command))
 
+    def test_public_http_command_can_bind_to_line_source_ip(self):
+        cfg = PumperConfig(download_mode="public_http", source_pool=["https://example.test/file.bin"])
+
+        command = build_download_command(cfg, "https://example.test/file.bin", 3, source_ip="192.168.1.234")
+
+        self.assertIn("--bind-ip", command)
+        self.assertIn("192.168.1.234", command)
+
+    def test_worker_plan_assigns_source_ip_per_line_in_multi_ip_mode(self):
+        cfg = PumperConfig(
+            line_count=3,
+            connections_per_line=2,
+            egress_mode="multi_ip",
+            lan_ips=["192.168.1.233", "192.168.1.234", "192.168.1.235"],
+        )
+
+        plan = build_worker_plan(cfg)
+
+        self.assertEqual(
+            [(worker.line_index, worker.source_ip) for worker in plan],
+            [
+                (1, "192.168.1.233"),
+                (2, "192.168.1.234"),
+                (3, "192.168.1.235"),
+                (1, "192.168.1.233"),
+                (2, "192.168.1.234"),
+                (3, "192.168.1.235"),
+            ],
+        )
+
     def test_worker_plan_distributes_public_sources_by_remote_ip(self):
         cfg = PumperConfig(line_count=2, connections_per_line=6, source_pool=["https://a.test/file"])
         sources = [

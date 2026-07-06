@@ -32,6 +32,7 @@ class WorkerSpec:
     rate_limit_kbps: int | None
     target: str = ""
     target_ip: str = ""
+    source_ip: str = ""
 
 
 @dataclass
@@ -40,6 +41,7 @@ class WorkerState:
     line_index: int
     app_id: str = ""
     target: str = ""
+    source_ip: str = ""
     cycles: int = 0
     status: str = "idle"
     last_error: str = ""
@@ -59,16 +61,21 @@ def build_worker_plan(
     if cfg.rate_limit_enabled:
         per_worker_kbps = max(1, int((cfg.rate_limit_mbps * 1000) / total_workers))
     assignments = _target_assignments(cfg, total_workers, sources)
-    return [
-        WorkerSpec(
-            worker_id=i + 1,
-            line_index=(i % cfg.line_count) + 1,
-            rate_limit_kbps=per_worker_kbps,
-            target=assignments[i].url,
-            target_ip=assignments[i].ip,
+    plan: list[WorkerSpec] = []
+    for i in range(total_workers):
+        line_index = (i % cfg.line_count) + 1
+        source_ip = cfg.lan_ips[line_index - 1] if cfg.egress_mode == "multi_ip" else ""
+        plan.append(
+            WorkerSpec(
+                worker_id=i + 1,
+                line_index=line_index,
+                rate_limit_kbps=per_worker_kbps,
+                target=assignments[i].url,
+                target_ip=assignments[i].ip,
+                source_ip=source_ip,
+            )
         )
-        for i in range(total_workers)
-    ]
+    return plan
 
 
 def _target_assignments(
@@ -135,8 +142,8 @@ def steamcmd_command(cfg: PumperConfig, app_id: str, worker_id: int) -> list[str
     ]
 
 
-def public_http_command(cfg: PumperConfig, url: str, worker_id: int) -> list[str]:
-    return [
+def public_http_command(cfg: PumperConfig, url: str, worker_id: int, source_ip: str = "") -> list[str]:
+    command = [
         "discarder",
         "--worker-id",
         str(worker_id),
@@ -144,13 +151,16 @@ def public_http_command(cfg: PumperConfig, url: str, worker_id: int) -> list[str
         str(cfg.worker_min_session_seconds),
         "--restart-jitter-seconds",
         str(cfg.worker_restart_jitter_seconds),
-        url,
     ]
+    if source_ip:
+        command.extend(["--bind-ip", source_ip])
+    command.append(url)
+    return command
 
 
-def build_download_command(cfg: PumperConfig, target: str, worker_id: int) -> list[str]:
+def build_download_command(cfg: PumperConfig, target: str, worker_id: int, source_ip: str = "") -> list[str]:
     if cfg.download_mode == "public_http":
-        return public_http_command(cfg, target, worker_id)
+        return public_http_command(cfg, target, worker_id, source_ip)
     return steamcmd_command(cfg, target, worker_id)
 
 
@@ -218,11 +228,13 @@ class DownloadWorker(threading.Thread):
             target = self.spec.target
             self.state.app_id = target if self.cfg.download_mode == "steam_tmpfs" else ""
             self.state.target = target
+            self.state.source_ip = self.spec.source_ip
             self.state.status = "downloading"
             self.state.last_error = ""
-            base_command = build_download_command(self.cfg, target, self.spec.worker_id)
+            base_command = build_download_command(self.cfg, target, self.spec.worker_id, self.spec.source_ip)
             command = base_command if self.cfg.download_mode == "public_http" else wrap_with_rate_limit(base_command, self.spec.rate_limit_kbps)
-            self.log(f"worker={self.spec.worker_id} line={self.spec.line_index} target={target} start")
+            source_part = f" source_ip={self.spec.source_ip}" if self.spec.source_ip else ""
+            self.log(f"worker={self.spec.worker_id} line={self.spec.line_index}{source_part} target={target} start")
             try:
                 self.process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, preexec_fn=os.setsid)
                 self.state.current_pid = self.process.pid
