@@ -238,11 +238,24 @@ EOF
 }
 
 main() {
+  local compose_file selected_ip egress_mode selected_ips
   ensure_project_checkout
   install_docker_if_needed
   write_env
   mkdir -p data
-  docker compose up -d --build
+  compose_file="${COMPOSE_FILE_PATH:-docker-compose.yml}"
+  if [ ! -f "$compose_file" ]; then
+    log "Compose 文件不存在: ${compose_file}"
+    exit 1
+  fi
+  if [ "${PULL_IMAGE:-0}" = "1" ]; then
+    docker compose -f "$compose_file" pull
+  fi
+  if [ "${COMPOSE_BUILD:-1}" = "1" ]; then
+    docker compose -f "$compose_file" up -d --build
+  else
+    docker compose -f "$compose_file" up -d
+  fi
   selected_ip="$(awk -F= '$1 == "LAN_IP" {print $2}' .env)"
   egress_mode="$(awk -F= '$1 == "EGRESS_MODE" {print $2}' .env)"
   selected_ips="$(awk -F= '$1 == "LAN_IPS" {print $2}' .env)"

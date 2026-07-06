@@ -24,6 +24,12 @@
 curl -fsSL https://raw.githubusercontent.com/MengxingFusheng/steam-download-pumper/main/install.sh | bash
 ```
 
+使用已经封装好的一对一预构建镜像，不在本机编译：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/MengxingFusheng/steam-download-pumper/main/install-one-to-one.sh | bash
+```
+
 如果已经安装 Docker，也可以 clone 后本地部署：
 
 ```bash
@@ -44,6 +50,12 @@ TARGET_MBPS=800 LINE_COUNT=2 CONNECTIONS_PER_LINE=6 MAX_CONNECTIONS_PER_LINE=12 
 EGRESS_MODE=multi_ip LINE_COUNT=4 TARGET_MBPS=1600 ./install.sh
 ```
 
+如果希望直接使用 GitHub Container Registry 的一对一镜像：
+
+```bash
+LINE_COUNT=4 TARGET_MBPS=1600 ./install-one-to-one.sh
+```
+
 脚本会写入类似下面的配置：
 
 ```text
@@ -61,6 +73,22 @@ EGRESS_MODE=multi_ip LINE_COUNT=4 LAN_IPS=192.168.1.233,192.168.1.234,192.168.1.
 单 IP 模式自动扫描 `192.168.1.233-192.168.1.240`。多 IP 模式会从 `.233` 开始凑齐 `LINE_COUNT` 个地址；当线路数超过 8 时会继续向后取，例如 `.241/.242`，也可以用 `LAN_IPS` 明确指定。
 
 `MAX_CONNECTIONS_PER_LINE` 硬上限为 `12`，用于避免 worker 数无限扩张占用 CPU 和内存。
+
+### 预构建镜像
+
+一对一模式镜像已封装为：
+
+```text
+ghcr.io/mengxingfusheng/steam-download-pumper:one-to-one
+```
+
+这个镜像默认 `EGRESS_MODE=multi_ip`，默认两条线路，默认 IP 为 `192.168.1.233,192.168.1.234`。实际部署时推荐通过 `install-one-to-one.sh` 生成 `.env`，它会按 `LINE_COUNT` 自动扫描并写入对应数量的 LAN IP。
+
+直接拉取镜像：
+
+```bash
+docker pull ghcr.io/mengxingfusheng/steam-download-pumper:one-to-one
+```
 
 ### 交互部署
 

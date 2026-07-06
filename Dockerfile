@@ -8,6 +8,11 @@ RUN go test ./cmd/discarder \
 
 FROM cm2network/steamcmd:root
 
+ARG DEFAULT_EGRESS_MODE=single_ip
+ARG DEFAULT_LINE_COUNT=2
+ARG DEFAULT_LAN_IP=192.168.1.233
+ARG DEFAULT_LAN_IPS=192.168.1.233
+
 USER root
 
 RUN apt-get update \
@@ -30,6 +35,10 @@ USER root
 ENV CONFIG_PATH=/data/config.json \
     WEB_PORT=80 \
     STEAMCMD_BIN=/home/steam/steamcmd/steamcmd.sh \
+    EGRESS_MODE=${DEFAULT_EGRESS_MODE} \
+    LINE_COUNT=${DEFAULT_LINE_COUNT} \
+    LAN_IP=${DEFAULT_LAN_IP} \
+    LAN_IPS=${DEFAULT_LAN_IPS} \
     PYTHONDONTWRITEBYTECODE=1 \
     TZ=Asia/Shanghai
 

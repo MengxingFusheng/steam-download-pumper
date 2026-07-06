@@ -19,7 +19,11 @@ class InstallScriptTests(unittest.TestCase):
         self.assertIn("LAN_IPS 数量必须等于 LINE_COUNT", content)
         self.assertIn("STEAM_PUMPER_REPO_URL", content)
         self.assertIn("git clone", content)
-        self.assertIn("docker compose up -d --build", content)
+        self.assertIn("COMPOSE_FILE_PATH", content)
+        self.assertIn("COMPOSE_BUILD", content)
+        self.assertIn("PULL_IMAGE", content)
+        self.assertIn('docker compose -f "$compose_file" pull', content)
+        self.assertIn('docker compose -f "$compose_file" up -d --build', content)
         self.assertNotIn("read -r -p", content)
 
     def test_install_script_has_valid_bash_syntax(self):
