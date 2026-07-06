@@ -25,6 +25,44 @@ run_privileged() {
   fi
 }
 
+install_git_if_needed() {
+  if command -v git >/dev/null 2>&1; then
+    return
+  fi
+  if command -v apt-get >/dev/null 2>&1; then
+    log "正在安装 git..."
+    run_privileged apt-get update
+    run_privileged apt-get install -y git ca-certificates curl
+    return
+  fi
+  log "git 不存在，请先安装 git，或手动下载仓库后运行 ./install.sh。"
+  exit 1
+}
+
+ensure_project_checkout() {
+  if [ -f docker-compose.yml ] && [ -d steam_pumper ]; then
+    return
+  fi
+  install_git_if_needed
+  local repo_url install_dir
+  repo_url="${STEAM_PUMPER_REPO_URL:-https://github.com/MengxingFusheng/steam-download-pumper.git}"
+  install_dir="${INSTALL_DIR:-$HOME/steam-download-pumper}"
+  if [ -d "$install_dir/.git" ]; then
+    log "更新已有目录: $install_dir"
+    cd "$install_dir"
+    git pull --ff-only
+    return
+  fi
+  if [ -e "$install_dir" ]; then
+    log "安装目录已存在但不是 Git 仓库: $install_dir"
+    exit 1
+  fi
+  mkdir -p "$(dirname "$install_dir")"
+  log "克隆仓库到: $install_dir"
+  git clone "$repo_url" "$install_dir"
+  cd "$install_dir"
+}
+
 install_docker_if_needed() {
   if command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; then
     return
@@ -119,6 +157,7 @@ EOF
 }
 
 main() {
+  ensure_project_checkout
   install_docker_if_needed
   write_env
   mkdir -p data

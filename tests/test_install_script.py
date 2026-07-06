@@ -13,6 +13,8 @@ class InstallScriptTests(unittest.TestCase):
         self.assertTrue(script.exists())
         content = script.read_text(encoding="utf-8")
         self.assertIn("pick_lan_ip", content)
+        self.assertIn("STEAM_PUMPER_REPO_URL", content)
+        self.assertIn("git clone", content)
         self.assertIn("docker compose up -d --build", content)
         self.assertNotIn("read -r -p", content)
 
