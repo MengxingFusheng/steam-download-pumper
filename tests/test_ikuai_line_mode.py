@@ -60,7 +60,7 @@ class IkuaiLineModeTests(unittest.TestCase):
 
         self.assertIn("FROM python:3.13-slim", dockerfile)
         self.assertIn("COPY steam_pumper/line_", dockerfile)
-        self.assertIn("ENTRYPOINT", dockerfile)
+        self.assertIn("CMD", dockerfile)
         self.assertNotIn("cm2network/steamcmd", dockerfile)
         self.assertNotIn("steamcmd", dockerfile.lower())
         self.assertNotIn("trickle", dockerfile.lower())

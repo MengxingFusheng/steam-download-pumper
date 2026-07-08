@@ -23,8 +23,15 @@
 镜像地址：
 
 ```text
+traveler1314/ikuai-line-pumper:latest
 ghcr.io/mengxingfusheng/ikuai-line-pumper:latest
 ```
+
+爱快创建容器时请注意：
+
+- `内存占用(M)` 不要填 `0`，建议填 `128` 或 `256`。部分爱快 3.x Docker 插件会把 `0` 校验成无效 JSON，启用时报 `internal error, verify json err`。
+- 容器 IPv4 地址在爱快界面里设置，例如 `192.168.10.233`。
+- 一个容器对应一条外网线路，多条线路请创建多个容器，并在爱快分流策略里按容器源 IP 绑定对应 WAN。
 
 可选环境变量：
 

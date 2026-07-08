@@ -36,4 +36,4 @@ ENV CONFIG_PATH=/data/config.json \
 
 EXPOSE 80
 
-ENTRYPOINT ["python3", "-m", "steam_pumper.line_main"]
+CMD ["python3", "-m", "steam_pumper.line_main"]
