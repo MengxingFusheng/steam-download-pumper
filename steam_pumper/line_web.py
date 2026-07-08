@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from typing import Any
 from urllib.parse import urlparse
 
@@ -254,7 +254,7 @@ class LineHandler(BaseHTTPRequestHandler):
 
 def run_line_web(controller: LineController, host: str, port: int) -> None:
     LineHandler.controller = controller
-    server = ThreadingHTTPServer((host, port), LineHandler)
+    server = HTTPServer((host, port), LineHandler)
     try:
         server.serve_forever()
     finally:

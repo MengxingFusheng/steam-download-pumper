@@ -1,4 +1,5 @@
 import subprocess
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -61,10 +62,31 @@ class IkuaiLineModeTests(unittest.TestCase):
         self.assertIn("FROM python:3.13-slim", dockerfile)
         self.assertIn("COPY steam_pumper/line_", dockerfile)
         self.assertIn("CMD", dockerfile)
+        self.assertIn("PYTHON_COLORS=0", dockerfile)
+        self.assertIn("NO_COLOR=1", dockerfile)
         self.assertNotIn("cm2network/steamcmd", dockerfile)
         self.assertNotIn("steamcmd", dockerfile.lower())
         self.assertNotIn("trickle", dockerfile.lower())
         self.assertNotIn("iproute2", dockerfile.lower())
+
+    def test_line_controller_logs_thread_resource_failures_without_crashing(self):
+        from steam_pumper.line_config import LineConfig, save_line_config
+        from steam_pumper.line_controller import LineController
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = Path(tmpdir) / "config.json"
+            save_line_config(config_path, LineConfig())
+            controller = LineController(config_path)
+
+            def fail_start():
+                raise RuntimeError("can't start new thread")
+
+            controller.scheduler_thread.start = fail_start
+            controller.metrics_thread.start = fail_start
+
+            controller.start_scheduler()
+
+            self.assertTrue(any("can't start new thread" in line for line in controller.logs))
 
     def test_publish_script_supports_ghcr_dockerhub_and_release_tar(self):
         script = (ROOT / "publish-ikuai-line.sh").read_text(encoding="utf-8")

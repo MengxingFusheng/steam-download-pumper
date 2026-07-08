@@ -34,8 +34,14 @@ class LineController:
         self._last_scale_check = 0.0
 
     def start_scheduler(self) -> None:
-        self.scheduler_thread.start()
-        self.metrics_thread.start()
+        for name, thread in (("scheduler", self.scheduler_thread), ("metrics", self.metrics_thread)):
+            try:
+                thread.start()
+            except RuntimeError as exc:
+                self.log(
+                    f"{name} thread failed: {exc}; increase the iKuai container memory/PID limit "
+                    "and keep MAX_CONNECTIONS at 12 or lower"
+                )
 
     def shutdown(self) -> None:
         self.scheduler_stop.set()
@@ -220,4 +226,14 @@ class LineController:
             self.worker_states[spec.worker_id] = state
             worker = LineDownloadWorker(self.cfg, spec, state, stop_event, self.log)
             self.workers[spec.worker_id] = worker
-            worker.start()
+            try:
+                worker.start()
+            except RuntimeError as exc:
+                self.workers.pop(spec.worker_id, None)
+                state.status = "error"
+                state.last_error = f"worker thread failed: {exc}"
+                self.log(
+                    f"worker={spec.worker_id} thread failed: {exc}; "
+                    "increase the iKuai container memory/PID limit or lower CONNECTIONS"
+                )
+                break
