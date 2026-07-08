@@ -16,6 +16,32 @@
 
 ## 快速部署
 
+### 爱快 Docker 插件单线路镜像
+
+爱快 3.5.0+ 的 Docker 插件可直接使用单线路镜像，一个容器对应一条外网线路。容器 IP 不由镜像分配，在爱快 Docker 插件创建容器时选择网络接口并设置固定 IPv4，然后在分流策略里做“容器源 IP -> 指定 WAN”的一对一绑定。
+
+镜像地址：
+
+```text
+ghcr.io/mengxingfusheng/ikuai-line-pumper:latest
+```
+
+可选环境变量：
+
+- `TARGET_MBPS`: 当前容器对应线路的目标 Mbps，默认 `400`。
+- `CONNECTIONS`: 基础连接数，默认 `8`。
+- `MAX_CONNECTIONS`: 最大连接数，默认 `12`，超过会自动压到 `12`。
+- `START_TIME` / `END_TIME`: 每天运行时间窗，默认 `00:00-18:00`。
+- `SOURCE_POOL`: 公共 HTTP/HTTPS 源 URL，多个用英文逗号分隔。
+
+创建容器后访问爱快里设置的容器 IP，例如：
+
+```text
+http://容器IP/
+```
+
+也可以使用 GitHub Release 附件版镜像包，在爱快“镜像管理”中引用镜像文件后创建容器。
+
 ### 一键部署
 
 在 Ubuntu/Debian 主机上执行：
