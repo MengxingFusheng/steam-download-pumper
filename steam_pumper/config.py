@@ -200,12 +200,6 @@ CONFIG_TYPES: dict[str, type[CommonConfig]] = {
 
 REMOVED_ENV = {"EGRESS_MODE", "LAN_IP"}
 IKUAI_UNSUPPORTED_ENV = {"LINE_COUNT", "LAN_IPS"}
-MIGRATED_SAVED_FIELDS = {
-    "connections": "connections_per_line",
-    "max_connections": "max_connections_per_line",
-    "rate_limit_mbps": "target_mbps",
-    "download_urls": "source_pool",
-}
 
 
 def load_config(
@@ -281,25 +275,20 @@ def _validated_saved_data(
     config_type: type[CommonConfig],
     saved: Mapping[str, Any],
 ) -> dict[str, Any]:
-    migrated = dict(saved)
-    for old_name, new_name in MIGRATED_SAVED_FIELDS.items():
-        if old_name in migrated:
-            migrated.setdefault(new_name, migrated[old_name])
-            del migrated[old_name]
-
-    persisted_topology = migrated.pop("topology", topology_name)
+    validated = dict(saved)
+    persisted_topology = validated.pop("topology", topology_name)
     if persisted_topology != topology_name:
         raise ValueError(
             f"persisted topology {persisted_topology!r} does not match requested topology {topology_name!r}"
         )
 
     allowed = {name for name, config_field in config_type.__dataclass_fields__.items() if config_field.init}
-    for key in migrated:
+    for key in validated:
         if key not in allowed:
             if topology_name == "ikuai_line" and key in {"line_count", "lan_ips"}:
                 raise ValueError(f"{key} is not supported by {topology_name}")
             raise ValueError(f"unknown persisted config key: {key}")
-    return migrated
+    return validated
 
 
 # Temporary import compatibility while later refactor tasks update consumers. This

@@ -1,8 +1,10 @@
 import json
+import os
 import tempfile
 import unittest
 from datetime import time
 from pathlib import Path
+from unittest.mock import patch
 
 from steam_pumper.config import (
     MAX_CONNECTIONS_PER_LINE,
@@ -51,6 +53,9 @@ class ConfigTests(unittest.TestCase):
             ),
             ("multi_ip", 800, 8, 12, 2, ["192.168.1.233", "192.168.1.234"]),
         )
+        for topology_field in ("line_count", "lan_ip", "lan_ips"):
+            with self.subTest(topology_field=topology_field):
+                self.assertFalse(hasattr(ikuai, topology_field))
 
     def test_hard_cap_is_rejected_for_both_topologies(self):
         for config_type in (IkuaiLineConfig, MultiIPConfig):
@@ -161,6 +166,22 @@ class ConfigTests(unittest.TestCase):
                     with self.assertRaisesRegex(ValueError, message):
                         load_config(topology, path, {})
 
+    def test_legacy_persisted_keys_are_rejected_even_with_new_keys(self):
+        legacy_cases = (
+            ("connections", 4, "connections_per_line", 8),
+            ("max_connections", 11, "max_connections_per_line", 12),
+            ("rate_limit_mbps", 500, "target_mbps", 800),
+            ("download_urls", ["https://old.test/file"], "source_pool", ["https://new.test/file"]),
+        )
+        for old_key, old_value, new_key, new_value in legacy_cases:
+            for saved in ({old_key: old_value}, {old_key: old_value, new_key: new_value}):
+                with self.subTest(old_key=old_key, saved=saved):
+                    with tempfile.TemporaryDirectory() as tmpdir:
+                        path = Path(tmpdir) / "config.json"
+                        path.write_text(json.dumps(saved), encoding="utf-8")
+                        with self.assertRaisesRegex(ValueError, f"unknown persisted config key: {old_key}"):
+                            load_config("multi_ip", path, {})
+
     def test_unknown_topology_is_rejected(self):
         with self.assertRaisesRegex(ValueError, "unsupported topology"):
             load_config("single_ip", "/missing.json", {})
@@ -170,18 +191,41 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(IkuaiLineConfig().to_dict()["topology"], "ikuai_line")
         self.assertEqual(MultiIPConfig().to_dict()["topology"], "multi_ip")
 
-    def test_save_config_replaces_file_with_valid_json(self):
+    def test_save_config_uses_same_directory_temporary_file_and_os_replace(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             path = Path(tmpdir) / "config.json"
             path.write_text("not json", encoding="utf-8")
 
-            save_config(path, MultiIPConfig(target_mbps=801))
+            with patch("steam_pumper.config.os.replace", wraps=os.replace) as replace:
+                save_config(path, MultiIPConfig(target_mbps=801))
 
             saved = json.loads(path.read_text(encoding="utf-8"))
             leftovers = [item for item in path.parent.iterdir() if item != path]
+            replace.assert_called_once()
+            temporary_path = Path(replace.call_args.args[0])
+            destination_path = Path(replace.call_args.args[1])
+            self.assertEqual(saved["target_mbps"], 801)
+            self.assertEqual(saved["topology"], "multi_ip")
+            self.assertEqual(temporary_path.parent, path.parent)
+            self.assertNotEqual(temporary_path, path)
+            self.assertEqual(destination_path, path)
+            self.assertFalse(temporary_path.exists())
+            self.assertEqual(leftovers, [])
 
-        self.assertEqual(saved["target_mbps"], 801)
-        self.assertEqual(saved["topology"], "multi_ip")
+    def test_save_config_replace_failure_preserves_prior_json(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "config.json"
+            original = MultiIPConfig(target_mbps=700).validate().to_dict()
+            path.write_text(json.dumps(original), encoding="utf-8")
+
+            with patch("steam_pumper.config.os.replace", side_effect=OSError("replace failed")):
+                with self.assertRaisesRegex(OSError, "replace failed"):
+                    save_config(path, MultiIPConfig(target_mbps=801))
+
+            persisted = json.loads(path.read_text(encoding="utf-8"))
+            leftovers = [item for item in path.parent.iterdir() if item != path]
+
+        self.assertEqual(persisted, original)
         self.assertEqual(leftovers, [])
 
 
