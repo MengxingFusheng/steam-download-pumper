@@ -76,10 +76,13 @@ class EngineProcess:
         self.next_restart_at = 0.0
         self.consecutive_failures = 0
         self._output_buffer = ""
+        self._byte_offset = 0
+        self._process_bytes = 0
 
     def start(self) -> None:
-        if self.stop_requested or (self.process and self.process.poll() is None):
+        if self.process and self.process.poll() is None:
             return
+        self.stop_requested = False
         self.state.status = "starting"
         self.state.last_error = ""
         try:
@@ -151,6 +154,8 @@ class EngineProcess:
         self.state.status = "stopped"
 
     def _schedule_restart(self, error: str, now: float | None = None) -> None:
+        self._byte_offset = self.state.total_bytes
+        self._process_bytes = 0
         self.consecutive_failures += 1
         self.state.restarts += 1
         self.state.status = "restarting"
@@ -190,7 +195,8 @@ class EngineProcess:
             total_bytes = event.get("bytes")
             connections = event.get("connections")
             if isinstance(total_bytes, int) and total_bytes >= 0:
-                self.state.total_bytes = total_bytes
+                self._process_bytes = total_bytes
+                self.state.total_bytes = self._byte_offset + self._process_bytes
                 self.state.has_metrics = True
                 self.consecutive_failures = 0
             if isinstance(connections, int) and 1 <= connections <= MAX_CONNECTIONS_PER_LINE:
