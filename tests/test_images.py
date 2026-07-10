@@ -52,6 +52,14 @@ class ImageTests(unittest.TestCase):
         self.assertIn("CONTAINER_IP", script)
         self.assertNotIn("EGRESS_MODE", script)
 
+    def test_docker_context_excludes_runtime_cache_and_release_output(self):
+        dockerignore = read(".dockerignore")
+
+        self.assertIn("__pycache__", dockerignore)
+        self.assertIn("*.pyc", dockerignore)
+        self.assertIn("dist", dockerignore)
+        self.assertIn("data/*", dockerignore)
+
 
 if __name__ == "__main__":
     unittest.main()

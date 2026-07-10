@@ -1,0 +1,46 @@
+name: test
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.23"
+      - name: Python tests
+        run: python3 -m unittest discover -s tests -v
+      - name: Go tests
+        run: go test -race ./...
+      - name: Go vet
+        run: go vet ./...
+      - name: Shell and Compose validation
+        run: |
+          bash -n install-multi-ip.sh publish-images.sh
+          docker compose -f docker-compose.multi-ip.yml config >/dev/null
+
+  images:
+    needs: test
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - name: ikuai-line
+            dockerfile: Dockerfile.ikuai-line
+            module: steam_pumper.ikuai_main
+          - name: multi-ip
+            dockerfile: Dockerfile.multi-ip
+            module: steam_pumper.multi_ip_main
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build image
+        run: docker build -f "${{ matrix.dockerfile }}" -t "local/${{ matrix.name }}:${{ github.sha }}" .
+      - name: Smoke import
+        run: docker run --rm --entrypoint python3 "local/${{ matrix.name }}:${{ github.sha }}" -c "import ${{ matrix.module }}"

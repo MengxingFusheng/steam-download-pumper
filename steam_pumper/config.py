@@ -340,8 +340,3 @@ def _validated_saved_data(
                 raise ValueError(f"{key} is not supported by {topology_name}")
             raise ValueError(f"unknown persisted config key: {key}")
     return validated
-
-
-# Temporary import compatibility while later refactor tasks update consumers. This
-# aliases the supported multi-IP model and does not retain single_ip behavior.
-PumperConfig = MultiIPConfig
