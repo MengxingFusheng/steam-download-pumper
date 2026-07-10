@@ -79,12 +79,40 @@ class TopologyTests(unittest.TestCase):
     def test_address_application_reports_failed_address(self, run):
         run.side_effect = [
             subprocess.CompletedProcess([], 0, stdout="", stderr=""),
-            subprocess.CalledProcessError(2, ["ip", "addr", "add"]),
+            subprocess.CalledProcessError(
+                2,
+                ["ip", "addr", "add"],
+                stderr="RTNETLINK answers: Operation not permitted\n",
+            ),
         ]
 
         with patch.dict(os.environ, {"APPLY_LAN_IPS": "true"}, clear=False):
-            with self.assertRaisesRegex(RuntimeError, "192.168.1.234"):
+            with self.assertRaises(RuntimeError) as raised:
                 apply_ipv4_addresses(["192.168.1.234"], "eth0", "24")
+
+        message = str(raised.exception)
+        self.assertIn("add IPv4 address 192.168.1.234", message)
+        self.assertIn("interface eth0", message)
+        self.assertIn("exit=2", message)
+        self.assertIn("Operation not permitted", message)
+
+    @patch("steam_pumper.topology.subprocess.run")
+    def test_address_inspection_preserves_command_diagnostics(self, run):
+        run.side_effect = subprocess.CalledProcessError(
+            1,
+            ["ip", "-4", "-o", "addr", "show", "dev", "missing0"],
+            stderr="Device missing0 does not exist.\n",
+        )
+
+        with patch.dict(os.environ, {"APPLY_LAN_IPS": "true"}, clear=False):
+            with self.assertRaises(RuntimeError) as raised:
+                apply_ipv4_addresses(["192.168.1.234"], "missing0", "24")
+
+        message = str(raised.exception)
+        self.assertIn("inspect IPv4 addresses", message)
+        self.assertIn("interface missing0", message)
+        self.assertIn("exit=1", message)
+        self.assertIn("Device missing0 does not exist", message)
 
     @patch("steam_pumper.topology.subprocess.run")
     def test_address_application_can_be_disabled(self, run):

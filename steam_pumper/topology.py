@@ -73,14 +73,17 @@ def apply_ipv4_addresses(
     if os.environ.get("APPLY_LAN_IPS", "1").strip().lower() in {"0", "false", "no", "off"}:
         return
 
-    existing = _existing_ipv4_addresses(interface)
+    try:
+        existing = _existing_ipv4_addresses(interface)
+    except (OSError, subprocess.CalledProcessError) as exc:
+        raise _command_error("inspect IPv4 addresses", interface, exc) from exc
     for lan_ip in validated_ips:
         if lan_ip in existing:
             continue
         try:
             _run(["ip", "addr", "add", f"{lan_ip}/{normalized_prefix}", "dev", interface])
         except (OSError, subprocess.CalledProcessError) as exc:
-            raise RuntimeError(f"failed to add IPv4 address {lan_ip} to {interface}") from exc
+            raise _command_error(f"add IPv4 address {lan_ip}", interface, exc) from exc
         existing.add(lan_ip)
         if log is not None:
             log(f"attached lan_ip={lan_ip} to {interface}")
@@ -111,3 +114,10 @@ def _existing_ipv4_addresses(interface: str) -> set[str]:
 
 def _run(command: list[str]) -> subprocess.CompletedProcess[str]:
     return subprocess.run(command, check=True, capture_output=True, text=True)
+
+
+def _command_error(operation: str, interface: str, exc: OSError | subprocess.CalledProcessError) -> RuntimeError:
+    exit_code = exc.returncode if isinstance(exc, subprocess.CalledProcessError) else "unavailable"
+    raw_detail = exc.stderr if isinstance(exc, subprocess.CalledProcessError) else str(exc)
+    detail = " ".join(str(raw_detail or "no diagnostic output").split())[:500]
+    return RuntimeError(f"failed to {operation} on interface {interface}: exit={exit_code}: {detail}")

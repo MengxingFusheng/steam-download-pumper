@@ -1,4 +1,5 @@
 import json
+import math
 import os
 import tempfile
 import unittest
@@ -187,16 +188,43 @@ class ConfigTests(unittest.TestCase):
             load_config("single_ip", "/missing.json", {})
 
     def test_to_dict_includes_the_explicit_topology(self):
-        self.assertEqual(CommonConfig().to_dict()["topology"], "")
+        with self.assertRaises(TypeError):
+            CommonConfig()
         self.assertEqual(IkuaiLineConfig().to_dict()["topology"], "ikuai_line")
         self.assertEqual(MultiIPConfig().to_dict()["topology"], "multi_ip")
+
+    def test_persisted_scalar_types_are_rejected_before_use(self):
+        invalid_values = (
+            ("target_mbps", True, "target_mbps must be an integer"),
+            ("connections_per_line", 8.0, "connections_per_line must be an integer"),
+            ("rate_limit_enabled", "false", "rate_limit_enabled must be a boolean"),
+            ("startup_stagger_seconds", math.nan, "startup_stagger_seconds must be a finite number"),
+            ("log_level", 7, "log_level must be a string"),
+            ("line_count", 2.0, "line_count must be an integer"),
+        )
+        for field_name, value, message in invalid_values:
+            with self.subTest(field_name=field_name, value=value):
+                with tempfile.TemporaryDirectory() as tmpdir:
+                    path = Path(tmpdir) / "config.json"
+                    path.write_text(json.dumps({field_name: value}), encoding="utf-8")
+                    with self.assertRaisesRegex(ValueError, message):
+                        load_config("multi_ip", path, {})
+
+    def test_config_rejects_non_string_source_and_ip_items(self):
+        with self.assertRaisesRegex(ValueError, "source_pool items must be strings"):
+            IkuaiLineConfig(source_pool=[123]).validate()
+        with self.assertRaisesRegex(ValueError, "lan_ips items must be strings"):
+            MultiIPConfig(lan_ips=["192.168.1.233", 234]).validate()
 
     def test_save_config_uses_same_directory_temporary_file_and_os_replace(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             path = Path(tmpdir) / "config.json"
             path.write_text("not json", encoding="utf-8")
 
-            with patch("steam_pumper.config.os.replace", wraps=os.replace) as replace:
+            with (
+                patch("steam_pumper.config.os.replace", wraps=os.replace) as replace,
+                patch("steam_pumper.config._fsync_directory") as fsync_directory,
+            ):
                 save_config(path, MultiIPConfig(target_mbps=801))
 
             saved = json.loads(path.read_text(encoding="utf-8"))
@@ -211,6 +239,7 @@ class ConfigTests(unittest.TestCase):
             self.assertEqual(destination_path, path)
             self.assertFalse(temporary_path.exists())
             self.assertEqual(leftovers, [])
+            fsync_directory.assert_called_once_with(path.parent)
 
     def test_save_config_replace_failure_preserves_prior_json(self):
         with tempfile.TemporaryDirectory() as tmpdir:

@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import tempfile
+from abc import ABC, abstractmethod
 from dataclasses import asdict, dataclass, field
 from datetime import time
 from ipaddress import ip_address
@@ -26,7 +28,7 @@ def default_source_pool() -> list[str]:
 
 
 @dataclass
-class CommonConfig:
+class CommonConfig(ABC):
     target_mbps: int = 400
     connections_per_line: int = 8
     max_connections_per_line: int = MAX_CONNECTIONS_PER_LINE
@@ -43,6 +45,16 @@ class CommonConfig:
     topology: str = field(init=False, default="")
 
     def validate_common(self) -> None:
+        _require_int("target_mbps", self.target_mbps)
+        _require_int("connections_per_line", self.connections_per_line)
+        _require_int("max_connections_per_line", self.max_connections_per_line)
+        _require_bool("rate_limit_enabled", self.rate_limit_enabled)
+        _require_int("loop_pause_seconds", self.loop_pause_seconds)
+        _require_finite_number("startup_stagger_seconds", self.startup_stagger_seconds)
+        _require_int("worker_min_session_seconds", self.worker_min_session_seconds)
+        _require_finite_number("worker_restart_jitter_seconds", self.worker_restart_jitter_seconds)
+        _require_int("schedule_poll_seconds", self.schedule_poll_seconds)
+        _require_string("log_level", self.log_level)
         if self.target_mbps < 1:
             raise ValueError("target_mbps must be at least 1")
         if self.connections_per_line < 1:
@@ -68,6 +80,10 @@ class CommonConfig:
         self._parse_time(self.start_time, "start_time")
         self._parse_time(self.end_time, "end_time")
         self.source_pool = validate_source_pool(self.source_pool)
+
+    @abstractmethod
+    def validate(self) -> CommonConfig:
+        raise NotImplementedError
 
     def is_within_window(self, current: time) -> bool:
         start = self._parse_time(self.start_time, "start_time")
@@ -111,6 +127,7 @@ class MultiIPConfig(CommonConfig):
 
     def validate(self) -> MultiIPConfig:
         self.validate_common()
+        _require_int("line_count", self.line_count)
         if not 2 <= self.line_count <= 10:
             raise ValueError("line_count must be between 2 and 10")
         self.lan_ips = validate_unique_ipv4(self.lan_ips)
@@ -122,7 +139,9 @@ class MultiIPConfig(CommonConfig):
 def validate_source_pool(values: list[str]) -> list[str]:
     if not isinstance(values, list):
         raise ValueError("source_pool must be a list of HTTP/HTTPS URLs")
-    cleaned = [str(value).strip() for value in values if str(value).strip()]
+    if any(not isinstance(value, str) for value in values):
+        raise ValueError("source_pool items must be strings")
+    cleaned = [value.strip() for value in values if value.strip()]
     if not cleaned:
         raise ValueError("source_pool must contain at least one URL")
     for url in cleaned:
@@ -141,7 +160,9 @@ def validate_source_pool(values: list[str]) -> list[str]:
 def validate_unique_ipv4(values: list[str]) -> list[str]:
     if not isinstance(values, list):
         raise ValueError("lan_ips must be a list of IPv4 addresses")
-    cleaned = [str(value).strip() for value in values]
+    if any(not isinstance(value, str) for value in values):
+        raise ValueError("lan_ips items must be strings")
+    cleaned = [value.strip() for value in values]
     validated: list[str] = []
     for index, value in enumerate(cleaned, start=1):
         try:
@@ -167,6 +188,26 @@ def _parse_bool(value: str) -> bool:
 
 def _parse_csv(value: str) -> list[str]:
     return [item.strip() for item in str(value).split(",") if item.strip()]
+
+
+def _require_int(name: str, value: Any) -> None:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"{name} must be an integer")
+
+
+def _require_finite_number(name: str, value: Any) -> None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+        raise ValueError(f"{name} must be a finite number")
+
+
+def _require_bool(name: str, value: Any) -> None:
+    if not isinstance(value, bool):
+        raise ValueError(f"{name} must be a boolean")
+
+
+def _require_string(name: str, value: Any) -> None:
+    if not isinstance(value, str):
+        raise ValueError(f"{name} must be a string")
 
 
 COMMON_ENV_MAP = {
@@ -225,7 +266,7 @@ def load_config(
     return config_type(**data).validate()
 
 
-def save_config(path: str | Path, cfg: CommonConfig) -> None:
+def save_config(path: str | Path, cfg: IkuaiLineConfig | MultiIPConfig) -> None:
     config_path = Path(path)
     config_path.parent.mkdir(parents=True, exist_ok=True)
     data = cfg.validate().to_dict()
@@ -246,9 +287,19 @@ def save_config(path: str | Path, cfg: CommonConfig) -> None:
             os.fsync(temporary.fileno())
         os.replace(temporary_path, config_path)
         temporary_path = None
+        _fsync_directory(config_path.parent)
     finally:
         if temporary_path is not None:
             temporary_path.unlink(missing_ok=True)
+
+
+def _fsync_directory(directory: Path) -> None:
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    descriptor = os.open(directory, flags)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
 
 
 def _reject_environment(topology_name: str, env: Mapping[str, str]) -> None:
