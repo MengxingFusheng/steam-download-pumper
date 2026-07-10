@@ -8,11 +8,6 @@ RUN go test ./cmd/discarder \
 
 FROM python:3.13-slim
 
-ARG DEFAULT_EGRESS_MODE=single_ip
-ARG DEFAULT_LINE_COUNT=2
-ARG DEFAULT_LAN_IP=192.168.1.233
-ARG DEFAULT_LAN_IPS=192.168.1.233
-
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates iproute2 \
     && rm -rf /var/lib/apt/lists/*
@@ -21,15 +16,20 @@ WORKDIR /app
 COPY steam_pumper /app/steam_pumper
 COPY --from=discarder-builder /out/discarder /usr/local/bin/discarder
 
-RUN mkdir -p /data /tmp /run \
-    && chmod 1777 /tmp
+RUN mkdir -p /data /tmp /run && chmod 1777 /tmp
 
 ENV CONFIG_PATH=/data/config.json \
     WEB_PORT=80 \
-    EGRESS_MODE=${DEFAULT_EGRESS_MODE} \
-    LINE_COUNT=${DEFAULT_LINE_COUNT} \
-    LAN_IP=${DEFAULT_LAN_IP} \
-    LAN_IPS=${DEFAULT_LAN_IPS} \
+    TARGET_MBPS=800 \
+    LINE_COUNT=2 \
+    LAN_IPS=192.168.1.233,192.168.1.234 \
+    CONNECTIONS_PER_LINE=8 \
+    MAX_CONNECTIONS_PER_LINE=12 \
+    RATE_LIMIT_ENABLED=true \
+    START_TIME=00:00 \
+    END_TIME=18:00 \
+    LAN_INTERFACE=eth0 \
+    LAN_PREFIX=24 \
     PYTHONDONTWRITEBYTECODE=1 \
     PYTHON_COLORS=0 \
     NO_COLOR=1 \
@@ -39,4 +39,4 @@ ENV CONFIG_PATH=/data/config.json \
 
 EXPOSE 80
 
-CMD ["python3", "-m", "steam_pumper.main"]
+CMD ["python3", "-m", "steam_pumper.multi_ip_main"]

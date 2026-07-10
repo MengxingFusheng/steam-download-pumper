@@ -1,0 +1,53 @@
+services:
+  multi-ip-pumper:
+    image: ${PUMPER_IMAGE:-traveler1314/multi-ip-pumper:latest}
+    container_name: multi-ip-pumper
+    restart: unless-stopped
+    networks:
+      pumper_lan:
+        ipv4_address: ${CONTAINER_IP:-192.168.1.233}
+    cap_add:
+      - NET_ADMIN
+    dns:
+      - 223.5.5.5
+      - 119.29.29.29
+    sysctls:
+      net.ipv6.conf.all.disable_ipv6: "1"
+      net.ipv6.conf.default.disable_ipv6: "1"
+      net.ipv6.conf.lo.disable_ipv6: "1"
+    volumes:
+      - ./data:/data
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+      - /run:size=16m,mode=755
+    logging:
+      driver: json-file
+      options:
+        max-size: "5m"
+        max-file: "2"
+    environment:
+      TZ: Asia/Shanghai
+      CONFIG_PATH: /data/config.json
+      WEB_PORT: "80"
+      TARGET_MBPS: ${TARGET_MBPS:-800}
+      LINE_COUNT: ${LINE_COUNT:-2}
+      LAN_IPS: ${LAN_IPS:-192.168.1.233,192.168.1.234}
+      LAN_INTERFACE: eth0
+      LAN_PREFIX: ${LAN_PREFIX:-24}
+      CONNECTIONS_PER_LINE: ${CONNECTIONS_PER_LINE:-8}
+      MAX_CONNECTIONS_PER_LINE: ${MAX_CONNECTIONS_PER_LINE:-12}
+      RATE_LIMIT_ENABLED: ${RATE_LIMIT_ENABLED:-true}
+      START_TIME: ${START_TIME:-00:00}
+      END_TIME: ${END_TIME:-18:00}
+      SOURCE_POOL: ${SOURCE_POOL:-}
+
+networks:
+  pumper_lan:
+    driver: macvlan
+    driver_opts:
+      parent: ${LAN_PARENT:-ens18}
+    ipam:
+      config:
+        - subnet: ${LAN_SUBNET:-192.168.1.0/24}
+          gateway: ${LAN_GATEWAY:-192.168.1.1}

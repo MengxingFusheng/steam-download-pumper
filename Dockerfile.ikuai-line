@@ -13,24 +13,19 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
-RUN mkdir -p /app/steam_pumper /data /tmp
-COPY steam_pumper/__init__.py /app/steam_pumper/__init__.py
-COPY steam_pumper/line_*.py /app/steam_pumper/
+COPY steam_pumper /app/steam_pumper
 COPY --from=discarder-builder /out/discarder /usr/local/bin/discarder
+
+RUN mkdir -p /data /tmp /run && chmod 1777 /tmp
 
 ENV CONFIG_PATH=/data/config.json \
     WEB_PORT=80 \
     TARGET_MBPS=400 \
-    CONNECTIONS=8 \
-    MAX_CONNECTIONS=12 \
+    CONNECTIONS_PER_LINE=8 \
+    MAX_CONNECTIONS_PER_LINE=12 \
     RATE_LIMIT_ENABLED=true \
     START_TIME=00:00 \
     END_TIME=18:00 \
-    LOOP_PAUSE_SECONDS=0 \
-    STARTUP_STAGGER_SECONDS=2 \
-    WORKER_MIN_SESSION_SECONDS=300 \
-    WORKER_RESTART_JITTER_SECONDS=3 \
-    SCHEDULE_POLL_SECONDS=30 \
     PYTHONDONTWRITEBYTECODE=1 \
     PYTHON_COLORS=0 \
     NO_COLOR=1 \
@@ -40,4 +35,4 @@ ENV CONFIG_PATH=/data/config.json \
 
 EXPOSE 80
 
-CMD ["python3", "-m", "steam_pumper.line_main"]
+CMD ["python3", "-m", "steam_pumper.ikuai_main"]
