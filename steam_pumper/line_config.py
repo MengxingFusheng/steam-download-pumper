@@ -7,6 +7,7 @@ from dataclasses import asdict, dataclass, field
 from datetime import time
 from pathlib import Path
 from typing import Any, Mapping
+from urllib.parse import urlparse
 
 
 TIME_RE = re.compile(r"^\d{2}:\d{2}$")
@@ -88,6 +89,12 @@ class LineConfig:
         self.source_pool = [str(url).strip() for url in self.source_pool if str(url).strip()]
         if not self.source_pool:
             raise ValueError("source_pool must contain at least one URL")
+        for url in self.source_pool:
+            parsed = urlparse(url)
+            if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+                raise ValueError(f"source_pool contains an invalid HTTP/HTTPS URL: {url}")
+            if parsed.username or parsed.password:
+                raise ValueError("source_pool URLs must not contain credentials")
         return self
 
     def is_within_window(self, current: time) -> bool:
@@ -135,13 +142,14 @@ def load_line_config(path: str | Path, env: Mapping[str, str] | None = None) -> 
     env = os.environ if env is None else env
     _reject_forbidden_env(env)
     data: dict[str, Any] = {}
-    config_path = Path(path)
-    if config_path.exists():
-        data.update(json.loads(config_path.read_text(encoding="utf-8")))
-    _reject_forbidden_keys(data)
     for env_name, (field_name, converter) in ENV_MAP.items():
         if env_name in env and env[env_name] != "":
             data[field_name] = converter(env[env_name])
+    config_path = Path(path)
+    if config_path.exists():
+        saved = json.loads(config_path.read_text(encoding="utf-8"))
+        _reject_forbidden_keys(saved)
+        data.update(saved)
     return LineConfig(**data).validate()
 
 

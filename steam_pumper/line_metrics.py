@@ -4,6 +4,8 @@ from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime
 
+from .line_config import LineConfig
+
 
 @dataclass
 class LineThroughputTracker:
@@ -48,3 +50,22 @@ class LineThroughputTracker:
         if elapsed <= 0:
             return 0.0
         return max(0, newest_bytes - oldest_bytes) * 8 / elapsed / 1_000_000
+
+    def sample_span_seconds(self) -> float:
+        if len(self.samples) < 2:
+            return 0.0
+        return max(0.0, self.samples[-1][0] - self.samples[0][0])
+
+
+def theoretical_window_bytes(cfg: LineConfig) -> int:
+    start = cfg._parse_time(cfg.start_time, "start_time")
+    end = cfg._parse_time(cfg.end_time, "end_time")
+    start_seconds = start.hour * 3600 + start.minute * 60
+    end_seconds = end.hour * 3600 + end.minute * 60
+    if start_seconds == end_seconds:
+        duration_seconds = 24 * 3600
+    elif start_seconds < end_seconds:
+        duration_seconds = end_seconds - start_seconds
+    else:
+        duration_seconds = 24 * 3600 - start_seconds + end_seconds
+    return int(cfg.target_mbps * 1_000_000 / 8 * duration_seconds)

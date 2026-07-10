@@ -33,6 +33,27 @@ func TestNewHTTPClientAcceptsBindIP(t *testing.T) {
 	}
 }
 
+func TestHTTPClientDoesNotApplyHeaderTimeoutToStreamingBody(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		for range 8 {
+			_, _ = w.Write([]byte("x"))
+			if flusher, ok := w.(http.Flusher); ok {
+				flusher.Flush()
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+	}))
+	defer server.Close()
+
+	got, err := downloadOnce(context.Background(), newHTTPClient(25*time.Millisecond, ""), server.URL, "1")
+	if err != nil {
+		t.Fatalf("streaming response was interrupted: %v", err)
+	}
+	if got != 8 {
+		t.Fatalf("downloadOnce bytes = %d, want 8", got)
+	}
+}
+
 func TestRunReconnectsShortFilesUntilCanceled(t *testing.T) {
 	var hits atomic.Int32
 	ctx, cancel := context.WithCancel(context.Background())
@@ -56,5 +77,24 @@ func TestRunReconnectsShortFilesUntilCanceled(t *testing.T) {
 	}
 	if hits.Load() < 3 {
 		t.Fatalf("hits = %d, want at least 3", hits.Load())
+	}
+}
+
+func TestSourceHealthSharesFailureCooldownAcrossConnections(t *testing.T) {
+	health := newSourceHealth()
+	now := time.Now()
+	delay := health.failed("http://bad.test/file", now)
+
+	if delay != time.Second {
+		t.Fatalf("first retry delay = %s, want 1s", delay)
+	}
+	if health.ready("http://bad.test/file", now.Add(500*time.Millisecond)) {
+		t.Fatal("failed source became ready before cooldown elapsed")
+	}
+	if !health.recovered("http://bad.test/file") {
+		t.Fatal("recovered did not report the prior failure")
+	}
+	if !health.ready("http://bad.test/file", now) {
+		t.Fatal("recovered source remained in cooldown")
 	}
 }

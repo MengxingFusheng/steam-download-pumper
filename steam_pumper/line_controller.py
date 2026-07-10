@@ -11,8 +11,15 @@ from typing import Any
 from urllib.parse import urlparse
 
 from .line_config import LineConfig, load_line_config, save_line_config
-from .line_metrics import LineThroughputTracker
-from .line_worker import LineDownloadWorker, LineSource, LineWorkerState, build_line_worker_plan, next_line_worker_count
+from .line_metrics import LineThroughputTracker, theoretical_window_bytes
+from .line_worker import (
+    LineDownloadWorker,
+    LineSource,
+    LineWorkerSpec,
+    LineWorkerState,
+    build_line_worker_plan,
+    next_line_worker_count,
+)
 
 
 class LineController:
@@ -22,6 +29,8 @@ class LineController:
         self.scheduler_stop = threading.Event()
         self.metrics_stop = threading.Event()
         self.manual_enabled = True
+        self.downloads_starting = False
+        self.reconfiguring = False
         self.cfg = load_line_config(self.config_path)
         self.workers: dict[int, LineDownloadWorker] = {}
         self.worker_states: dict[int, LineWorkerState] = {}
@@ -50,14 +59,20 @@ class LineController:
 
     def start_downloads(self) -> None:
         with self.lock:
-            if self.workers:
+            if self.workers or self.downloads_starting or self.reconfiguring:
                 return
+            self.downloads_starting = True
+        try:
             self.sources = self.resolve_sources()
-            self.desired_worker_count = self.cfg.connections
-            self.worker_states = {}
-            self.workers = {}
-            self._set_worker_count_locked(self.desired_worker_count)
-            self.log(f"started {len(self.workers)} workers")
+            with self.lock:
+                self.desired_worker_count = self.cfg.connections
+                self.worker_states = {}
+                self.workers = {}
+                self._set_worker_count_locked(self.desired_worker_count)
+                self.log(f"started engine with {self.desired_worker_count} connections")
+        finally:
+            with self.lock:
+                self.downloads_starting = False
 
     def stop_downloads(self) -> None:
         with self.lock:
@@ -67,12 +82,14 @@ class LineController:
             self.workers = {}
         for worker in workers:
             worker.stop()
-            worker.join(timeout=20)
         with self.lock:
             self.log("stopped workers")
 
     def update_config(self, data: dict[str, Any]) -> LineConfig:
         allowed = set(LineConfig.__dataclass_fields__.keys())
+        unknown = sorted(set(data) - allowed)
+        if unknown:
+            raise ValueError(f"unsupported configuration fields: {', '.join(unknown)}")
         clean = {key: value for key, value in data.items() if key in allowed}
         with self.lock:
             merged = self.cfg.to_dict()
@@ -80,16 +97,24 @@ class LineController:
             if isinstance(merged.get("source_pool"), str):
                 merged["source_pool"] = [item.strip() for item in merged["source_pool"].replace("\n", ",").split(",") if item.strip()]
             new_cfg = LineConfig(**merged).validate()
-            save_line_config(self.config_path, new_cfg)
             running = bool(self.workers)
+            self.reconfiguring = True
+        should_restart = False
+        try:
+            save_line_config(self.config_path, new_cfg)
             if running:
                 self.stop_downloads()
-            self.cfg = new_cfg
-            self.desired_worker_count = self.cfg.connections
-            if running and self.manual_enabled and self.cfg.is_within_window(datetime.now().time()):
-                self.start_downloads()
-            self.log("configuration updated")
-            return self.cfg
+            with self.lock:
+                self.cfg = new_cfg
+                self.desired_worker_count = self.cfg.connections
+                self.log("configuration updated")
+                should_restart = running and self.manual_enabled and self.cfg.is_within_window(datetime.now().time())
+        finally:
+            with self.lock:
+                self.reconfiguring = False
+        if should_restart:
+            self.start_downloads()
+        return self.cfg
 
     def set_manual_enabled(self, enabled: bool) -> None:
         self.manual_enabled = enabled
@@ -100,7 +125,8 @@ class LineController:
         now = datetime.now()
         with self.lock:
             return {
-                "running": bool(self.workers),
+                "running": any(state.status in {"starting", "downloading", "restarting"} for state in self.worker_states.values()),
+                "downloads_starting": self.downloads_starting,
                 "manual_enabled": self.manual_enabled,
                 "within_window": self.cfg.is_within_window(now.time()),
                 "now": now.isoformat(timespec="seconds"),
@@ -115,6 +141,8 @@ class LineController:
             avg10 = self.tracker.average_mbps(10)
             avg60 = self.tracker.average_mbps(60)
             target_pct = (avg60 / self.cfg.target_mbps * 100) if self.cfg.target_mbps else 0.0
+            theoretical_bytes = theoretical_window_bytes(self.cfg)
+            minimum_accept_bytes = int(theoretical_bytes * 0.8)
             return {
                 "target_mbps": self.cfg.target_mbps,
                 "current_mbps": self.tracker.current_mbps,
@@ -122,16 +150,37 @@ class LineController:
                 "avg60_mbps": avg60,
                 "target_percent": target_pct,
                 "today_bytes": self.tracker.today_bytes,
-                "worker_count": len(self.workers),
+                "theoretical_window_bytes": theoretical_bytes,
+                "minimum_accept_bytes": minimum_accept_bytes,
+                "daily_target_percent": (self.tracker.today_bytes / theoretical_bytes * 100) if theoretical_bytes else 0.0,
+                "worker_count": self.desired_worker_count if any(
+                    state.status == "downloading" for state in self.worker_states.values()
+                ) else 0,
+                "managed_worker_count": len(self.workers),
                 "desired_worker_count": self.desired_worker_count,
                 "max_worker_count": self.cfg.max_connections,
-                "capacity_warning": bool(self.workers and len(self.workers) >= self.cfg.max_connections and avg60 < self.cfg.target_mbps * 0.9),
+                "capacity_warning": bool(
+                    self.workers
+                    and self.desired_worker_count >= self.cfg.max_connections
+                    and avg60 < self.cfg.target_mbps * 0.9
+                ),
             }
 
     def source_snapshot(self) -> list[dict[str, Any]]:
         with self.lock:
             sources = self.sources or self.resolve_sources()
-            return [source.__dict__.copy() for source in sources]
+            failures_by_url: dict[str, int] = {}
+            for engine in self.workers.values():
+                for url, failures in engine.source_failures.items():
+                    failures_by_url[url] = failures_by_url.get(url, 0) + failures
+            return [
+                {
+                    **source.__dict__,
+                    "healthy": source.healthy and failures_by_url.get(source.url, 0) == 0,
+                    "failures": source.failures + failures_by_url.get(source.url, 0),
+                }
+                for source in sources
+            ]
 
     def resolve_sources(self) -> list[LineSource]:
         endpoints: list[LineSource] = []
@@ -149,8 +198,6 @@ class LineController:
                     endpoints.append(LineSource(url=url, ip=ip, healthy=True))
             except OSError:
                 endpoints.append(LineSource(url=url, ip=host, healthy=False, failures=1))
-        if not any(source.healthy for source in endpoints):
-            endpoints = [LineSource(url=url, ip=urlparse(url).hostname or url, healthy=True) for url in self.cfg.source_pool]
         return endpoints
 
     def log(self, message: str) -> None:
@@ -166,7 +213,8 @@ class LineController:
             rx_bytes = int(Path(path).read_text(encoding="utf-8").strip())
         except Exception:
             return
-        self.tracker.record(time.time(), rx_bytes)
+        with self.lock:
+            self.tracker.record(time.time(), rx_bytes)
 
     def _scheduler_loop(self) -> None:
         while not self.scheduler_stop.is_set():
@@ -184,6 +232,7 @@ class LineController:
         while not self.metrics_stop.is_set():
             try:
                 self.sample_metrics()
+                self._maintain_workers()
                 self._maybe_scale_workers()
             except Exception as exc:
                 self.log(f"metrics error={exc}")
@@ -191,6 +240,8 @@ class LineController:
 
     def _maybe_scale_workers(self) -> None:
         now = time.monotonic()
+        if self.tracker.sample_span_seconds() < 10:
+            return
         if now - self._last_scale_check < 10:
             return
         self._last_scale_check = now
@@ -198,42 +249,41 @@ class LineController:
             if not self.workers:
                 return
             avg60 = self.tracker.average_mbps(60) or self.tracker.average_mbps(10) or self.tracker.current_mbps
-            target_count = next_line_worker_count(self.cfg, len(self.workers), avg60)
-            if target_count == len(self.workers):
+            target_count = next_line_worker_count(self.cfg, self.desired_worker_count, avg60)
+            if target_count == self.desired_worker_count:
                 return
             self.desired_worker_count = target_count
             self._set_worker_count_locked(target_count)
             self.log(f"autoscale workers={target_count} avg60_mbps={avg60:.1f}")
 
     def _set_worker_count_locked(self, target_count: int) -> None:
-        target_count = max(0, target_count)
-        if len(self.workers) > target_count:
-            for worker_id in sorted(self.workers.keys(), reverse=True):
-                if len(self.workers) <= target_count:
-                    break
-                worker = self.workers.pop(worker_id)
+        target_count = max(0, min(target_count, self.cfg.max_connections))
+        if target_count == 0:
+            for worker in self.workers.values():
                 worker.stop()
-                if worker_id in self.worker_states:
-                    self.worker_states[worker_id].status = "stopped"
-        if len(self.workers) >= target_count:
+            self.workers = {}
+            return
+        if self.workers:
+            engine = next(iter(self.workers.values()))
+            engine.set_connection_count(target_count)
             return
         plan = build_line_worker_plan(self.cfg, worker_count=target_count, sources=self.sources)
-        for spec in plan:
-            if spec.worker_id in self.workers:
-                continue
-            stop_event = threading.Event()
-            state = LineWorkerState(worker_id=spec.worker_id, target=spec.target)
-            self.worker_states[spec.worker_id] = state
-            worker = LineDownloadWorker(self.cfg, spec, state, stop_event, self.log)
-            self.workers[spec.worker_id] = worker
-            try:
-                worker.start()
-            except RuntimeError as exc:
-                self.workers.pop(spec.worker_id, None)
-                state.status = "error"
-                state.last_error = f"worker thread failed: {exc}"
-                self.log(
-                    f"worker={spec.worker_id} thread failed: {exc}; "
-                    "increase the iKuai container memory/PID limit or lower CONNECTIONS"
-                )
-                break
+        primary = plan[0]
+        all_targets = tuple(dict.fromkeys([spec.target for spec in plan] + list(primary.fallback_targets)))
+        spec = LineWorkerSpec(
+            worker_id=1,
+            target=primary.target,
+            target_ip=primary.target_ip,
+            fallback_targets=tuple(url for url in all_targets if url != primary.target),
+        )
+        state = LineWorkerState(worker_id=1, target=spec.target, connections=target_count)
+        self.worker_states = {1: state}
+        engine = LineDownloadWorker(self.cfg, spec, state, self.log, connections=target_count)
+        self.workers = {1: engine}
+        engine.start()
+
+    def _maintain_workers(self) -> None:
+        with self.lock:
+            now = time.monotonic()
+            for worker in self.workers.values():
+                worker.poll(now)

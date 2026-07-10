@@ -35,6 +35,7 @@ ENV CONFIG_PATH=/data/config.json \
     PYTHON_COLORS=0 \
     NO_COLOR=1 \
     TERM=dumb \
+    GOMAXPROCS=2 \
     TZ=Asia/Shanghai
 
 EXPOSE 80

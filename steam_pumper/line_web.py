@@ -56,6 +56,7 @@ HTML = """<!doctype html>
     <span id="running" class="pill">loading</span>
     <span id="window" class="pill">loading</span>
     <span id="now" class="pill">loading</span>
+    <span id="apiError" class="pill" style="display:none;background:#fee2e2;color:#991b1b"></span>
     <div class="actions">
       <button class="primary" onclick="control('/api/start')">启动</button>
       <button class="danger" onclick="control('/api/stop')">停止</button>
@@ -69,8 +70,9 @@ HTML = """<!doctype html>
       <div class="metric">10 秒均值 <b id="avg10Mbps">0</b></div>
       <div class="metric">60 秒均值 <b id="avg60Mbps">0</b></div>
       <div class="metric">今日累计 <b id="todayBytes">0</b></div>
-      <div class="metric">目标达成 <b id="targetPercent">0%</b></div>
-      <div class="metric">Worker <b id="workerCount">0</b></div>
+      <div class="metric">60 秒速度达成 <b id="targetPercent">0%</b></div>
+      <div class="metric">今日流量完成 <b id="dailyTargetPercent">0%</b></div>
+      <div class="metric">连接数 <b id="workerCount">0</b></div>
     </div>
     <canvas id="trafficChart" width="1060" height="220"></canvas>
     <p id="capacityWarning" class="pill" style="display:none">源池或当前线路容量不足</p>
@@ -82,7 +84,7 @@ HTML = """<!doctype html>
         <label>目标带宽 Mbps <input name="target_mbps" type="number" min="1"></label>
         <label>基础连接数 <input name="connections" type="number" min="1" max="12"></label>
         <label>最大连接数 <input name="max_connections" type="number" min="1" max="12"></label>
-        <label>是否自动收敛
+        <label>超目标 115% 时减少连接
           <select name="rate_limit_enabled"><option value="true">是</option><option value="false">否</option></select>
         </label>
         <label>开始时间 <input name="start_time" type="time"></label>
@@ -97,8 +99,8 @@ HTML = """<!doctype html>
     <table><thead><tr><th>URL</th><th>IPv4</th><th>健康</th><th>失败</th></tr></thead><tbody id="sources"></tbody></table>
   </section>
   <section>
-    <h2>Worker</h2>
-    <table><thead><tr><th>ID</th><th>目标</th><th>状态</th><th>次数</th><th>PID</th><th>错误</th></tr></thead><tbody id="workers"></tbody></table>
+    <h2>下载引擎</h2>
+    <table><thead><tr><th>引擎</th><th>主源</th><th>状态</th><th>连接</th><th>重启</th><th>PID</th><th>错误</th></tr></thead><tbody id="workers"></tbody></table>
   </section>
   <section>
     <h2>日志</h2>
@@ -125,6 +127,9 @@ function fmtBytes(bytes) {
   if (bytes >= 1e6) return (bytes / 1e6).toFixed(2) + ' MB';
   return String(bytes || 0) + ' B';
 }
+function escapeHtml(value) {
+  return String(value ?? '').replace(/[&<>"']/g, char => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[char]));
+}
 function drawChart(target) {
   const canvas = document.getElementById('trafficChart');
   const ctx = canvas.getContext('2d');
@@ -150,9 +155,9 @@ function drawChart(target) {
   line(chartSamples.map(s => s.avg60), '#16a34a');
 }
 async function refresh() {
-  const status = await api('/api/status');
-  const metrics = await api('/api/metrics');
-  const sources = await api('/api/sources');
+  try {
+  const [status, metrics, sources] = await Promise.all([api('/api/status'), api('/api/metrics'), api('/api/sources')]);
+  document.getElementById('apiError').style.display = 'none';
   document.getElementById('running').textContent = status.running ? '运行中' : '已停止';
   document.getElementById('window').textContent = status.within_window ? '时间窗内' : '时间窗外';
   document.getElementById('now').textContent = status.now;
@@ -162,18 +167,24 @@ async function refresh() {
   document.getElementById('avg60Mbps').textContent = metrics.avg60_mbps.toFixed(0);
   document.getElementById('todayBytes').textContent = fmtBytes(metrics.today_bytes);
   document.getElementById('targetPercent').textContent = metrics.target_percent.toFixed(0) + '%';
+  document.getElementById('dailyTargetPercent').textContent = metrics.daily_target_percent.toFixed(1) + '%';
   document.getElementById('workerCount').textContent = metrics.worker_count + '/' + metrics.max_worker_count;
   document.getElementById('capacityWarning').style.display = metrics.capacity_warning ? 'inline-flex' : 'none';
   chartSamples.push({ current: metrics.current_mbps, avg60: metrics.avg60_mbps });
   while (chartSamples.length > 120) chartSamples.shift();
   drawChart(metrics.target_mbps);
   document.getElementById('workers').innerHTML = status.workers.map(w =>
-    `<tr><td>${w.worker_id}</td><td>${w.target || ''}</td><td>${w.status}</td><td>${w.cycles}</td><td>${w.current_pid || ''}</td><td>${w.last_error || ''}</td></tr>`
+    `<tr><td>${w.worker_id}</td><td>${escapeHtml(w.target)}</td><td>${escapeHtml(w.status)}</td><td>${w.connections || 0}</td><td>${w.restarts || 0}</td><td>${w.current_pid || ''}</td><td>${escapeHtml(w.last_error)}</td></tr>`
   ).join('');
   document.getElementById('sources').innerHTML = sources.map(s =>
-    `<tr><td>${s.url}</td><td>${s.ip || ''}</td><td>${s.healthy ? '是' : '否'}</td><td>${s.failures || 0}</td></tr>`
+    `<tr><td>${escapeHtml(s.url)}</td><td>${escapeHtml(s.ip)}</td><td>${s.healthy ? '是' : '否'}</td><td>${s.failures || 0}</td></tr>`
   ).join('');
   document.getElementById('logs').textContent = status.logs.join('\\n');
+  } catch (error) {
+    const banner = document.getElementById('apiError');
+    banner.textContent = '读取状态失败: ' + error.message;
+    banner.style.display = 'inline-flex';
+  }
 }
 async function control(path) {
   await api(path, { method: 'POST' });
