@@ -4,7 +4,7 @@ from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime
 
-from .config import PumperConfig
+from .config import CommonConfig
 
 
 @dataclass
@@ -51,21 +51,31 @@ class ThroughputTracker:
             return 0.0
         return max(0, newest_bytes - oldest_bytes) * 8 / elapsed / 1_000_000
 
-
-def next_worker_count(cfg: PumperConfig, current_workers: int, avg60_mbps: float) -> int:
-    min_workers = cfg.line_count * cfg.connections_per_line
-    max_workers = cfg.line_count * cfg.max_connections_per_line
-    current_workers = max(min_workers, min(current_workers, max_workers))
-    if avg60_mbps < cfg.target_mbps * 0.9 and current_workers < max_workers:
-        return min(max_workers, current_workers + cfg.line_count)
-    if cfg.rate_limit_enabled and avg60_mbps > cfg.target_mbps * 1.15 and current_workers > min_workers:
-        return max(min_workers, current_workers - cfg.line_count)
-    return current_workers
+    def sample_span_seconds(self) -> float:
+        if len(self.samples) < 2:
+            return 0.0
+        return max(0.0, self.samples[-1][0] - self.samples[0][0])
 
 
-def theoretical_window_bytes(cfg: PumperConfig) -> int:
-    start = cfg._parse_time(cfg.start_time, "start_time")
-    end = cfg._parse_time(cfg.end_time, "end_time")
+def next_connection_count(
+    base: int,
+    maximum: int,
+    current: int,
+    avg60_mbps: float,
+    target_mbps: int,
+    reduce_above_target: bool,
+) -> int:
+    current = max(base, min(current, maximum, 12))
+    if avg60_mbps < target_mbps * 0.9 and current < maximum:
+        return current + 1
+    if reduce_above_target and avg60_mbps > target_mbps * 1.15 and current > base:
+        return current - 1
+    return current
+
+
+def theoretical_window_bytes(target_mbps: int, start_time: str, end_time: str) -> int:
+    start = CommonConfig._parse_time(start_time, "start_time")
+    end = CommonConfig._parse_time(end_time, "end_time")
     start_seconds = start.hour * 3600 + start.minute * 60
     end_seconds = end.hour * 3600 + end.minute * 60
     if start_seconds == end_seconds:
@@ -74,4 +84,4 @@ def theoretical_window_bytes(cfg: PumperConfig) -> int:
         duration_seconds = end_seconds - start_seconds
     else:
         duration_seconds = 24 * 3600 - start_seconds + end_seconds
-    return int(cfg.target_mbps * 1_000_000 / 8 * duration_seconds)
+    return int(target_mbps * 1_000_000 / 8 * duration_seconds)

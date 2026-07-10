@@ -1,7 +1,6 @@
 import unittest
 
-from steam_pumper.config import PumperConfig
-from steam_pumper.metrics import ThroughputTracker, next_worker_count, theoretical_window_bytes
+from steam_pumper.metrics import ThroughputTracker, next_connection_count, theoretical_window_bytes
 
 
 class MetricsTests(unittest.TestCase):
@@ -25,22 +24,24 @@ class MetricsTests(unittest.TestCase):
 
         self.assertEqual(tracker.today_bytes, 0)
 
-    def test_autoscaler_grows_below_ninety_percent_target(self):
-        cfg = PumperConfig(line_count=2, connections_per_line=6, max_connections_per_line=10, target_mbps=800)
+    def test_tracker_reports_sample_span(self):
+        tracker = ThroughputTracker()
+        tracker.record(10.0, 0)
+        tracker.record(14.5, 10)
 
-        self.assertEqual(next_worker_count(cfg, current_workers=12, avg60_mbps=700), 14)
-        self.assertEqual(next_worker_count(cfg, current_workers=20, avg60_mbps=700), 20)
+        self.assertEqual(tracker.sample_span_seconds(), 4.5)
+
+    def test_autoscaler_grows_below_ninety_percent_target(self):
+        self.assertEqual(next_connection_count(6, 10, 6, 350, 400, True), 7)
+        self.assertEqual(next_connection_count(6, 10, 10, 350, 400, True), 10)
 
     def test_autoscaler_can_shrink_when_over_upper_bound(self):
-        cfg = PumperConfig(line_count=2, connections_per_line=6, max_connections_per_line=10, target_mbps=800)
-
-        self.assertEqual(next_worker_count(cfg, current_workers=14, avg60_mbps=950), 12)
-        self.assertEqual(next_worker_count(cfg, current_workers=12, avg60_mbps=950), 12)
+        self.assertEqual(next_connection_count(6, 10, 8, 500, 400, True), 7)
+        self.assertEqual(next_connection_count(6, 10, 6, 500, 400, True), 6)
+        self.assertEqual(next_connection_count(6, 10, 8, 500, 400, False), 8)
 
     def test_theoretical_window_bytes_uses_target_mbps_and_runtime_window(self):
-        cfg = PumperConfig(target_mbps=800, start_time="00:00", end_time="18:00")
-
-        self.assertEqual(theoretical_window_bytes(cfg), 6_480_000_000_000)
+        self.assertEqual(theoretical_window_bytes(800, "00:00", "18:00"), 6_480_000_000_000)
 
 
 if __name__ == "__main__":
