@@ -1,42 +1,77 @@
 import json
 import threading
 import unittest
+import urllib.error
 import urllib.request
-from http.server import ThreadingHTTPServer
+from http.server import HTTPServer
 
-from steam_pumper.web import Handler
-from steam_pumper.web import HTML
+from steam_pumper.web import Handler, render_html
+
+
+class DummyConfig:
+    def to_dict(self):
+        return {"target_mbps": 800}
 
 
 class DummyController:
-    cfg = type("Cfg", (), {"to_dict": lambda self: {}})()
+    cfg = DummyConfig()
 
     def status(self):
-        return {"ok": True}
+        return {"running": False, "config": self.cfg.to_dict(), "logs": []}
 
     def metrics(self):
-        return {"target_mbps": 800, "avg60_mbps": 760}
+        return {"target_mbps": 800, "avg60_mbps": 760, "lines": []}
 
     def source_snapshot(self):
         return [{"url": "https://example.test/file", "ip": "203.0.113.1", "healthy": True}]
 
+    def set_manual_enabled(self, _enabled):
+        return None
+
+    def start_downloads(self):
+        return None
+
+    def update_config(self, _data):
+        return self.cfg
+
 
 class WebTests(unittest.TestCase):
-    def test_config_form_exposes_egress_mode_and_lan_ips(self):
-        self.assertIn('name="egress_mode"', HTML)
-        self.assertIn('name="lan_ips"', HTML)
-        self.assertIn("单 IP", HTML)
-        self.assertIn("多 IP", HTML)
+    def test_ikuai_console_has_no_ip_or_line_count_fields(self):
+        html = render_html("ikuai_line")
 
-    def test_metrics_and_sources_api_endpoints(self):
+        self.assertIn('name="target_mbps"', html)
+        self.assertIn('name="connections_per_line"', html)
+        self.assertNotIn('name="line_count"', html)
+        self.assertNotIn('name="lan_ips"', html)
+        self.assertNotIn("EGRESS_MODE", html)
+
+    def test_multi_ip_console_adds_only_topology_fields(self):
+        html = render_html("multi_ip")
+
+        self.assertIn('name="line_count"', html)
+        self.assertIn('name="lan_ips"', html)
+        self.assertNotIn('name="egress_mode"', html)
+        self.assertNotIn("新建连接数", html)
+
+    def test_console_escapes_table_values_and_uses_text_content_for_logs(self):
+        html = render_html("multi_ip")
+
+        self.assertIn("function escapeHtml", html)
+        self.assertIn("escapeHtml(line.bind_ip", html)
+        self.assertIn("escapeHtml(source.url", html)
+        self.assertIn("logs').textContent", html)
+
+    def test_metrics_sources_and_config_api_endpoints(self):
         Handler.controller = DummyController()
-        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        Handler.topology_name = "ikuai_line"
+        server = HTTPServer(("127.0.0.1", 0), Handler)
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
         base = f"http://127.0.0.1:{server.server_port}"
         try:
-            metrics = json.loads(urllib.request.urlopen(f"{base}/api/metrics", timeout=2).read().decode("utf-8"))
-            sources = json.loads(urllib.request.urlopen(f"{base}/api/sources", timeout=2).read().decode("utf-8"))
+            metrics = self._get_json(f"{base}/api/metrics")
+            sources = self._get_json(f"{base}/api/sources")
+            config = self._get_json(f"{base}/api/config")
         finally:
             server.shutdown()
             server.server_close()
@@ -44,6 +79,40 @@ class WebTests(unittest.TestCase):
 
         self.assertEqual(metrics["target_mbps"], 800)
         self.assertEqual(sources[0]["ip"], "203.0.113.1")
+        self.assertEqual(config["target_mbps"], 800)
+
+    def test_api_errors_are_json(self):
+        class RejectingController(DummyController):
+            def update_config(self, _data):
+                raise ValueError("bad config")
+
+        Handler.controller = RejectingController()
+        Handler.topology_name = "ikuai_line"
+        server = HTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        request = urllib.request.Request(
+            f"http://127.0.0.1:{server.server_port}/api/config",
+            data=b"{}",
+            headers={"content-type": "application/json"},
+            method="POST",
+        )
+        try:
+            with self.assertRaises(urllib.error.HTTPError) as raised:
+                urllib.request.urlopen(request, timeout=2)
+            payload = json.loads(raised.exception.read().decode("utf-8"))
+            raised.exception.close()
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2)
+
+        self.assertEqual(raised.exception.code, 400)
+        self.assertEqual(payload, {"error": "bad config"})
+
+    @staticmethod
+    def _get_json(url):
+        return json.loads(urllib.request.urlopen(url, timeout=2).read().decode("utf-8"))
 
 
 if __name__ == "__main__":
