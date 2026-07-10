@@ -1,13 +1,50 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
 )
+
+func TestValidateOptionsRejectsMoreThanTwelveConnections(t *testing.T) {
+	for _, opts := range []options{
+		{connections: 13, maxConnections: 13, urls: []string{"http://example.test/file"}},
+		{connections: 1, maxConnections: 13, urls: []string{"http://example.test/file"}},
+	} {
+		if err := validateOptions(&opts); err == nil || !strings.Contains(err.Error(), "12") {
+			t.Fatalf("expected hard-cap error, got %v", err)
+		}
+	}
+}
+
+func TestCountingWriterReportsBytesBeforeRequestCompletes(t *testing.T) {
+	var total atomic.Int64
+	writer := countingWriter{total: &total}
+	n, err := writer.Write(make([]byte, 4096))
+	if err != nil || n != 4096 || total.Load() != 4096 {
+		t.Fatalf("n=%d total=%d err=%v", n, total.Load(), err)
+	}
+}
+
+func TestStatusEventIsNewlineDelimitedJSON(t *testing.T) {
+	var output bytes.Buffer
+	err := writeStatus(&output, statusEvent{
+		Type: "status", LineID: "line-1", BindIP: "192.168.1.233", Bytes: 42, Connections: 2,
+	})
+	if err != nil || !strings.HasSuffix(output.String(), "\n") {
+		t.Fatalf("output=%q err=%v", output.String(), err)
+	}
+	var decoded statusEvent
+	if err := json.Unmarshal(bytes.TrimSpace(output.Bytes()), &decoded); err != nil || decoded.Bytes != 42 {
+		t.Fatalf("decoded=%+v err=%v", decoded, err)
+	}
+}
 
 func TestDownloadOnceDiscardsBodyAndReturnsByteCount(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {

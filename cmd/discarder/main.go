@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
@@ -11,20 +12,46 @@ import (
 	"os"
 	"os/signal"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 )
 
 type options struct {
-	workerID             string
-	connections          int
-	maxConnections       int
-	minSessionSeconds    int
-	startupJitterSeconds float64
-	restartJitterSeconds float64
-	readTimeoutSeconds   int
-	bindIP               string
-	urls                 []string
+	workerID              string
+	lineID                string
+	connections           int
+	maxConnections        int
+	minSessionSeconds     int
+	startupJitterSeconds  float64
+	restartJitterSeconds  float64
+	readTimeoutSeconds    int
+	statusIntervalSeconds int
+	bindIP                string
+	urls                  []string
+	statusWriter          io.Writer
+}
+
+const maxConnectionLimit = 12
+
+type statusEvent struct {
+	Type        string `json:"type"`
+	LineID      string `json:"line_id"`
+	BindIP      string `json:"bind_ip,omitempty"`
+	Bytes       int64  `json:"bytes"`
+	Connections int32  `json:"connections"`
+	URL         string `json:"url,omitempty"`
+	Error       string `json:"error,omitempty"`
+	Recovered   bool   `json:"recovered,omitempty"`
+}
+
+type countingWriter struct {
+	total *atomic.Int64
+}
+
+type statusSink struct {
+	mu     sync.Mutex
+	writer io.Writer
 }
 
 type idleTimeoutConn struct {
@@ -73,8 +100,30 @@ func (conn *idleTimeoutConn) Read(buffer []byte) (int, error) {
 	return conn.Conn.Read(buffer)
 }
 
+func (writer countingWriter) Write(buffer []byte) (int, error) {
+	writer.total.Add(int64(len(buffer)))
+	return len(buffer), nil
+}
+
+func writeStatus(output io.Writer, event statusEvent) error {
+	return json.NewEncoder(output).Encode(event)
+}
+
+func (sink *statusSink) emit(event statusEvent) {
+	if sink == nil || sink.writer == nil {
+		return
+	}
+	sink.mu.Lock()
+	defer sink.mu.Unlock()
+	_ = writeStatus(sink.writer, event)
+}
+
 func main() {
 	opts := parseOptions()
+	if err := validateOptions(&opts); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(2)
+	}
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 	defer stop()
 	if err := run(ctx, opts); err != nil {
@@ -86,29 +135,67 @@ func main() {
 func parseOptions() options {
 	var opts options
 	flag.StringVar(&opts.workerID, "worker-id", "0", "worker id for user-agent")
+	flag.StringVar(&opts.lineID, "line-id", "line-1", "logical line id for status output")
 	flag.IntVar(&opts.connections, "connections", 1, "initial concurrent downloads")
 	flag.IntVar(&opts.maxConnections, "max-connections", 12, "maximum concurrent downloads")
 	flag.IntVar(&opts.minSessionSeconds, "min-session-seconds", 300, "minimum intended worker session duration")
 	flag.Float64Var(&opts.startupJitterSeconds, "startup-jitter-seconds", 0, "maximum jitter before the first request")
 	flag.Float64Var(&opts.restartJitterSeconds, "restart-jitter-seconds", 3, "maximum jitter after each short download")
 	flag.IntVar(&opts.readTimeoutSeconds, "read-timeout-seconds", 30, "HTTP client timeout per request")
+	flag.IntVar(&opts.statusIntervalSeconds, "status-interval-seconds", 1, "status output interval, or 0 to disable")
 	flag.StringVar(&opts.bindIP, "bind-ip", "", "local IPv4 address to bind outbound connections")
 	flag.Parse()
 	opts.urls = flag.Args()
-	if len(opts.urls) == 0 {
-		fmt.Fprintln(os.Stderr, "at least one URL is required")
-		os.Exit(2)
-	}
 	return opts
 }
 
-func run(ctx context.Context, opts options) error {
-	if opts.connections < 1 {
+func validateOptions(opts *options) error {
+	if opts.connections == 0 {
 		opts.connections = 1
 	}
-	if opts.maxConnections < opts.connections {
-		opts.maxConnections = opts.connections
+	if opts.maxConnections == 0 {
+		opts.maxConnections = maxConnectionLimit
 	}
+	if opts.connections < 1 || opts.connections > maxConnectionLimit {
+		return fmt.Errorf("connections must be between 1 and %d", maxConnectionLimit)
+	}
+	if opts.maxConnections < 1 || opts.maxConnections > maxConnectionLimit {
+		return fmt.Errorf("max-connections must be between 1 and %d", maxConnectionLimit)
+	}
+	if opts.maxConnections < opts.connections {
+		return fmt.Errorf("max-connections must be greater than or equal to connections")
+	}
+	if opts.statusIntervalSeconds < 0 {
+		return fmt.Errorf("status-interval-seconds must be 0 or greater")
+	}
+	if opts.bindIP != "" {
+		parsedIP := net.ParseIP(opts.bindIP)
+		if parsedIP == nil || parsedIP.To4() == nil {
+			return fmt.Errorf("bind-ip must be a valid IPv4 address")
+		}
+	}
+	if len(opts.urls) == 0 {
+		return fmt.Errorf("at least one URL is required")
+	}
+	if opts.lineID == "" {
+		opts.lineID = "line-1"
+	}
+	return nil
+}
+
+func run(ctx context.Context, opts options) error {
+	if err := validateOptions(&opts); err != nil {
+		return err
+	}
+	writer := opts.statusWriter
+	if writer == nil {
+		writer = os.Stdout
+	}
+	sink := &statusSink{writer: writer}
+	var totalBytes atomic.Int64
+	var activeConnections atomic.Int32
+	var currentSource atomic.Value
+	currentSource.Store("")
 	type workerResult struct {
 		id  int
 		err error
@@ -119,8 +206,12 @@ func run(ctx context.Context, opts options) error {
 	startWorker := func(id int) {
 		workerCtx, cancel := context.WithCancel(ctx)
 		workers[id] = cancel
+		activeConnections.Add(1)
 		go func() {
-			results <- workerResult{id: id, err: runWorker(workerCtx, opts, id, health)}
+			results <- workerResult{
+				id:  id,
+				err: runWorker(workerCtx, opts, id, health, &totalBytes, &currentSource, sink),
+			}
 		}()
 	}
 	for id := 1; id <= opts.connections; id++ {
@@ -129,6 +220,13 @@ func run(ctx context.Context, opts options) error {
 	scaleSignals := make(chan os.Signal, 16)
 	signal.Notify(scaleSignals, syscall.SIGUSR1, syscall.SIGUSR2)
 	defer signal.Stop(scaleSignals)
+	var statusTicker *time.Ticker
+	var statusUpdates <-chan time.Time
+	if opts.statusIntervalSeconds > 0 {
+		statusTicker = time.NewTicker(time.Duration(opts.statusIntervalSeconds) * time.Second)
+		statusUpdates = statusTicker.C
+		defer statusTicker.Stop()
+	}
 	for {
 		select {
 		case <-ctx.Done():
@@ -148,6 +246,7 @@ func run(ctx context.Context, opts options) error {
 				for id := opts.maxConnections; id >= 1; id-- {
 					if cancel, exists := workers[id]; exists {
 						delete(workers, id)
+						activeConnections.Add(-1)
 						cancel()
 						break
 					}
@@ -158,6 +257,7 @@ func run(ctx context.Context, opts options) error {
 				continue
 			}
 			delete(workers, result.id)
+			activeConnections.Add(-1)
 			if ctx.Err() != nil {
 				return nil
 			}
@@ -165,11 +265,29 @@ func run(ctx context.Context, opts options) error {
 				fmt.Fprintf(os.Stderr, "connection=%d stopped: %v\n", result.id, result.err)
 			}
 			startWorker(result.id)
+		case <-statusUpdates:
+			source, _ := currentSource.Load().(string)
+			sink.emit(statusEvent{
+				Type:        "status",
+				LineID:      opts.lineID,
+				BindIP:      opts.bindIP,
+				Bytes:       totalBytes.Load(),
+				Connections: activeConnections.Load(),
+				URL:         source,
+			})
 		}
 	}
 }
 
-func runWorker(ctx context.Context, opts options, connectionID int, health *sourceHealth) error {
+func runWorker(
+	ctx context.Context,
+	opts options,
+	connectionID int,
+	health *sourceHealth,
+	totalBytes *atomic.Int64,
+	currentSource *atomic.Value,
+	sink *statusSink,
+) error {
 	timeout := time.Duration(opts.readTimeoutSeconds) * time.Second
 	client := newHTTPClient(timeout, opts.bindIP)
 	urlIndex := connectionID - 1
@@ -203,12 +321,14 @@ func runWorker(ctx context.Context, opts options, connectionID int, health *sour
 			continue
 		}
 		workerID := fmt.Sprintf("%s-%d", opts.workerID, connectionID)
-		if _, err := downloadOnce(ctx, client, url, workerID); err != nil {
+		currentSource.Store(url)
+		if _, err := downloadOnceTracked(ctx, client, url, workerID, totalBytes); err != nil {
 			if ctx.Err() != nil {
 				return nil
 			}
 			failures++
 			delay := health.failed(url, time.Now())
+			sink.emit(statusEvent{Type: "source", LineID: opts.lineID, BindIP: opts.bindIP, URL: url, Error: err.Error()})
 			fmt.Fprintf(os.Stderr, "worker=%s url=%s error=%v retry_in=%s\n", workerID, url, err, delay)
 			if failures >= 12 && time.Since(startedAt) >= time.Duration(opts.minSessionSeconds)*time.Second {
 				return fmt.Errorf("all sources remained unavailable after %d attempts", failures)
@@ -216,6 +336,7 @@ func runWorker(ctx context.Context, opts options, connectionID int, health *sour
 			continue
 		}
 		if health.recovered(url) {
+			sink.emit(statusEvent{Type: "source", LineID: opts.lineID, BindIP: opts.bindIP, URL: url, Recovered: true})
 			fmt.Fprintf(os.Stderr, "worker=%s url=%s recovered=true\n", workerID, url)
 		}
 		failures = 0
@@ -269,11 +390,21 @@ func newHTTPClient(timeout time.Duration, bindIP string) *http.Client {
 }
 
 func downloadOnce(ctx context.Context, client *http.Client, url string, workerID string) (int64, error) {
+	return downloadOnceTracked(ctx, client, url, workerID, nil)
+}
+
+func downloadOnceTracked(
+	ctx context.Context,
+	client *http.Client,
+	url string,
+	workerID string,
+	totalBytes *atomic.Int64,
+) (int64, error) {
 	request, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return 0, err
 	}
-	request.Header.Set("User-Agent", "steam-download-pumper/"+workerID)
+	request.Header.Set("User-Agent", "broadband-pumper/"+workerID)
 	response, err := client.Do(request)
 	if err != nil {
 		return 0, err
@@ -283,7 +414,11 @@ func downloadOnce(ctx context.Context, client *http.Client, url string, workerID
 		return 0, fmt.Errorf("unexpected HTTP status %s", response.Status)
 	}
 	buffer := make([]byte, 64*1024)
-	return io.CopyBuffer(io.Discard, response.Body, buffer)
+	destination := io.Writer(io.Discard)
+	if totalBytes != nil {
+		destination = countingWriter{total: totalBytes}
+	}
+	return io.CopyBuffer(destination, response.Body, buffer)
 }
 
 func sleepWithContext(ctx context.Context, duration time.Duration) error {
