@@ -37,8 +37,6 @@ class IkuaiLineModeTests(unittest.TestCase):
             "LINE_COUNT": "2",
             "EGRESS_MODE": "multi_ip",
             "LAN_IPS": "192.168.1.233,192.168.1.234",
-            "DOWNLOAD_MODE": "steam_tmpfs",
-            "APP_IDS": "90",
         }
         for key, value in rejected.items():
             with self.subTest(key=key):

@@ -1,2 +1,1 @@
-"""Steam anonymous download pumper service."""
-
+"""Broadband HTTP download pumper service."""

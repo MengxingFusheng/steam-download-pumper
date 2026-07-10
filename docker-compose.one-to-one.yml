@@ -17,11 +17,8 @@ services:
       net.ipv6.conf.lo.disable_ipv6: "1"
     volumes:
       - ./data:/data
-      - steamcmd-bin:/home/steam/steamcmd
-      - steamcmd-state:/home/steam/Steam
     read_only: true
     tmpfs:
-      - /steam/downloads:size=${DOWNLOAD_TMPFS_SIZE:-8g},mode=1777
       - /tmp:size=256m,mode=1777
       - /run:size=64m,mode=755
     logging:
@@ -44,15 +41,11 @@ services:
       RATE_LIMIT_ENABLED: "${RATE_LIMIT_ENABLED:-true}"
       START_TIME: "${START_TIME:-00:00}"
       END_TIME: "${END_TIME:-18:00}"
-      APP_IDS: "${APP_IDS:-90}"
-      DOWNLOAD_MODE: "${DOWNLOAD_MODE:-public_http}"
       SOURCE_POOL: "${SOURCE_POOL:-http://mobile.shunicomtest.com:8080/speedtest/random4000x4000.jpg,http://speedtest1.online.sh.cn:8080/speedtest/random4000x4000.jpg,http://5gzhenjiang.speedtest.jsinfo.net:8080/speedtest/random4000x4000.jpg,http://4gsuzhou1.speedtest.jsinfo.net:8080/speedtest/random4000x4000.jpg}"
-      DELETE_AFTER_CYCLE: "${DELETE_AFTER_CYCLE:-true}"
       LOOP_PAUSE_SECONDS: "${LOOP_PAUSE_SECONDS:-0}"
       STARTUP_STAGGER_SECONDS: "${STARTUP_STAGGER_SECONDS:-2}"
       WORKER_MIN_SESSION_SECONDS: "${WORKER_MIN_SESSION_SECONDS:-300}"
       WORKER_RESTART_JITTER_SECONDS: "${WORKER_RESTART_JITTER_SECONDS:-3}"
-      BOOTSTRAP_TIMEOUT_SECONDS: "${BOOTSTRAP_TIMEOUT_SECONDS:-1800}"
       SCHEDULE_POLL_SECONDS: "${SCHEDULE_POLL_SECONDS:-30}"
       IKUAI_BASE_URL: "${IKUAI_BASE_URL:-}"
       IKUAI_TOKEN: "${IKUAI_TOKEN:-}"
@@ -67,7 +60,3 @@ networks:
       config:
         - subnet: ${LAN_SUBNET:-192.168.1.0/24}
           gateway: ${LAN_GATEWAY:-192.168.1.1}
-
-volumes:
-  steamcmd-bin:
-  steamcmd-state:

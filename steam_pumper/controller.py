@@ -14,7 +14,7 @@ from .config import PumperConfig, load_config, save_config
 from .ikuai import fetch_interfaces_status
 from .metrics import ThroughputTracker, next_worker_count, theoretical_window_bytes
 from .networking import apply_lan_ips
-from .worker import DownloadWorker, SourceEndpoint, WorkerState, bootstrap_steamcmd, build_worker_plan
+from .worker import DownloadWorker, SourceEndpoint, WorkerState, build_worker_plan
 
 
 class PumperController:
@@ -25,7 +25,6 @@ class PumperController:
         self.scheduler_stop = threading.Event()
         self.metrics_stop = threading.Event()
         self.manual_enabled = True
-        self.bootstrap_in_progress = False
         self.cfg = load_config(self.config_path)
         self.workers: dict[int, DownloadWorker] = {}
         self.worker_states: dict[int, WorkerState] = {}
@@ -48,31 +47,14 @@ class PumperController:
 
     def start_downloads(self) -> None:
         with self.lock:
-            if self.workers or self.bootstrap_in_progress:
+            if self.workers:
                 return
-            self.bootstrap_in_progress = self.cfg.download_mode == "steam_tmpfs"
-        ready = True
-        bootstrap_log = ""
-        if self.cfg.download_mode == "steam_tmpfs":
-            ready, bootstrap_log = bootstrap_steamcmd(self.cfg.bootstrap_timeout_seconds)
-        try:
-            if not ready:
-                self.log(f"steamcmd bootstrap failed: {bootstrap_log}")
-                return
-            if self.cfg.download_mode == "steam_tmpfs":
-                self.log("steamcmd bootstrap completed")
-            with self.lock:
-                if self.workers:
-                    return
-                self.sources = self.resolve_sources()
-                self.desired_worker_count = self.cfg.line_count * self.cfg.connections_per_line
-                self.worker_states = {}
-                self.workers = {}
-                self._set_worker_count_locked(self.desired_worker_count)
-                self.log(f"started {len(self.workers)} workers")
-        finally:
-            with self.lock:
-                self.bootstrap_in_progress = False
+            self.sources = self.resolve_sources()
+            self.desired_worker_count = self.cfg.line_count * self.cfg.connections_per_line
+            self.worker_states = {}
+            self.workers = {}
+            self._set_worker_count_locked(self.desired_worker_count)
+            self.log(f"started {len(self.workers)} workers")
 
     def stop_downloads(self) -> None:
         with self.lock:
@@ -92,8 +74,6 @@ class PumperController:
         with self.lock:
             merged = self.cfg.to_dict()
             merged.update(clean)
-            if isinstance(merged.get("app_ids"), str):
-                merged["app_ids"] = [item.strip() for item in merged["app_ids"].split(",") if item.strip()]
             if isinstance(merged.get("lan_ips"), str):
                 merged["lan_ips"] = [item.strip() for item in merged["lan_ips"].replace("\n", ",").split(",") if item.strip()]
             new_cfg = PumperConfig(**merged).validate()
@@ -119,7 +99,6 @@ class PumperController:
         with self.lock:
             return {
                 "running": bool(self.workers),
-                "bootstrap_in_progress": self.bootstrap_in_progress,
                 "manual_enabled": self.manual_enabled,
                 "within_window": self.cfg.is_within_window(now.time()),
                 "now": now.isoformat(timespec="seconds"),
@@ -167,8 +146,6 @@ class PumperController:
             return [source.__dict__.copy() for source in sources]
 
     def resolve_sources(self) -> list[SourceEndpoint]:
-        if self.cfg.download_mode != "public_http":
-            return [SourceEndpoint(url=app_id, ip=app_id, healthy=True) for app_id in self.cfg.app_ids]
         endpoints: list[SourceEndpoint] = []
         for url in self.cfg.source_pool:
             host = urlparse(url).hostname

@@ -1,7 +1,7 @@
 import unittest
 
 from steam_pumper.config import PumperConfig
-from steam_pumper.worker import SourceEndpoint, build_download_command, build_worker_plan, steamcmd_command
+from steam_pumper.worker import SourceEndpoint, build_download_command, build_worker_plan
 
 
 class WorkerPlanTests(unittest.TestCase):
@@ -35,19 +35,8 @@ class WorkerPlanTests(unittest.TestCase):
 
         self.assertEqual([worker.rate_limit_kbps for worker in plan], [None, None, None, None])
 
-    def test_steamcmd_command_uses_anonymous_login_by_default(self):
-        cfg = PumperConfig(app_ids=["740"], install_root="/downloads")
-
-        command = steamcmd_command(cfg, "740", 2)
-
-        self.assertIn("+login", command)
-        self.assertIn("anonymous", command)
-        self.assertIn("+app_update", command)
-        self.assertIn("740", command)
-        self.assertIn("/downloads/worker-2/app-740", command)
-
     def test_public_http_command_downloads_to_go_discarder(self):
-        cfg = PumperConfig(download_mode="public_http", source_pool=["https://example.test/file.bin"])
+        cfg = PumperConfig(source_pool=["https://example.test/file.bin"])
 
         command = build_download_command(cfg, "https://example.test/file.bin", 3)
 
@@ -56,10 +45,9 @@ class WorkerPlanTests(unittest.TestCase):
         self.assertIn("--min-session-seconds", command)
         self.assertIn("--restart-jitter-seconds", command)
         self.assertIn("https://example.test/file.bin", command)
-        self.assertNotIn("steamcmd", " ".join(command))
 
     def test_public_http_command_can_bind_to_line_source_ip(self):
-        cfg = PumperConfig(download_mode="public_http", source_pool=["https://example.test/file.bin"])
+        cfg = PumperConfig(source_pool=["https://example.test/file.bin"])
 
         command = build_download_command(cfg, "https://example.test/file.bin", 3, source_ip="192.168.1.234")
 

@@ -120,15 +120,10 @@ fi
   ask_env RATE_LIMIT_ENABLED "是否限速 true/false" "true"
   ask_env START_TIME "每天开始时间 HH:MM" "00:00"
   ask_env END_TIME "每天结束时间 HH:MM" "18:00"
-  ask_env DOWNLOAD_MODE "下载模式 public_http/steam_tmpfs" "public_http"
   ask_env SOURCE_POOL "公共源 URL，多个用英文逗号分隔" "http://mobile.shunicomtest.com:8080/speedtest/random4000x4000.jpg,http://speedtest1.online.sh.cn:8080/speedtest/random4000x4000.jpg,http://5gzhenjiang.speedtest.jsinfo.net:8080/speedtest/random4000x4000.jpg,http://4gsuzhou1.speedtest.jsinfo.net:8080/speedtest/random4000x4000.jpg"
-  ask_env APP_IDS "Steam tmpfs 模式 AppID，多个用英文逗号分隔" "90"
-  ask_env DELETE_AFTER_CYCLE "每轮下载后删除以便循环 true/false" "true"
-  ask_env DOWNLOAD_TMPFS_SIZE "游戏下载内存盘大小，例如 8g/16g" "8g"
   ask_env STARTUP_STAGGER_SECONDS "worker 启动间隔秒数" "2"
   ask_env WORKER_MIN_SESSION_SECONDS "worker 最小会话秒数" "300"
   ask_env WORKER_RESTART_JITTER_SECONDS "短文件重连随机抖动秒数" "3"
-  ask_env BOOTSTRAP_TIMEOUT_SECONDS "SteamCMD 首次自更新超时秒数" "1800"
 } > .env
 
 docker compose up -d --build

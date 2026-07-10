@@ -1,5 +1,4 @@
 import tempfile
-import threading
 import time
 import unittest
 from pathlib import Path
@@ -10,61 +9,6 @@ from steam_pumper.controller import PumperController
 
 
 class ControllerTests(unittest.TestCase):
-    def test_status_does_not_block_during_steamcmd_bootstrap(self):
-        with tempfile.TemporaryDirectory() as tmpdir:
-            config_path = Path(tmpdir) / "config.json"
-            save_config(config_path, PumperConfig(line_count=2, connections_per_line=1, download_mode="steam_tmpfs"))
-            controller = PumperController(config_path)
-            entered = threading.Event()
-            release = threading.Event()
-
-            def slow_bootstrap(_timeout_seconds):
-                entered.set()
-                release.wait(timeout=2)
-                return False, "deliberately slow"
-
-            with patch("steam_pumper.controller.bootstrap_steamcmd", slow_bootstrap):
-                thread = threading.Thread(target=controller.start_downloads)
-                thread.start()
-                self.assertTrue(entered.wait(timeout=1))
-
-                started = time.monotonic()
-                status = controller.status()
-                elapsed = time.monotonic() - started
-
-                release.set()
-                thread.join(timeout=2)
-
-        self.assertFalse(status["running"])
-        self.assertLess(elapsed, 0.5)
-
-    def test_start_downloads_is_single_flight_during_bootstrap(self):
-        with tempfile.TemporaryDirectory() as tmpdir:
-            config_path = Path(tmpdir) / "config.json"
-            save_config(config_path, PumperConfig(line_count=2, connections_per_line=1, download_mode="steam_tmpfs"))
-            controller = PumperController(config_path)
-            entered = threading.Event()
-            release = threading.Event()
-            calls = []
-
-            def slow_bootstrap(_timeout_seconds):
-                calls.append(1)
-                entered.set()
-                release.wait(timeout=2)
-                return False, "deliberately slow"
-
-            with patch("steam_pumper.controller.bootstrap_steamcmd", slow_bootstrap):
-                thread = threading.Thread(target=controller.start_downloads)
-                thread.start()
-                self.assertTrue(entered.wait(timeout=1))
-                controller.start_downloads()
-                status = controller.status()
-                release.set()
-                thread.join(timeout=2)
-
-        self.assertEqual(len(calls), 1)
-        self.assertTrue(status["bootstrap_in_progress"])
-
     def test_metrics_snapshot_reports_target_and_daily_goal(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             config_path = Path(tmpdir) / "config.json"

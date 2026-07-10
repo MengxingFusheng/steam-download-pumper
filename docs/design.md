@@ -1,6 +1,6 @@
 # Design
 
-The service uses a small Python controller, a static web console, and a tiny Go HTTP discarder helper. The controller owns configuration, the daily schedule, worker lifecycle, metrics snapshots, source resolution, and adaptive worker counts. Public HTTP workers are long-running `discarder` processes that force IPv4 and stream response bodies to `io.Discard`; Steam workers are optional `steamcmd` processes using anonymous login.
+The service uses a small Python controller, a static web console, and a tiny Go HTTP discarder helper. The controller owns configuration, the daily schedule, worker lifecycle, metrics snapshots, source resolution, and adaptive worker counts. Public HTTP workers are long-running `discarder` processes that force IPv4 and stream response bodies to `io.Discard`.
 
 Traffic distribution is connection based: base workers are calculated as `line_count * connections_per_line`, and worker line indexes rotate evenly across configured lines. The controller samples container RX bytes every second and grows workers by one line group when the 60-second average is below 90% of `target_mbps`, up to `line_count * max_connections_per_line`; `max_connections_per_line` is hard-capped at 12. Public HTTP source assignment spreads workers across resolved IPv4 endpoints to avoid piling most connections onto a single remote IP.
 

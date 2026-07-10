@@ -6,42 +6,37 @@ COPY cmd/discarder ./cmd/discarder
 RUN go test ./cmd/discarder \
     && CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /out/discarder ./cmd/discarder
 
-FROM cm2network/steamcmd:root
+FROM python:3.13-slim
 
 ARG DEFAULT_EGRESS_MODE=single_ip
 ARG DEFAULT_LINE_COUNT=2
 ARG DEFAULT_LAN_IP=192.168.1.233
 ARG DEFAULT_LAN_IPS=192.168.1.233
 
-USER root
-
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends python3 trickle ca-certificates iproute2 \
-    && mkdir -p /usr/lib/trickle \
-    && ln -sf /usr/lib/x86_64-linux-gnu/trickle/trickle-overload.so /usr/lib/trickle/trickle-overload.so \
-    && ln -sf /usr/lib/x86_64-linux-gnu/trickle/libtrickle.so /usr/lib/trickle/libtrickle.so \
+    && apt-get install -y --no-install-recommends ca-certificates iproute2 \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 COPY steam_pumper /app/steam_pumper
 COPY --from=discarder-builder /out/discarder /usr/local/bin/discarder
 
-RUN mkdir -p /data /steam/downloads /tmp /run \
-    && chown -R steam:steam /data /steam /app /tmp /run \
-    && chmod 1777 /tmp /steam/downloads
-
-USER root
+RUN mkdir -p /data /tmp /run \
+    && chmod 1777 /tmp
 
 ENV CONFIG_PATH=/data/config.json \
     WEB_PORT=80 \
-    STEAMCMD_BIN=/home/steam/steamcmd/steamcmd.sh \
     EGRESS_MODE=${DEFAULT_EGRESS_MODE} \
     LINE_COUNT=${DEFAULT_LINE_COUNT} \
     LAN_IP=${DEFAULT_LAN_IP} \
     LAN_IPS=${DEFAULT_LAN_IPS} \
     PYTHONDONTWRITEBYTECODE=1 \
+    PYTHON_COLORS=0 \
+    NO_COLOR=1 \
+    TERM=dumb \
+    GOMAXPROCS=2 \
     TZ=Asia/Shanghai
 
 EXPOSE 80
 
-ENTRYPOINT ["python3", "-m", "steam_pumper.main"]
+CMD ["python3", "-m", "steam_pumper.main"]

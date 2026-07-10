@@ -1,15 +1,13 @@
-# Steam Download Pumper
+# Broadband Download Pumper
 
-一个 Docker 化的宽带下载流量生成器，用于在自有网络中按时间窗产生公共 HTTP 或 Steam 下载流量，并用多 worker 新建连接帮助多 WAN/多线路负载均衡设备按连接分流。
+一个 Docker 化的宽带下载流量生成器，用于在自有网络中按时间窗产生公共 HTTP 下载流量，并用多 worker 新建连接帮助多 WAN/多线路负载均衡设备按连接分流。
 
 ## 功能
 
 - 默认使用公共 HTTP 丢弃下载模式：强制 IPv4，流式读取到 `io.Discard`，不写下载缓存到硬盘。
-- 可选 `steam_tmpfs` 模式：`steamcmd +login anonymous` 下载匿名可访问 AppID，下载目录使用 tmpfs。
 - 按每天开始/结束时间自动启动和停止。
 - 通过 `线路条数 * 每条线路连接数` 创建基础 worker，并在 60 秒均值低于目标 90% 时自动增加 worker。
 - 目标带宽、线路条数、基础/最大连接数、运行时间窗和 URL 源池均可在 Web 控制台修改。
-- 游戏下载目录默认挂载为 `tmpfs` 内存盘，避免反复写硬盘；下载完成后默认删除目录，再进入下一轮循环。
 - Web 控制台包含实时 Mbps 曲线、10/60 秒均值、今日累计流量和源健康表。
 - Docker Compose 默认使用 macvlan，容器 LAN IP 优先为 `192.168.1.233`，部署脚本会在 `.233-.240` 中自动顺移，网关为 `192.168.1.1`。
 - 多线路支持两种出口方式：`single_ip` 为一个容器 IP 依赖爱快按新建连接数分流；`multi_ip` 会生成与线路数相同数量的 LAN IP，并让公共 HTTP worker 按线路绑定源 IP，便于在爱快中手动配置一对一分流。
@@ -164,47 +162,16 @@ cp .env.example .env
 - `MAX_CONNECTIONS_PER_LINE`: 自动扩容时每条线路最多创建多少个 worker，硬上限为 `12`。
 - `RATE_LIMIT_ENABLED`: `true` 或 `false`。为 `true` 时，明显超过目标会收敛 worker 数。
 - `START_TIME` / `END_TIME`: 每天运行时间窗，格式 `HH:MM`，支持跨午夜。
-- `APP_IDS`: Steam AppID 列表，多个用英文逗号分隔。匿名模式下只能下载 SteamCMD 允许匿名访问的内容。默认 `90`，测试中可匿名下载；`4020` 也可匿名下载但体积更大。
-- `DOWNLOAD_MODE`: `public_http` 或 `steam_tmpfs`。旧值 `null` 会兼容为 `public_http`，旧值 `steam` 会兼容为 `steam_tmpfs`。
-- `SOURCE_POOL`: `public_http` 模式使用的下载 URL，多个用英文逗号分隔。
+- `SOURCE_POOL`: 公共 HTTP/HTTPS 下载 URL，多个用英文逗号分隔。
 - `STARTUP_STAGGER_SECONDS`: worker 启动间隔秒数，用于错峰建立连接。
 - `WORKER_MIN_SESSION_SECONDS`: 公共 HTTP worker 的最小会话时间，worker 进程会在内部持续重连短文件。
 - `WORKER_RESTART_JITTER_SECONDS`: 短文件 EOF 后的随机重连抖动秒数。
-- `DOWNLOAD_TMPFS_SIZE`: 游戏下载内存盘大小，例如 `8g`。它限制 `/steam/downloads` 可用内存空间。
-- `BOOTSTRAP_TIMEOUT_SECONDS`: SteamCMD 首次自更新超时秒数，网络较慢时可以调大。
 
 启动：
 
 ```bash
 docker compose up -d --build
 ```
-
-## SteamCMD 首次更新
-
-SteamCMD 第一次启动会先自更新，当前镜像无法保证这个更新包已经存在。项目已经把下面两个 SteamCMD 目录持久化为 Docker volume：
-
-- `/home/steam/steamcmd`
-- `/home/steam/Steam`
-
-因此只要不要删除 Docker volume，后续重启或重建容器不会从零开始更新。
-
-公共 HTTP 模式不会写下载内容。Steam 游戏下载内容不会写入这些 volume。`/steam/downloads` 使用 `tmpfs` 内存盘，重启后自动清空，避免高频写硬盘。
-
-更新完成后也可以把当前容器打包为预热镜像：
-
-```bash
-./bake-warmed-image.sh
-```
-
-默认生成：
-
-```text
-steam-download-pumper:warmed
-```
-
-这个脚本会复制容器中已更新的 `/home/steam/steamcmd` 和 `/home/steam/Steam` 到一个新镜像层；直接 `docker commit` 不适合这里，因为 Docker 不会把 volume 内容提交进镜像。
-
-SteamCMD 自更新通常是单进程下载，不能像游戏下载 worker 那样通过多连接明显加速。可以做的主要是保持当前容器不重启、不要反复保存配置触发重启、确保上游网络/DNS 到 Steam 更新服务可达。
 
 查看日志：
 
@@ -220,14 +187,12 @@ docker compose down
 
 ## 说明
 
-Steam 匿名下载不适用于所有游戏。默认 AppID `90` 已在匿名模式下验证可下载；如果你需要下载账号拥有的游戏，需要后续改为账号登录模式并妥善处理 Steam Guard 和凭据。
-
 多线路均衡有两种使用方式：
 
 - `single_ip`: 只有一个容器源 IP，容器内会创建多个独立 worker，最终是否均匀落到各外线由爱快“新建连接数”策略决定。
 - `multi_ip`: 容器会把 `LAN_IPS` 中的地址加到 macvlan 网卡，公共 HTTP worker 会按线路绑定源 IP。你需要在爱快中手动把这些源 IP 分别绑定到不同 WAN，这种方式更适合追求连续、均匀分流。
 
-`multi_ip` 绑定源 IP 目前作用于默认的 `public_http` 下载模式。`steam_tmpfs` 使用 SteamCMD，不能像 Go `discarder` 一样直接给每个 worker 绑定本地源 IP。
+`multi_ip` 模式下，Go `discarder` 会为每条线路绑定对应的本地源 IP。
 
 默认验收口径：
 

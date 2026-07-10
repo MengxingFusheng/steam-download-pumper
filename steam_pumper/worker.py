@@ -3,13 +3,11 @@ from __future__ import annotations
 import os
 import math
 import random
-import shutil
 import signal
 import subprocess
 import threading
 import time
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Callable
 from urllib.parse import urlparse
 
@@ -39,7 +37,6 @@ class WorkerSpec:
 class WorkerState:
     worker_id: int
     line_index: int
-    app_id: str = ""
     target: str = ""
     source_ip: str = ""
     cycles: int = 0
@@ -83,10 +80,6 @@ def _target_assignments(
     total_workers: int,
     sources: list[SourceEndpoint] | None = None,
 ) -> list[SourceEndpoint]:
-    if cfg.download_mode == "steam_tmpfs":
-        app_sources = [SourceEndpoint(url=app_id, ip=app_id) for app_id in cfg.app_ids]
-        return [app_sources[i % len(app_sources)] for i in range(total_workers)]
-
     candidates = [source for source in (sources or source_endpoints_from_urls(cfg.source_pool)) if source.healthy]
     if not candidates:
         raise ValueError("source_pool must contain at least one healthy source")
@@ -118,30 +111,6 @@ def source_endpoints_from_urls(urls: list[str]) -> list[SourceEndpoint]:
     return endpoints
 
 
-def steamcmd_command(cfg: PumperConfig, app_id: str, worker_id: int) -> list[str]:
-    install_dir = Path(cfg.install_root) / f"worker-{worker_id}" / f"app-{app_id}"
-    steamcmd_bin = os.environ.get("STEAMCMD_BIN", "steamcmd")
-    login_parts = ["+login"]
-    if cfg.steam_username:
-        login_parts.extend([cfg.steam_username, cfg.steam_password])
-        if cfg.steam_guard_code:
-            login_parts.append(cfg.steam_guard_code)
-    else:
-        login_parts.append("anonymous")
-    return [
-        steamcmd_bin,
-        "+@ShutdownOnFailedCommand",
-        "1",
-        "+force_install_dir",
-        str(install_dir),
-        *login_parts,
-        "+app_update",
-        str(app_id),
-        "validate",
-        "+quit",
-    ]
-
-
 def public_http_command(cfg: PumperConfig, url: str, worker_id: int, source_ip: str = "") -> list[str]:
     command = [
         "discarder",
@@ -159,46 +128,7 @@ def public_http_command(cfg: PumperConfig, url: str, worker_id: int, source_ip: 
 
 
 def build_download_command(cfg: PumperConfig, target: str, worker_id: int, source_ip: str = "") -> list[str]:
-    if cfg.download_mode == "public_http":
-        return public_http_command(cfg, target, worker_id, source_ip)
-    return steamcmd_command(cfg, target, worker_id)
-
-
-def wrap_with_rate_limit(command: list[str], rate_limit_kbps: int | None) -> list[str]:
-    if not rate_limit_kbps:
-        return command
-    if shutil.which("trickle"):
-        per_worker_kib = max(1, int(rate_limit_kbps / 8))
-        return ["trickle", "-s", "-d", str(per_worker_kib), *command]
-    return command
-
-
-def bootstrap_steamcmd(timeout_seconds: int = 180) -> tuple[bool, str]:
-    steamcmd_bin = os.environ.get("STEAMCMD_BIN", "steamcmd")
-    process: subprocess.Popen[bytes] | None = None
-    try:
-        process = subprocess.Popen(
-            [steamcmd_bin, "+quit"],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            preexec_fn=os.setsid,
-        )
-        stdout, _ = process.communicate(timeout=timeout_seconds)
-    except subprocess.TimeoutExpired:
-        if process and process.poll() is None:
-            try:
-                os.killpg(os.getpgid(process.pid), signal.SIGTERM)
-                process.wait(timeout=10)
-            except Exception:
-                if process and process.poll() is None:
-                    os.killpg(os.getpgid(process.pid), signal.SIGKILL)
-        return False, f"steamcmd bootstrap timed out after {timeout_seconds} seconds"
-    except Exception as exc:
-        return False, str(exc)
-    output = stdout.decode("utf-8", errors="replace")[-1200:]
-    if process.returncode == 0:
-        return True, output
-    return False, output or f"steamcmd bootstrap exited with {process.returncode}"
+    return public_http_command(cfg, target, worker_id, source_ip)
 
 
 class DownloadWorker(threading.Thread):
@@ -226,13 +156,12 @@ class DownloadWorker(threading.Thread):
                 return
         while not self.stop_event.is_set():
             target = self.spec.target
-            self.state.app_id = target if self.cfg.download_mode == "steam_tmpfs" else ""
             self.state.target = target
             self.state.source_ip = self.spec.source_ip
             self.state.status = "downloading"
             self.state.last_error = ""
             base_command = build_download_command(self.cfg, target, self.spec.worker_id, self.spec.source_ip)
-            command = base_command if self.cfg.download_mode == "public_http" else wrap_with_rate_limit(base_command, self.spec.rate_limit_kbps)
+            command = base_command
             source_part = f" source_ip={self.spec.source_ip}" if self.spec.source_ip else ""
             self.log(f"worker={self.spec.worker_id} line={self.spec.line_index}{source_part} target={target} start")
             try:
@@ -247,8 +176,6 @@ class DownloadWorker(threading.Thread):
                     self.state.cycles += 1
                     self.state.status = "completed"
                     self.log(f"worker={self.spec.worker_id} target={target} completed")
-                    if self.cfg.download_mode == "steam_tmpfs" and self.cfg.delete_after_cycle:
-                        shutil.rmtree(Path(self.cfg.install_root) / f"worker-{self.spec.worker_id}" / f"app-{target}", ignore_errors=True)
                 elif not self.stop_event.is_set():
                     self.state.status = "error"
                     self.state.last_error = f"download command exited with {code}"

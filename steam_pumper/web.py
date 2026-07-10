@@ -13,7 +13,7 @@ HTML = """<!doctype html>
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Steam Download Pumper</title>
+  <title>Broadband Download Pumper</title>
   <style>
     :root { color-scheme: light dark; font-family: Arial, sans-serif; }
     body { margin: 0; background: #f5f7fb; color: #172033; }
@@ -51,7 +51,7 @@ HTML = """<!doctype html>
 </head>
 <body>
 <main>
-  <h1>Steam Download Pumper</h1>
+  <h1>Broadband Download Pumper</h1>
   <section>
     <span id="running" class="pill">loading</span>
     <span id="window" class="pill">loading</span>
@@ -92,13 +92,6 @@ HTML = """<!doctype html>
         </label>
         <label>开始时间 <input name="start_time" type="time"></label>
         <label>结束时间 <input name="end_time" type="time"></label>
-        <label>下载模式
-          <select name="download_mode"><option value="public_http">公共 HTTP 丢弃</option><option value="steam_tmpfs">Steam tmpfs</option></select>
-        </label>
-        <label>Steam AppID 列表 <input name="app_ids" placeholder="90"></label>
-        <label>循环后删除文件
-          <select name="delete_after_cycle"><option value="true">是</option><option value="false">否</option></select>
-        </label>
       </div>
       <label style="margin-top:12px">多 IP 列表 <textarea name="lan_ips" placeholder="multi_ip 模式下每行或逗号分隔一个 IP"></textarea></label>
       <label style="margin-top:12px">公共源 URL 池 <textarea name="source_pool" placeholder="每行或逗号分隔一个 http/https URL"></textarea></label>
@@ -191,7 +184,7 @@ async function refresh() {
   while (chartSamples.length > 120) chartSamples.shift();
   drawChart(metrics.target_mbps);
   document.getElementById('workers').innerHTML = status.workers.map(w =>
-    `<tr><td>${w.worker_id}</td><td>${w.line_index}</td><td>${w.source_ip || ''}</td><td>${w.target || w.app_id || ''}</td><td>${w.status}</td><td>${w.cycles}</td><td>${w.current_pid || ''}</td><td>${w.last_error || ''}</td></tr>`
+    `<tr><td>${w.worker_id}</td><td>${w.line_index}</td><td>${w.source_ip || ''}</td><td>${w.target || ''}</td><td>${w.status}</td><td>${w.cycles}</td><td>${w.current_pid || ''}</td><td>${w.last_error || ''}</td></tr>`
   ).join('');
   document.getElementById('sources').innerHTML = sources.map(s =>
     `<tr><td>${s.url}</td><td>${s.ip || ''}</td><td>${s.healthy ? '是' : '否'}</td><td>${s.failures || 0}</td></tr>`
@@ -208,8 +201,7 @@ document.getElementById('configForm').addEventListener('submit', async (event) =
   const data = {};
   for (const [key, value] of form.entries()) {
     if (['target_mbps','line_count','connections_per_line','max_connections_per_line'].includes(key)) data[key] = Number(value);
-    else if (['rate_limit_enabled','delete_after_cycle'].includes(key)) data[key] = value === 'true';
-    else if (key === 'app_ids') data[key] = value.split(',').map(v => v.trim()).filter(Boolean);
+    else if (key === 'rate_limit_enabled') data[key] = value === 'true';
     else if (key === 'source_pool' || key === 'lan_ips') data[key] = value.split(/[\\n,]+/).map(v => v.trim()).filter(Boolean);
     else data[key] = value;
   }

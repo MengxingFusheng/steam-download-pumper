@@ -17,22 +17,12 @@ FORBIDDEN_KEYS = {
     "egress_mode",
     "lan_ips",
     "lan_ip",
-    "download_mode",
-    "app_ids",
-    "steam_username",
-    "steam_password",
-    "steam_guard_code",
 }
 FORBIDDEN_ENV = {
     "LINE_COUNT",
     "EGRESS_MODE",
     "LAN_IPS",
     "LAN_IP",
-    "DOWNLOAD_MODE",
-    "APP_IDS",
-    "STEAM_USERNAME",
-    "STEAM_PASSWORD",
-    "STEAM_GUARD_CODE",
 }
 
 

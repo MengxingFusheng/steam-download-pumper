@@ -24,8 +24,6 @@ class PumperConfig:
     target_mbps: int = 900
     start_time: str = "00:00"
     end_time: str = "18:00"
-    app_ids: list[str] = field(default_factory=lambda: ["90"])
-    download_mode: str = "public_http"
     source_pool: list[str] = field(
         default_factory=lambda: [
             "http://mobile.shunicomtest.com:8080/speedtest/random4000x4000.jpg",
@@ -42,18 +40,12 @@ class PumperConfig:
             "http://4gsuzhou1.speedtest.jsinfo.net:8080/speedtest/random4000x4000.jpg",
         ]
     )
-    install_root: str = "/steam/downloads"
-    delete_after_cycle: bool = True
     loop_pause_seconds: int = 5
     startup_stagger_seconds: float = 2.0
     worker_min_session_seconds: int = 300
     worker_restart_jitter_seconds: float = 3.0
-    bootstrap_timeout_seconds: int = 1800
     schedule_poll_seconds: int = 30
     stats_interval_seconds: int = 5
-    steam_username: str = ""
-    steam_password: str = ""
-    steam_guard_code: str = ""
     lan_ip: str = "192.168.1.233"
     lan_ips: list[str] = field(default_factory=lambda: ["192.168.1.233"])
     egress_mode: str = "single_ip"
@@ -61,10 +53,6 @@ class PumperConfig:
     log_level: str = "INFO"
 
     def validate(self) -> "PumperConfig":
-        if self.download_mode == "null":
-            self.download_mode = "public_http"
-        elif self.download_mode == "steam":
-            self.download_mode = "steam_tmpfs"
         if self.line_count < 2 or self.line_count > 10:
             raise ValueError("line_count must be between 2 and 10")
         self.egress_mode = str(self.egress_mode).strip().lower()
@@ -112,28 +100,19 @@ class PumperConfig:
             raise ValueError("worker_min_session_seconds must be at least 1")
         if self.worker_restart_jitter_seconds < 0:
             raise ValueError("worker_restart_jitter_seconds must be 0 or greater")
-        if self.bootstrap_timeout_seconds < 30:
-            raise ValueError("bootstrap_timeout_seconds must be at least 30")
         if self.schedule_poll_seconds < 1:
             raise ValueError("schedule_poll_seconds must be at least 1")
-        if self.download_mode not in {"public_http", "steam_tmpfs"}:
-            raise ValueError("download_mode must be public_http or steam_tmpfs")
-        if self.download_mode == "steam_tmpfs" and not self.app_ids:
-            raise ValueError("app_ids must contain at least one Steam app id")
         if not self.source_pool and self.download_urls:
             self.source_pool = list(self.download_urls)
         for value_name in ("start_time", "end_time"):
             self._parse_time(getattr(self, value_name), value_name)
-        self.app_ids = [str(app_id).strip() for app_id in self.app_ids if str(app_id).strip()]
         self.source_pool = [str(url).strip() for url in self.source_pool if str(url).strip()]
         self.download_urls = [str(url).strip() for url in self.download_urls if str(url).strip()]
         if self.source_pool:
             self.download_urls = list(self.source_pool)
         elif self.download_urls:
             self.source_pool = list(self.download_urls)
-        if self.download_mode == "steam_tmpfs" and not self.app_ids:
-            raise ValueError("app_ids must contain at least one Steam app id")
-        if self.download_mode == "public_http" and not self.source_pool:
+        if not self.source_pool:
             raise ValueError("source_pool must contain at least one URL")
         return self
 
@@ -179,22 +158,14 @@ ENV_MAP = {
     "TARGET_MBPS": ("target_mbps", int),
     "START_TIME": ("start_time", str),
     "END_TIME": ("end_time", str),
-    "APP_IDS": ("app_ids", lambda value: [item.strip() for item in str(value).split(",") if item.strip()]),
-    "DOWNLOAD_MODE": ("download_mode", str),
     "SOURCE_POOL": ("source_pool", lambda value: [item.strip() for item in str(value).split(",") if item.strip()]),
     "DOWNLOAD_URLS": ("download_urls", lambda value: [item.strip() for item in str(value).split(",") if item.strip()]),
-    "INSTALL_ROOT": ("install_root", str),
-    "DELETE_AFTER_CYCLE": ("delete_after_cycle", lambda value: str(value).lower() in {"1", "true", "yes", "on"}),
     "LOOP_PAUSE_SECONDS": ("loop_pause_seconds", int),
     "STARTUP_STAGGER_SECONDS": ("startup_stagger_seconds", float),
     "WORKER_MIN_SESSION_SECONDS": ("worker_min_session_seconds", int),
     "WORKER_RESTART_JITTER_SECONDS": ("worker_restart_jitter_seconds", float),
-    "BOOTSTRAP_TIMEOUT_SECONDS": ("bootstrap_timeout_seconds", int),
     "SCHEDULE_POLL_SECONDS": ("schedule_poll_seconds", int),
     "STATS_INTERVAL_SECONDS": ("stats_interval_seconds", int),
-    "STEAM_USERNAME": ("steam_username", str),
-    "STEAM_PASSWORD": ("steam_password", str),
-    "STEAM_GUARD_CODE": ("steam_guard_code", str),
     "LAN_IP": ("lan_ip", str),
     "LAN_IPS": ("lan_ips", lambda value: [item.strip() for item in str(value).split(",") if item.strip()]),
     "EGRESS_MODE": ("egress_mode", str),
@@ -209,6 +180,8 @@ def load_config(path: str | Path, env: Mapping[str, str] | None = None) -> Pumpe
     config_path = Path(path)
     if config_path.exists():
         data.update(json.loads(config_path.read_text(encoding="utf-8")))
+    allowed_fields = set(PumperConfig.__dataclass_fields__)
+    data = {key: value for key, value in data.items() if key in allowed_fields}
     for env_name, (field_name, converter) in ENV_MAP.items():
         if env_name in env and env[env_name] != "":
             data[field_name] = converter(env[env_name])

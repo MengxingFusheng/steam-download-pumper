@@ -39,6 +39,15 @@ class OneToOneImageTests(unittest.TestCase):
         self.assertIn("ARG DEFAULT_LAN_IPS=192.168.1.233", dockerfile)
         self.assertIn("EGRESS_MODE=${DEFAULT_EGRESS_MODE}", dockerfile)
         self.assertIn("LAN_IPS=${DEFAULT_LAN_IPS}", dockerfile)
+        self.assertIn("FROM python:3.13-slim", dockerfile)
+        self.assertNotIn("steamcmd", dockerfile.lower())
+
+    def test_compose_files_have_no_legacy_download_volumes(self):
+        for name in ("docker-compose.yml", "docker-compose.one-to-one.yml"):
+            compose = (ROOT / name).read_text(encoding="utf-8")
+            with self.subTest(name=name):
+                self.assertNotIn("steamcmd", compose.lower())
+                self.assertNotIn("/steam/", compose.lower())
 
 
 if __name__ == "__main__":

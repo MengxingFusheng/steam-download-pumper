@@ -17,7 +17,6 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(cfg.gateway, "192.168.1.1")
         self.assertEqual(cfg.line_count, 2)
         self.assertEqual(cfg.target_mbps, 900)
-        self.assertEqual(cfg.download_mode, "public_http")
         self.assertGreaterEqual(cfg.max_connections_per_line, cfg.connections_per_line)
         self.assertEqual(cfg.max_connections_per_line, 12)
         self.assertTrue(cfg.rate_limit_enabled)
@@ -38,13 +37,12 @@ class ConfigTests(unittest.TestCase):
     def test_load_config_merges_file_and_environment(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             path = Path(tmpdir) / "config.json"
-            path.write_text(json.dumps({"line_count": 4, "app_ids": ["740"]}), encoding="utf-8")
+            path.write_text(json.dumps({"line_count": 4}), encoding="utf-8")
 
             cfg = load_config(
                 path,
                 {
                     "TARGET_MBPS": "1200",
-                    "APP_IDS": "740,90",
                     "SOURCE_POOL": "https://a.test/file,https://b.test/file",
                     "MAX_CONNECTIONS_PER_LINE": "99",
                     "EGRESS_MODE": "multi_ip",
@@ -58,7 +56,6 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(cfg.lan_ips, ["192.168.1.233", "192.168.1.234", "192.168.1.235", "192.168.1.236"])
         self.assertEqual(cfg.target_mbps, 1200)
         self.assertEqual(cfg.rate_limit_mbps, 1200)
-        self.assertEqual(cfg.app_ids, ["740", "90"])
         self.assertEqual(cfg.source_pool, ["https://a.test/file", "https://b.test/file"])
         self.assertEqual(cfg.max_connections_per_line, 12)
 
@@ -86,9 +83,19 @@ class ConfigTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             PumperConfig(egress_mode="invalid").validate()
 
-    def test_download_mode_aliases_keep_existing_configs_working(self):
-        self.assertEqual(PumperConfig(download_mode="null").validate().download_mode, "public_http")
-        self.assertEqual(PumperConfig(download_mode="steam").validate().download_mode, "steam_tmpfs")
+    def test_removed_legacy_fields_are_ignored_when_loading_saved_config(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "config.json"
+            path.write_text(
+                json.dumps({"line_count": 2, "download_mode": "legacy", "app_ids": ["90"]}),
+                encoding="utf-8",
+            )
+
+            cfg = load_config(path, {})
+
+        self.assertEqual(cfg.line_count, 2)
+        self.assertFalse(hasattr(cfg, "download_mode"))
+        self.assertFalse(hasattr(cfg, "app_ids"))
 
 
 if __name__ == "__main__":
