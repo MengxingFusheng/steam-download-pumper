@@ -1,5 +1,6 @@
 import tempfile
 import unittest
+from datetime import datetime
 from pathlib import Path
 from unittest.mock import patch
 
@@ -7,6 +8,31 @@ from steam_pumper.controller import PumperController
 
 
 class ControllerTests(unittest.TestCase):
+    def test_controller_does_not_create_background_threads(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch("steam_pumper.controller.threading.Thread", side_effect=AssertionError("thread created")):
+                PumperController("ikuai_line", Path(tmpdir) / "config.json", env={})
+
+    def test_tick_runs_scheduler_and_metrics_at_their_intervals(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            controller = PumperController(
+                "ikuai_line",
+                Path(tmpdir) / "config.json",
+                env={"START_TIME": "00:00", "END_TIME": "00:00", "SCHEDULE_POLL_SECONDS": "30"},
+            )
+            with (
+                patch.object(controller, "start_downloads") as start,
+                patch.object(controller, "sample_metrics") as sample,
+                patch.object(controller, "_scale_lines") as scale,
+            ):
+                controller.tick(monotonic_now=100.0, wall_time=datetime(2026, 7, 11, 10, 0))
+                controller.tick(monotonic_now=100.5, wall_time=datetime(2026, 7, 11, 10, 0))
+                controller.tick(monotonic_now=101.0, wall_time=datetime(2026, 7, 11, 10, 0))
+
+        start.assert_called_once_with()
+        self.assertEqual(sample.call_count, 2)
+        self.assertEqual(scale.call_count, 2)
+
     def test_controller_builds_one_runtime_per_logical_line(self):
         cases = (
             ("ikuai_line", {}, 1),

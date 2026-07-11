@@ -1,11 +1,13 @@
 import json
+import shutil
+import subprocess
 import threading
 import unittest
 import urllib.error
 import urllib.request
 from http.server import HTTPServer
 
-from steam_pumper.web import Handler, render_html
+from steam_pumper.web import Handler, PumperHTTPServer, render_html
 
 
 class DummyConfig:
@@ -36,6 +38,39 @@ class DummyController:
 
 
 class WebTests(unittest.TestCase):
+    def test_http_server_drives_controller_tick(self):
+        class TickController:
+            def __init__(self):
+                self.ticks = 0
+
+            def tick(self):
+                self.ticks += 1
+
+        controller = TickController()
+        server = PumperHTTPServer(("127.0.0.1", 0), Handler, controller)
+        try:
+            server.service_actions()
+        finally:
+            server.server_close()
+
+        self.assertEqual(controller.ticks, 1)
+
+    def test_rendered_console_javascript_is_valid(self):
+        if shutil.which("node") is None:
+            self.skipTest("node is required for JavaScript syntax validation")
+        html = render_html("multi_ip")
+        script = html.split("<script>", 1)[1].split("</script>", 1)[0]
+
+        result = subprocess.run(
+            ["node", "--check"],
+            input=script,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_ikuai_console_has_no_ip_or_line_count_fields(self):
         html = render_html("ikuai_line")
 

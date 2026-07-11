@@ -24,7 +24,7 @@ def render_html(topology_name: str) -> str:
     return _HTML_TEMPLATE.replace("{{TITLE}}", title).replace("{{TOPOLOGY_FIELDS}}", _topology_fields(topology_name))
 
 
-_HTML_TEMPLATE = """<!doctype html>
+_HTML_TEMPLATE = r"""<!doctype html>
 <html lang="zh-CN">
 <head>
   <meta charset="utf-8">
@@ -186,10 +186,19 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body_bytes)
 
 
+class PumperHTTPServer(HTTPServer):
+    def __init__(self, server_address: tuple[str, int], handler: type[Handler], controller: PumperController) -> None:
+        self.controller = controller
+        super().__init__(server_address, handler)
+
+    def service_actions(self) -> None:
+        self.controller.tick()
+
+
 def run_web(controller: PumperController, host: str, port: int, topology_name: str) -> None:
     Handler.controller = controller
     Handler.topology_name = topology_name
-    server = HTTPServer((host, port), Handler)
+    server = PumperHTTPServer((host, port), Handler, controller)
     try:
         server.serve_forever()
     finally:

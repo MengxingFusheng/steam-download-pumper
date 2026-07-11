@@ -72,7 +72,7 @@ class EngineProcess:
             connections=cfg.connections_per_line,
         )
         self.process: subprocess.Popen[bytes] | None = None
-        self.stop_requested = False
+        self.stop_requested = True
         self.next_restart_at = 0.0
         self.consecutive_failures = 0
         self._output_buffer = ""

@@ -26,6 +26,5 @@ def run_application(topology_name: str) -> int:
 
     signal.signal(signal.SIGTERM, stop)
     signal.signal(signal.SIGINT, stop)
-    controller.start_scheduler()
     run_web(controller, "0.0.0.0", int(os.environ.get("WEB_PORT", "80")), topology_name)
     return 0

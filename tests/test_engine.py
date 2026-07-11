@@ -8,6 +8,21 @@ from steam_pumper.topology import LogicalLine
 
 
 class EngineTests(unittest.TestCase):
+    def test_poll_does_not_start_an_engine_that_was_never_started(self):
+        from steam_pumper.engine import EngineProcess
+
+        engine = EngineProcess(
+            IkuaiLineConfig(),
+            LogicalLine("line-1", 400),
+            ["http://a.test/file"],
+            lambda _message: None,
+        )
+
+        with patch.object(engine, "start") as start:
+            engine.poll(now=100)
+
+        start.assert_not_called()
+
     def test_engine_command_binds_only_when_line_has_an_ip(self):
         from steam_pumper.engine import build_engine_command
 

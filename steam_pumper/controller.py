@@ -45,8 +45,6 @@ class PumperController:
         self.topology = topology_for(topology_name)
         self.config_path = Path(config_path)
         self.lock = threading.RLock()
-        self.scheduler_stop = threading.Event()
-        self.metrics_stop = threading.Event()
         self.manual_enabled = True
         self.downloads_starting = False
         self.reconfiguring = False
@@ -56,9 +54,9 @@ class PumperController:
         self.sources: list[SourceEndpoint] = []
         self.interface_tracker = ThroughputTracker()
         self.line_runtimes = self._build_runtimes()
-        self.scheduler_thread = threading.Thread(target=self._scheduler_loop, name="scheduler", daemon=True)
-        self.metrics_thread = threading.Thread(target=self._metrics_loop, name="metrics", daemon=True)
         self._last_scale_check = 0.0
+        self._last_schedule_tick: float | None = None
+        self._last_metrics_tick: float | None = None
 
     def _build_runtimes(self) -> dict[str, LineRuntime]:
         return {
@@ -70,16 +68,30 @@ class PumperController:
             for line in self.lines
         }
 
-    def start_scheduler(self) -> None:
-        for name, thread in (("scheduler", self.scheduler_thread), ("metrics", self.metrics_thread)):
+    def tick(self, monotonic_now: float | None = None, wall_time: datetime | None = None) -> None:
+        now = time.monotonic() if monotonic_now is None else monotonic_now
+        current = datetime.now() if wall_time is None else wall_time
+        if self._last_schedule_tick is None or now - self._last_schedule_tick >= self.cfg.schedule_poll_seconds:
+            self._last_schedule_tick = now
             try:
-                thread.start()
-            except RuntimeError as exc:
-                self.log(f"{name} thread failed: {exc}")
+                should_run = self.manual_enabled and self.cfg.is_within_window(current.time())
+                with self.lock:
+                    running = self._is_running_locked()
+                if should_run and not running:
+                    self.start_downloads()
+                elif not should_run and running:
+                    self.stop_downloads()
+            except Exception as exc:
+                self.log(f"scheduler error={exc}")
+        if self._last_metrics_tick is None or now - self._last_metrics_tick >= 1:
+            self._last_metrics_tick = now
+            try:
+                self.sample_metrics()
+                self._scale_lines(now)
+            except Exception as exc:
+                self.log(f"metrics error={exc}")
 
     def shutdown(self) -> None:
-        self.scheduler_stop.set()
-        self.metrics_stop.set()
         self.stop_downloads()
 
     def start_downloads(self) -> None:
@@ -330,29 +342,6 @@ class PumperController:
         with self.lock:
             self.logs.append(line)
             self.logs = self.logs[-500:]
-
-    def _scheduler_loop(self) -> None:
-        while not self.scheduler_stop.is_set():
-            try:
-                should_run = self.manual_enabled and self.cfg.is_within_window(datetime.now().time())
-                with self.lock:
-                    running = self._is_running_locked()
-                if should_run and not running:
-                    self.start_downloads()
-                elif not should_run and running:
-                    self.stop_downloads()
-            except Exception as exc:
-                self.log(f"scheduler error={exc}")
-            self.scheduler_stop.wait(self.cfg.schedule_poll_seconds)
-
-    def _metrics_loop(self) -> None:
-        while not self.metrics_stop.is_set():
-            try:
-                self.sample_metrics()
-                self._scale_lines()
-            except Exception as exc:
-                self.log(f"metrics error={exc}")
-            self.metrics_stop.wait(1)
 
     def _is_running_locked(self) -> bool:
         return any(
