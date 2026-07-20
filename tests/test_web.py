@@ -115,14 +115,14 @@ class WebTests(unittest.TestCase):
             "sourceListNextRefresh",
             "sourceListStale",
             "sourceListError",
-            "sourceListRefreshState",
-            "sourceListApplyState",
             "立即刷新",
             "/api/source-list/refresh",
         ):
             self.assertIn(expected, html)
         self.assertNotIn('name="source_list_url"', html)
         self.assertNotIn('name="source_list_public_key"', html)
+        self.assertNotIn("sourceListRefreshState", html)
+        self.assertNotIn("sourceListApplyState", html)
 
     def test_ikuai_console_does_not_show_remote_source_list_controls(self):
         html = render_html("ikuai_line")
