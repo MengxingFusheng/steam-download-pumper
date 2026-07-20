@@ -5,7 +5,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from typing import Any
 from urllib.parse import urlparse
 
-from .controller import PumperController
+from .controller import PumperController, SourceListRefreshError
 
 
 def _topology_fields(topology_name: str) -> str:
@@ -19,9 +19,44 @@ def _topology_fields(topology_name: str) -> str:
     raise ValueError(f"unsupported topology: {topology_name}")
 
 
+def _source_list_section(topology_name: str) -> str:
+    if topology_name == "ikuai_line":
+        return ""
+    if topology_name != "multi_ip":
+        raise ValueError(f"unsupported topology: {topology_name}")
+    return """
+  <section>
+    <div class="toolbar">
+      <h2 style="margin-right:auto">远程源清单</h2>
+      <button class="neutral" onclick="refreshSourceList()">立即刷新</button>
+    </div>
+    <div class="metrics">
+      <div class="metric">Revision<b id="sourceListRevision">-</b></div>
+      <div class="metric">源数量<b id="sourceListCount">0</b></div>
+      <div class="metric">Origin<b id="sourceListOrigin">local-fallback</b></div>
+      <div class="metric">最后成功<b id="sourceListLastSuccess">-</b></div>
+      <div class="metric">下次刷新<b id="sourceListNextRefresh">-</b></div>
+      <div class="metric">过期状态<b id="sourceListStale">否</b></div>
+      <div class="metric">错误<b id="sourceListError">-</b></div>
+    </div>
+  </section>
+    """
+
+
+def _source_list_refresh_function(topology_name: str) -> str:
+    if topology_name == "ikuai_line":
+        return ""
+    return "async function refreshSourceList() { try { setSourceList(await api('/api/source-list/refresh',{method:'POST'}));showError(); } catch(error) { showError(error); } }"
+
+
 def render_html(topology_name: str) -> str:
     title = "iKuai 单线路下载器" if topology_name == "ikuai_line" else "多 IP 宽带下载器"
-    return _HTML_TEMPLATE.replace("{{TITLE}}", title).replace("{{TOPOLOGY_FIELDS}}", _topology_fields(topology_name))
+    return (
+        _HTML_TEMPLATE.replace("{{TITLE}}", title)
+        .replace("{{TOPOLOGY_FIELDS}}", _topology_fields(topology_name))
+        .replace("{{SOURCE_LIST_SECTION}}", _source_list_section(topology_name))
+        .replace("{{SOURCE_LIST_REFRESH_FUNCTION}}", _source_list_refresh_function(topology_name))
+    )
 
 
 _HTML_TEMPLATE = r"""<!doctype html>
@@ -105,6 +140,7 @@ _HTML_TEMPLATE = r"""<!doctype html>
       <div class="actions" style="margin-top:10px"><button class="primary" type="submit">保存并应用</button></div>
     </form>
   </section>
+  {{SOURCE_LIST_SECTION}}
   <section><h2>线路</h2><div class="table-wrap"><table><thead><tr><th>线路</th><th>绑定 IP</th><th>目标</th><th>当前</th><th>60 秒</th><th>连接</th><th>状态</th><th>错误</th></tr></thead><tbody id="lines"></tbody></table></div></section>
   <section><h2>源健康</h2><div class="table-wrap"><table><thead><tr><th>URL</th><th>IPv4</th><th>状态</th><th>连续失败</th><th>隔离/重试</th><th>错误</th></tr></thead><tbody id="sources"></tbody></table></div></section>
   <section><h2>日志</h2><pre id="logs"></pre></section>
@@ -117,8 +153,10 @@ function showError(error) { const node = document.getElementById('apiError'); no
 function setForm(config) { for (const [key, value] of Object.entries(config)) { const input = document.querySelector(`[name="${key}"]`); if (input) input.value = Array.isArray(value) ? value.join('\n') : String(value); } }
 function fmtBytes(bytes) { if (bytes >= 1e12) return (bytes / 1e12).toFixed(2) + ' TB'; if (bytes >= 1e9) return (bytes / 1e9).toFixed(2) + ' GB'; if (bytes >= 1e6) return (bytes / 1e6).toFixed(2) + ' MB'; return String(bytes || 0) + ' B'; }
 function drawChart(target) { const canvas = document.getElementById('trafficChart'); const ctx = canvas.getContext('2d'); const width = canvas.width, height = canvas.height; ctx.clearRect(0, 0, width, height); ctx.strokeStyle = '#d6dee8'; for (let i=0;i<=4;i++){const y=8+i*((height-16)/4);ctx.beginPath();ctx.moveTo(0,y);ctx.lineTo(width,y);ctx.stroke();} const max=Math.max(target||1,...chartSamples.flatMap(s=>[s.current,s.avg60]))*1.15; const line=(key,color)=>{ctx.strokeStyle=color;ctx.lineWidth=2;ctx.beginPath();chartSamples.forEach((sample,index)=>{const x=chartSamples.length<2?0:index*(width/(chartSamples.length-1));const y=height-8-(sample[key]/max)*(height-16);if(index===0)ctx.moveTo(x,y);else ctx.lineTo(x,y);});ctx.stroke();};line('current','#1769aa');line('avg60','#16804b'); }
-async function refresh() { try { const [status, metrics, sources] = await Promise.all([api('/api/status'),api('/api/metrics'),api('/api/sources')]); showError(); document.getElementById('running').textContent=status.running?'运行中':'已停止';document.getElementById('window').textContent=status.within_window?'时间窗内':'时间窗外';document.getElementById('now').textContent=status.now||'';setForm(status.config||{});document.getElementById('currentMbps').textContent=Number(metrics.current_mbps||0).toFixed(0);document.getElementById('avg10Mbps').textContent=Number(metrics.avg10_mbps||0).toFixed(0);document.getElementById('avg60Mbps').textContent=Number(metrics.avg60_mbps||0).toFixed(0);document.getElementById('todayBytes').textContent=fmtBytes(metrics.today_bytes);document.getElementById('targetPercent').textContent=Number(metrics.target_percent||0).toFixed(0)+'%';document.getElementById('dailyPercent').textContent=Number(metrics.daily_target_percent||0).toFixed(0)+'%';document.getElementById('workerCount').textContent=String(metrics.worker_count||0);document.getElementById('capacityWarning').style.display=metrics.capacity_warning?'inline-flex':'none';chartSamples.push({current:Number(metrics.current_mbps||0),avg60:Number(metrics.avg60_mbps||0)});while(chartSamples.length>120)chartSamples.shift();drawChart(metrics.target_mbps);document.getElementById('lines').innerHTML=(metrics.lines||[]).map(line=>`<tr><td>${escapeHtml(line.line_id)}</td><td>${escapeHtml(line.bind_ip || '-')}</td><td>${Number(line.target_mbps||0).toFixed(0)}</td><td>${line.metrics_available?Number(line.current_mbps||0).toFixed(0):'-'}</td><td>${line.metrics_available?Number(line.avg60_mbps||0).toFixed(0):'-'}</td><td>${Number(line.connections||0)}/${Number(line.max_connections||0)}</td><td>${escapeHtml(line.status)}</td><td>${escapeHtml(line.last_error)}</td></tr>`).join('');document.getElementById('sources').innerHTML=(sources||[]).map(source=>`<tr><td>${escapeHtml(source.url)}</td><td>${escapeHtml(source.ip)}</td><td>${escapeHtml(source.state || (source.healthy?'healthy':'unhealthy'))}</td><td>${Number(source.failures||0)}</td><td>${source.retry_in_seconds?Number(source.retry_in_seconds)+' 秒':'-'}</td><td>${escapeHtml(source.last_error||'')}</td></tr>`).join('');document.getElementById('logs').textContent=(status.logs||[]).join('\n'); } catch (error) { showError(error); } }
+function setSourceList(sourceList) { if (!document.getElementById('sourceListRevision')) return; document.getElementById('sourceListRevision').textContent=sourceList.revision||'-';document.getElementById('sourceListCount').textContent=String(sourceList.source_count||0);document.getElementById('sourceListOrigin').textContent=sourceList.origin||'local-fallback';document.getElementById('sourceListLastSuccess').textContent=sourceList.last_success_at||'-';document.getElementById('sourceListNextRefresh').textContent=sourceList.next_refresh_at||'-';document.getElementById('sourceListStale').textContent=sourceList.stale?'是':'否';document.getElementById('sourceListError').textContent=sourceList.last_error||'-'; }
+async function refresh() { try { const [status, metrics, sources, sourceList] = await Promise.all([api('/api/status'),api('/api/metrics'),api('/api/sources'),api('/api/source-list')]); showError(); document.getElementById('running').textContent=status.running?'运行中':'已停止';document.getElementById('window').textContent=status.within_window?'时间窗内':'时间窗外';document.getElementById('now').textContent=status.now||'';setForm(status.config||{});setSourceList(sourceList||{});document.getElementById('currentMbps').textContent=Number(metrics.current_mbps||0).toFixed(0);document.getElementById('avg10Mbps').textContent=Number(metrics.avg10_mbps||0).toFixed(0);document.getElementById('avg60Mbps').textContent=Number(metrics.avg60_mbps||0).toFixed(0);document.getElementById('todayBytes').textContent=fmtBytes(metrics.today_bytes);document.getElementById('targetPercent').textContent=Number(metrics.target_percent||0).toFixed(0)+'%';document.getElementById('dailyPercent').textContent=Number(metrics.daily_target_percent||0).toFixed(0)+'%';document.getElementById('workerCount').textContent=String(metrics.worker_count||0);document.getElementById('capacityWarning').style.display=metrics.capacity_warning?'inline-flex':'none';chartSamples.push({current:Number(metrics.current_mbps||0),avg60:Number(metrics.avg60_mbps||0)});while(chartSamples.length>120)chartSamples.shift();drawChart(metrics.target_mbps);document.getElementById('lines').innerHTML=(metrics.lines||[]).map(line=>`<tr><td>${escapeHtml(line.line_id)}</td><td>${escapeHtml(line.bind_ip || '-')}</td><td>${Number(line.target_mbps||0).toFixed(0)}</td><td>${line.metrics_available?Number(line.current_mbps||0).toFixed(0):'-'}</td><td>${line.metrics_available?Number(line.avg60_mbps||0).toFixed(0):'-'}</td><td>${Number(line.connections||0)}/${Number(line.max_connections||0)}</td><td>${escapeHtml(line.status)}</td><td>${escapeHtml(line.last_error)}</td></tr>`).join('');document.getElementById('sources').innerHTML=(sources||[]).map(source=>`<tr><td>${escapeHtml(source.url)}</td><td>${escapeHtml(source.ip)}</td><td>${escapeHtml(source.state || (source.healthy?'healthy':'unhealthy'))}</td><td>${Number(source.failures||0)}</td><td>${source.retry_in_seconds?Number(source.retry_in_seconds)+' 秒':'-'}</td><td>${escapeHtml(source.last_error||'')}</td></tr>`).join('');document.getElementById('logs').textContent=(status.logs||[]).join('\n'); } catch (error) { showError(error); } }
 async function control(path) { try { await api(path,{method:'POST'}); await refresh(); } catch(error) { showError(error); } }
+{{SOURCE_LIST_REFRESH_FUNCTION}}
 document.getElementById('configForm').addEventListener('submit', async event => { event.preventDefault(); const data={}; for(const [key,value] of new FormData(event.target).entries()){if(['target_mbps','connections_per_line','max_connections_per_line','line_count'].includes(key))data[key]=Number(value);else if(key==='rate_limit_enabled')data[key]=value==='true';else if(['source_pool','lan_ips'].includes(key))data[key]=value.split(/[\n,]+/).map(item=>item.trim()).filter(Boolean);else data[key]=value;} try{await api('/api/config',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(data)});await refresh();}catch(error){showError(error);} });
 refresh(); setInterval(refresh, 5000);
 </script>
@@ -140,6 +178,8 @@ class Handler(BaseHTTPRequestHandler):
             self._json(200, self.controller.metrics())
         elif path == "/api/sources":
             self._json(200, self.controller.source_snapshot())
+        elif path == "/api/source-list":
+            self._json(200, self.controller.source_list_status())
         elif path == "/api/config":
             self._json(200, self.controller.cfg.to_dict())
         else:
@@ -163,8 +203,15 @@ class Handler(BaseHTTPRequestHandler):
                 if not isinstance(data, dict):
                     raise ValueError("configuration payload must be a JSON object")
                 self._json(200, self.controller.update_config(data).to_dict())
+            elif path == "/api/source-list/refresh":
+                status = self.controller.refresh_source_list()
+                if status.get("status") in {"error", "stale"} and status.get("last_error"):
+                    raise SourceListRefreshError(status["last_error"])
+                self._json(200, status)
             else:
                 self._json(404, {"error": "not found"})
+        except SourceListRefreshError as exc:
+            self._json(503, {"error": str(exc)})
         except (ValueError, json.JSONDecodeError) as exc:
             self._json(400, {"error": str(exc)})
         except Exception as exc:

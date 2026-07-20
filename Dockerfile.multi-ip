@@ -3,8 +3,10 @@ FROM golang:1.23 AS discarder-builder
 WORKDIR /src
 COPY go.mod ./
 COPY cmd/discarder ./cmd/discarder
-RUN go test ./cmd/discarder \
-    && CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /out/discarder ./cmd/discarder
+COPY cmd/manifestctl ./cmd/manifestctl
+RUN go test ./cmd/discarder ./cmd/manifestctl \
+    && CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /out/discarder ./cmd/discarder \
+    && CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /out/manifestctl ./cmd/manifestctl
 
 FROM python:3.13-slim
 
@@ -15,6 +17,7 @@ RUN apt-get update \
 WORKDIR /app
 COPY steam_pumper /app/steam_pumper
 COPY --from=discarder-builder /out/discarder /usr/local/bin/discarder
+COPY --from=discarder-builder /out/manifestctl /usr/local/bin/manifestctl
 
 RUN mkdir -p /data /tmp /run && chmod 1777 /tmp
 
@@ -25,6 +28,15 @@ ENV CONFIG_PATH=/data/config.json \
     LAN_IPS=192.168.1.233,192.168.1.234 \
     CONNECTIONS_PER_LINE=8 \
     MAX_CONNECTIONS_PER_LINE=12 \
+    REMOTE_SOURCE_LIST_ENABLED=false \
+    SOURCE_LIST_URL="" \
+    SOURCE_LIST_PUBLIC_KEY="" \
+    SOURCE_LIST_KEY_ID="" \
+    SOURCE_LIST_REFRESH_TIME=04:00 \
+    SOURCE_LIST_REFRESH_JITTER_SECONDS=1800 \
+    SOURCE_LIST_FETCH_TIMEOUT_SECONDS=15 \
+    SOURCE_LIST_MAX_BYTES=524288 \
+    SOURCE_LIST_MIN_SOURCES=3 \
     RATE_LIMIT_ENABLED=true \
     START_TIME=00:00 \
     END_TIME=18:00 \

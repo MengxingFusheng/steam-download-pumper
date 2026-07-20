@@ -1,6 +1,9 @@
+import json
 import signal
 import subprocess
+import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import Mock, patch
 
 from steam_pumper.config import IkuaiLineConfig
@@ -39,6 +42,24 @@ class EngineTests(unittest.TestCase):
         self.assertEqual(unbound[unbound.index("--connections") + 1], "4")
         self.assertEqual(unbound[unbound.index("--max-connections") + 1], "12")
         self.assertEqual(unbound[unbound.index("--line-id") + 1], "line-1")
+
+    def test_multi_ip_engine_command_uses_source_file_and_private_destination_guard(self):
+        from steam_pumper.engine import build_engine_command
+
+        command = build_engine_command(
+            IkuaiLineConfig(),
+            LogicalLine("line-1", 400, "192.168.1.233"),
+            ["http://fallback.test/file"],
+            sources_file=Path("/run/pumper/line-1.sources.json"),
+            reject_private_destinations=True,
+        )
+
+        self.assertEqual(
+            command[command.index("--sources-file") + 1],
+            "/run/pumper/line-1.sources.json",
+        )
+        self.assertIn("--reject-private-destinations", command)
+        self.assertNotIn("http://fallback.test/file", command)
 
     def test_engine_parses_status_without_a_reader_thread(self):
         from steam_pumper.engine import EngineProcess
@@ -188,6 +209,75 @@ class EngineTests(unittest.TestCase):
 
         popen.assert_called_once()
         self.assertEqual(engine.state.status, "downloading")
+
+    def test_set_sources_atomically_updates_file_and_sighups_live_process(self):
+        from steam_pumper.engine import EngineProcess
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            source_file = Path(tmpdir) / "line-1.sources.json"
+            process = Mock(pid=789)
+            process.poll.return_value = None
+            engine = EngineProcess(
+                IkuaiLineConfig(),
+                LogicalLine("line-1", 400),
+                ["http://old.test/file"],
+                lambda _message: None,
+                sources_file=source_file,
+                reject_private_destinations=True,
+            )
+            engine.process = process
+
+            with patch("steam_pumper.engine.os.kill") as kill:
+                changed = engine.set_sources(["https://new.test/a", "https://new.test/b"])
+
+            self.assertTrue(changed)
+            self.assertEqual(json.loads(source_file.read_text(encoding="utf-8")), ["https://new.test/a", "https://new.test/b"])
+            kill.assert_called_once_with(789, signal.SIGHUP)
+            self.assertEqual(engine.process.pid, 789)
+
+    def test_set_sources_does_not_signal_stopped_or_unchanged_engine(self):
+        from steam_pumper.engine import EngineProcess
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            source_file = Path(tmpdir) / "line-1.sources.json"
+            engine = EngineProcess(
+                IkuaiLineConfig(),
+                LogicalLine("line-1", 400),
+                ["https://same.test/file"],
+                lambda _message: None,
+                sources_file=source_file,
+            )
+
+            with patch("steam_pumper.engine.os.kill") as kill:
+                changed = engine.set_sources(["https://same.test/file"])
+
+            self.assertFalse(changed)
+            self.assertEqual(json.loads(source_file.read_text(encoding="utf-8")), ["https://same.test/file"])
+            kill.assert_not_called()
+
+    def test_set_sources_keeps_previous_list_when_atomic_write_fails(self):
+        from steam_pumper.engine import EngineProcess
+
+        engine = EngineProcess(
+            IkuaiLineConfig(),
+            LogicalLine("line-1", 400),
+            ["https://old.test/file"],
+            lambda _message: None,
+            sources_file="/run/pumper/line-1.sources.json",
+        )
+        process = Mock(pid=999)
+        process.poll.return_value = None
+        engine.process = process
+
+        with (
+            patch.object(engine, "_write_sources_file", side_effect=OSError("read only")),
+            patch("steam_pumper.engine.os.kill") as kill,
+            self.assertRaisesRegex(OSError, "read only"),
+        ):
+            engine.set_sources(["https://new.test/file"])
+
+        self.assertEqual(engine.sources, ["https://old.test/file"])
+        kill.assert_not_called()
 
 
 if __name__ == "__main__":

@@ -4,8 +4,12 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"reflect"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -280,4 +284,130 @@ func TestWorkerKeepsHealthyTrafficWhileFailedSourceIsQuarantined(t *testing.T) {
 	if healthyHits.Load() < 10 || total.Load() == 0 {
 		t.Fatalf("healthy hits=%d total_bytes=%d", healthyHits.Load(), total.Load())
 	}
+}
+
+func TestSourceFileLoadsAndAtomicallyReplacesNonEmptyURLs(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "sources.json")
+	initial := []string{"https://one.example/file", "https://two.example/file"}
+	data, err := json.Marshal(initial)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := loadSourcesFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	set, err := newSourceSet(loaded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	updated := []string{"https://two.example/file", "https://three.example/file"}
+	if err := set.replace(updated); err != nil {
+		t.Fatal(err)
+	}
+	if got := set.snapshot(); !reflect.DeepEqual(got, updated) {
+		t.Fatalf("snapshot = %v, want %v", got, updated)
+	}
+
+	for name, contents := range map[string]string{
+		"empty":      `[]`,
+		"malformed":  `{`,
+		"bad-scheme": `["file:///tmp/a"]`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			if err := os.WriteFile(path, []byte(contents), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := loadSourcesFile(path); err == nil {
+				t.Fatal("invalid source file was accepted")
+			}
+		})
+	}
+}
+
+func TestReloadSourcesPreservesSharedCircuitBreakerStateAndRejectsEmpty(t *testing.T) {
+	health := newSourceHealth()
+	now := time.Now()
+	health.failed("https://keep.example/file", now, "timeout", false)
+	health.failed("https://remove.example/file", now, "timeout", false)
+	set, err := newSourceSet([]string{"https://keep.example/file", "https://remove.example/file"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := replaceSources(set, health, []string{"https://keep.example/file", "https://add.example/file"}); err != nil {
+		t.Fatal(err)
+	}
+	if got := health.snapshot("https://keep.example/file", now).ConsecutiveFailures; got != 1 {
+		t.Fatalf("kept source failures = %d, want 1", got)
+	}
+	if got := health.snapshot("https://remove.example/file", now).ConsecutiveFailures; got != 0 {
+		t.Fatalf("removed source failures = %d, want 0", got)
+	}
+	before := set.snapshot()
+	if err := replaceSources(set, health, nil); err == nil {
+		t.Fatal("empty reload was accepted")
+	}
+	if got := set.snapshot(); !reflect.DeepEqual(got, before) {
+		t.Fatalf("failed reload changed sources to %v", got)
+	}
+}
+
+func TestPrivateAndReservedDestinationsAreRejected(t *testing.T) {
+	denied := []string{
+		"0.0.0.0", "10.0.0.1", "100.64.0.1", "127.0.0.1", "169.254.169.254",
+		"172.16.0.1", "192.0.2.1", "192.168.1.1", "198.18.0.1", "198.51.100.1",
+		"203.0.113.1", "224.0.0.1", "240.0.0.1",
+	}
+	for _, address := range denied {
+		if isPublicIPv4(net.ParseIP(address)) {
+			t.Errorf("%s was considered public", address)
+		}
+	}
+	if !isPublicIPv4(net.ParseIP("8.8.8.8")) {
+		t.Fatal("public IPv4 was rejected")
+	}
+}
+
+func TestHTTPDestinationPolicyChecksDNSAndEveryRedirect(t *testing.T) {
+	lookup := func(_ context.Context, _network, host string) ([]net.IP, error) {
+		if host == "private.example" {
+			return []net.IP{net.ParseIP("169.254.169.254")}, nil
+		}
+		return []net.IP{net.ParseIP("8.8.8.8")}, nil
+	}
+	client := newHTTPClientWithPolicy(5*time.Second, "", true, lookup)
+	request, err := http.NewRequest(http.MethodGet, "http://private.example/file", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	via := []*http.Request{
+		mustRequest(t, "https://public.example/one"),
+	}
+	if err := client.CheckRedirect(request, via); err == nil || !strings.Contains(err.Error(), "public IPv4") {
+		t.Fatalf("private redirect error = %v", err)
+	}
+
+	publicRequest := mustRequest(t, "https://public.example/four")
+	tooMany := []*http.Request{
+		mustRequest(t, "https://public.example/start"),
+		mustRequest(t, "https://public.example/one"),
+		mustRequest(t, "https://public.example/two"),
+		mustRequest(t, "https://public.example/three"),
+	}
+	if err := client.CheckRedirect(publicRequest, tooMany); err == nil || !strings.Contains(err.Error(), "three") {
+		t.Fatalf("redirect limit error = %v", err)
+	}
+}
+
+func mustRequest(t *testing.T, rawURL string) *http.Request {
+	t.Helper()
+	request, err := http.NewRequest(http.MethodGet, rawURL, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return request
 }

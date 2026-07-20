@@ -6,6 +6,33 @@ from unittest.mock import patch
 
 from steam_pumper.controller import PumperController
 from steam_pumper.controller import SourceEndpoint
+from steam_pumper.remote_sources import SourceListSnapshot
+
+
+class FakeRemoteSourceManager:
+    def __init__(self, initial=None):
+        self.initial = initial or []
+        self.snapshot = SourceListSnapshot(
+            status="ok" if self.initial else "pending",
+            revision=20260720031700 if self.initial else 0,
+            source_count=len(self.initial),
+        )
+        self.refresh_result = (False, list(self.initial), self.snapshot)
+        self.due_result = True
+        self.due_calls = 0
+        self.refresh_calls = 0
+
+    def load_last_known_good(self, _now=None):
+        return list(self.initial), self.snapshot
+
+    def due(self, _now=None):
+        self.due_calls += 1
+        return self.due_result
+
+    def refresh(self, _now=None):
+        self.refresh_calls += 1
+        self.snapshot = self.refresh_result[2]
+        return self.refresh_result
 
 
 class ControllerTests(unittest.TestCase):
@@ -49,6 +76,113 @@ class ControllerTests(unittest.TestCase):
                     controller = PumperController(topology_name, Path(tmpdir) / f"{topology_name}.json", env=env)
                     self.assertEqual(len(controller.lines), expected_lines)
                     self.assertEqual(len(controller.line_runtimes), expected_lines)
+
+    def test_multi_ip_loads_lkg_before_building_line_engines(self):
+        remote = FakeRemoteSourceManager(["https://remote-a.test/file", "https://remote-b.test/file"])
+        env = {
+            "LINE_COUNT": "2",
+            "LAN_IPS": "192.168.1.233,192.168.1.234",
+        }
+        with tempfile.TemporaryDirectory() as tmpdir:
+            env["SOURCES_RUNTIME_DIR"] = tmpdir
+            controller = PumperController(
+                "multi_ip",
+                Path(tmpdir) / "config.json",
+                env=env,
+                remote_source_manager=remote,
+            )
+
+        self.assertEqual(controller.effective_source_pool, remote.initial)
+        self.assertEqual(controller.effective_source_origin, "last-known-good")
+        for runtime in controller.line_runtimes.values():
+            self.assertEqual(runtime.engine.sources, remote.initial)
+            self.assertTrue(runtime.engine.reject_private_destinations)
+
+    def test_ikuai_does_not_enable_remote_or_private_destination_mode(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            controller = PumperController("ikuai_line", Path(tmpdir) / "config.json", env={})
+
+        self.assertIsNone(controller.remote_source_manager)
+        self.assertEqual(controller.effective_source_origin, "local-fallback")
+        self.assertFalse(controller.line_runtimes["line-1"].engine.reject_private_destinations)
+
+    def test_tick_hot_reloads_changed_remote_pool_without_rebuilding_runtimes(self):
+        remote = FakeRemoteSourceManager(["https://old.test/file"])
+        remote.refresh_result = (
+            True,
+            ["https://new-a.test/file", "https://new-b.test/file"],
+            SourceListSnapshot(status="ok", revision=20260721031700, source_count=2),
+        )
+        env = {"LINE_COUNT": "2", "LAN_IPS": "192.168.1.233,192.168.1.234"}
+        with tempfile.TemporaryDirectory() as tmpdir:
+            env["SOURCES_RUNTIME_DIR"] = tmpdir
+            controller = PumperController(
+                "multi_ip",
+                Path(tmpdir) / "config.json",
+                env=env,
+                remote_source_manager=remote,
+            )
+            runtimes = dict(controller.line_runtimes)
+            with (
+                patch.object(controller, "start_downloads"),
+                patch.object(controller, "sample_metrics"),
+                patch.object(controller, "_scale_lines"),
+                patch.object(controller, "resolve_sources", return_value=[]),
+                patch.object(runtimes["line-1"].engine, "set_sources", return_value=True) as first,
+                patch.object(runtimes["line-2"].engine, "set_sources", return_value=True) as second,
+            ):
+                controller.tick(monotonic_now=100, wall_time=datetime(2026, 7, 21, 4, 0))
+
+        self.assertEqual(remote.refresh_calls, 1)
+        first.assert_called_once_with(remote.refresh_result[1])
+        second.assert_called_once_with(remote.refresh_result[1])
+        self.assertIs(controller.line_runtimes["line-1"], runtimes["line-1"])
+        self.assertEqual(controller.effective_source_origin, "remote")
+
+    def test_failed_remote_refresh_keeps_active_sources_and_engines_untouched(self):
+        initial = ["https://old.test/file"]
+        remote = FakeRemoteSourceManager(initial)
+        remote.refresh_result = (
+            False,
+            initial,
+            SourceListSnapshot(status="error", revision=20260720031700, source_count=1, last_error="offline"),
+        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            controller = PumperController(
+                "multi_ip",
+                Path(tmpdir) / "config.json",
+                env={"SOURCES_RUNTIME_DIR": tmpdir},
+                remote_source_manager=remote,
+            )
+            runtime = controller.line_runtimes["line-1"]
+            with patch.object(runtime.engine, "set_sources") as update:
+                status = controller.refresh_source_list()
+
+        update.assert_not_called()
+        self.assertEqual(controller.effective_source_pool, initial)
+        self.assertEqual(controller.effective_source_origin, "last-known-good")
+        self.assertEqual(status["last_error"], "offline")
+
+    def test_remote_pool_keeps_web_source_pool_as_fallback_only(self):
+        remote = FakeRemoteSourceManager(["https://remote.test/file"])
+        with tempfile.TemporaryDirectory() as tmpdir:
+            controller = PumperController(
+                "multi_ip",
+                Path(tmpdir) / "config.json",
+                env={"SOURCES_RUNTIME_DIR": tmpdir},
+                remote_source_manager=remote,
+            )
+            runtime = controller.line_runtimes["line-1"]
+            with (
+                patch.object(controller, "stop_downloads") as stop,
+                patch.object(runtime.engine, "set_sources") as update,
+            ):
+                controller.update_config({"source_pool": ["https://fallback-new.test/file"]})
+
+        stop.assert_not_called()
+        update.assert_not_called()
+        self.assertEqual(controller.cfg.source_pool, ["https://fallback-new.test/file"])
+        self.assertEqual(controller.effective_source_pool, remote.initial)
 
     def test_start_applies_topology_before_starting_engines(self):
         events = []

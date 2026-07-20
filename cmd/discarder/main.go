@@ -9,8 +9,10 @@ import (
 	"math/rand"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -18,18 +20,21 @@ import (
 )
 
 type options struct {
-	workerID              string
-	lineID                string
-	connections           int
-	maxConnections        int
-	minSessionSeconds     int
-	startupJitterSeconds  float64
-	restartJitterSeconds  float64
-	readTimeoutSeconds    int
-	statusIntervalSeconds int
-	bindIP                string
-	urls                  []string
-	statusWriter          io.Writer
+	workerID                  string
+	lineID                    string
+	connections               int
+	maxConnections            int
+	minSessionSeconds         int
+	startupJitterSeconds      float64
+	restartJitterSeconds      float64
+	readTimeoutSeconds        int
+	statusIntervalSeconds     int
+	bindIP                    string
+	urls                      []string
+	sourcesFile               string
+	rejectPrivateDestinations bool
+	sourceSet                 *sourceSet
+	statusWriter              io.Writer
 }
 
 const maxConnectionLimit = 12
@@ -66,6 +71,97 @@ type idleTimeoutConn struct {
 type sourceHealth struct {
 	mu     sync.Mutex
 	states map[string]*sourceState
+}
+
+type sourceSet struct {
+	value atomic.Value
+}
+
+type lookupIPFunc func(context.Context, string, string) ([]net.IP, error)
+
+func newSourceSet(urls []string) (*sourceSet, error) {
+	set := &sourceSet{}
+	if err := set.replace(urls); err != nil {
+		return nil, err
+	}
+	return set, nil
+}
+
+func (set *sourceSet) replace(urls []string) error {
+	if err := validateSourceURLs(urls); err != nil {
+		return err
+	}
+	set.value.Store(append([]string(nil), urls...))
+	return nil
+}
+
+func (set *sourceSet) snapshot() []string {
+	loaded := set.value.Load()
+	if loaded == nil {
+		return nil
+	}
+	return append([]string(nil), loaded.([]string)...)
+}
+
+func validateSourceURLs(urls []string) error {
+	if len(urls) == 0 {
+		return fmt.Errorf("source list cannot be empty")
+	}
+	if len(urls) > 100 {
+		return fmt.Errorf("source list cannot contain more than 100 URLs")
+	}
+	seen := make(map[string]struct{}, len(urls))
+	for _, rawURL := range urls {
+		parsed, err := url.Parse(rawURL)
+		if err != nil || parsed.Hostname() == "" || (parsed.Scheme != "http" && parsed.Scheme != "https") {
+			return fmt.Errorf("invalid HTTP/HTTPS source URL %q", rawURL)
+		}
+		if parsed.User != nil || parsed.Fragment != "" {
+			return fmt.Errorf("source URL cannot contain credentials or a fragment: %q", rawURL)
+		}
+		if _, exists := seen[rawURL]; exists {
+			return fmt.Errorf("duplicate source URL %q", rawURL)
+		}
+		seen[rawURL] = struct{}{}
+	}
+	return nil
+}
+
+func loadSourcesFile(path string) ([]string, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+	limited := io.LimitReader(file, 1_048_577)
+	data, err := io.ReadAll(limited)
+	if err != nil {
+		return nil, err
+	}
+	if len(data) > 1_048_576 {
+		return nil, fmt.Errorf("sources file is too large")
+	}
+	var urls []string
+	decoder := json.NewDecoder(strings.NewReader(string(data)))
+	if err := decoder.Decode(&urls); err != nil {
+		return nil, fmt.Errorf("invalid sources file: %w", err)
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); err != io.EOF {
+		return nil, fmt.Errorf("sources file contains trailing JSON")
+	}
+	if err := validateSourceURLs(urls); err != nil {
+		return nil, err
+	}
+	return urls, nil
+}
+
+func replaceSources(set *sourceSet, health *sourceHealth, urls []string) error {
+	if err := set.replace(urls); err != nil {
+		return err
+	}
+	health.retain(urls)
+	return nil
 }
 
 type sourceState struct {
@@ -155,6 +251,20 @@ func (health *sourceHealth) snapshot(url string, now time.Time) sourceSnapshot {
 	return snapshotFor(health.states[url], now)
 }
 
+func (health *sourceHealth) retain(urls []string) {
+	keep := make(map[string]struct{}, len(urls))
+	for _, sourceURL := range urls {
+		keep[sourceURL] = struct{}{}
+	}
+	health.mu.Lock()
+	defer health.mu.Unlock()
+	for sourceURL := range health.states {
+		if _, exists := keep[sourceURL]; !exists {
+			delete(health.states, sourceURL)
+		}
+	}
+}
+
 func snapshotFor(state *sourceState, now time.Time) sourceSnapshot {
 	if state == nil {
 		return sourceSnapshot{State: "healthy"}
@@ -230,6 +340,8 @@ func parseOptions() options {
 	flag.IntVar(&opts.readTimeoutSeconds, "read-timeout-seconds", 30, "HTTP client timeout per request")
 	flag.IntVar(&opts.statusIntervalSeconds, "status-interval-seconds", 1, "status output interval, or 0 to disable")
 	flag.StringVar(&opts.bindIP, "bind-ip", "", "local IPv4 address to bind outbound connections")
+	flag.StringVar(&opts.sourcesFile, "sources-file", "", "JSON file containing reloadable source URLs")
+	flag.BoolVar(&opts.rejectPrivateDestinations, "reject-private-destinations", false, "reject non-public IPv4 destinations")
 	flag.Parse()
 	opts.urls = flag.Args()
 	return opts
@@ -260,7 +372,7 @@ func validateOptions(opts *options) error {
 			return fmt.Errorf("bind-ip must be a valid IPv4 address")
 		}
 	}
-	if len(opts.urls) == 0 {
+	if len(opts.urls) == 0 && opts.sourcesFile == "" {
 		return fmt.Errorf("at least one URL is required")
 	}
 	if opts.lineID == "" {
@@ -273,6 +385,19 @@ func run(ctx context.Context, opts options) error {
 	if err := validateOptions(&opts); err != nil {
 		return err
 	}
+	initialSources := opts.urls
+	if opts.sourcesFile != "" {
+		loaded, err := loadSourcesFile(opts.sourcesFile)
+		if err != nil {
+			return fmt.Errorf("load sources file: %w", err)
+		}
+		initialSources = loaded
+	}
+	set, err := newSourceSet(initialSources)
+	if err != nil {
+		return err
+	}
+	opts.sourceSet = set
 	writer := opts.statusWriter
 	if writer == nil {
 		writer = os.Stdout
@@ -303,9 +428,9 @@ func run(ctx context.Context, opts options) error {
 	for id := 1; id <= opts.connections; id++ {
 		startWorker(id)
 	}
-	scaleSignals := make(chan os.Signal, 16)
-	signal.Notify(scaleSignals, syscall.SIGUSR1, syscall.SIGUSR2)
-	defer signal.Stop(scaleSignals)
+	controlSignals := make(chan os.Signal, 16)
+	signal.Notify(controlSignals, syscall.SIGUSR1, syscall.SIGUSR2, syscall.SIGHUP)
+	defer signal.Stop(controlSignals)
 	var statusTicker *time.Ticker
 	var statusUpdates <-chan time.Time
 	if opts.statusIntervalSeconds > 0 {
@@ -320,15 +445,32 @@ func run(ctx context.Context, opts options) error {
 				cancel()
 			}
 			return nil
-		case scaleSignal := <-scaleSignals:
-			if scaleSignal == syscall.SIGUSR1 && len(workers) < opts.maxConnections {
+		case controlSignal := <-controlSignals:
+			if controlSignal == syscall.SIGHUP {
+				var loaded []string
+				var err error
+				if opts.sourcesFile == "" {
+					err = fmt.Errorf("sources-file is not configured")
+				} else {
+					loaded, err = loadSourcesFile(opts.sourcesFile)
+				}
+				if err == nil {
+					err = replaceSources(set, health, loaded)
+				}
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "source-list reload error=%v\n", err)
+					sink.emit(statusEvent{Type: "source-list", LineID: opts.lineID, Error: err.Error()})
+				} else {
+					fmt.Fprintf(os.Stderr, "source-list reloaded count=%d\n", len(loaded))
+				}
+			} else if controlSignal == syscall.SIGUSR1 && len(workers) < opts.maxConnections {
 				for id := 1; id <= opts.maxConnections; id++ {
 					if _, exists := workers[id]; !exists {
 						startWorker(id)
 						break
 					}
 				}
-			} else if scaleSignal == syscall.SIGUSR2 && len(workers) > 1 {
+			} else if controlSignal == syscall.SIGUSR2 && len(workers) > 1 {
 				for id := opts.maxConnections; id >= 1; id-- {
 					if cancel, exists := workers[id]; exists {
 						delete(workers, id)
@@ -375,7 +517,7 @@ func runWorker(
 	sink *statusSink,
 ) error {
 	timeout := time.Duration(opts.readTimeoutSeconds) * time.Second
-	client := newHTTPClient(timeout, opts.bindIP)
+	client := newHTTPClientWithPolicy(timeout, opts.bindIP, opts.rejectPrivateDestinations, nil)
 	urlIndex := connectionID - 1
 	if opts.startupJitterSeconds > 0 {
 		jitter := time.Duration(rand.Float64() * opts.startupJitterSeconds * float64(time.Second))
@@ -392,8 +534,12 @@ func runWorker(
 		url := ""
 		probe := false
 		var nextRetry time.Duration
-		for checked := 0; checked < len(opts.urls); checked++ {
-			candidate := opts.urls[urlIndex%len(opts.urls)]
+		sources := opts.urls
+		if opts.sourceSet != nil {
+			sources = opts.sourceSet.snapshot()
+		}
+		for checked := 0; checked < len(sources); checked++ {
+			candidate := sources[urlIndex%len(sources)]
 			urlIndex++
 			allowed, retryIn, claimedProbe := health.claim(candidate, time.Now())
 			if allowed {
@@ -490,6 +636,70 @@ func quarantineDelay(level int) time.Duration {
 }
 
 func newHTTPClient(timeout time.Duration, bindIP string) *http.Client {
+	return newHTTPClientWithPolicy(timeout, bindIP, false, nil)
+}
+
+var blockedIPv4Networks = func() []*net.IPNet {
+	ranges := []string{
+		"0.0.0.0/8", "10.0.0.0/8", "100.64.0.0/10", "127.0.0.0/8",
+		"169.254.0.0/16", "172.16.0.0/12", "192.0.0.0/24", "192.0.2.0/24",
+		"192.88.99.0/24", "192.168.0.0/16", "198.18.0.0/15", "198.51.100.0/24",
+		"203.0.113.0/24", "224.0.0.0/4", "240.0.0.0/4",
+	}
+	networks := make([]*net.IPNet, 0, len(ranges))
+	for _, rawRange := range ranges {
+		_, network, err := net.ParseCIDR(rawRange)
+		if err != nil {
+			panic(err)
+		}
+		networks = append(networks, network)
+	}
+	return networks
+}()
+
+func isPublicIPv4(ip net.IP) bool {
+	ipv4 := ip.To4()
+	if ipv4 == nil || !ipv4.IsGlobalUnicast() {
+		return false
+	}
+	for _, network := range blockedIPv4Networks {
+		if network.Contains(ipv4) {
+			return false
+		}
+	}
+	return true
+}
+
+func resolvePublicIPv4(ctx context.Context, host string, lookup lookupIPFunc) ([]net.IP, error) {
+	if parsed := net.ParseIP(host); parsed != nil {
+		if !isPublicIPv4(parsed) {
+			return nil, fmt.Errorf("destination %s is not a public IPv4 address", host)
+		}
+		return []net.IP{parsed.To4()}, nil
+	}
+	addresses, err := lookup(ctx, "ip4", host)
+	if err != nil {
+		return nil, fmt.Errorf("resolve destination %s: %w", host, err)
+	}
+	if len(addresses) == 0 {
+		return nil, fmt.Errorf("destination %s has no public IPv4 address", host)
+	}
+	public := make([]net.IP, 0, len(addresses))
+	for _, address := range addresses {
+		if !isPublicIPv4(address) {
+			return nil, fmt.Errorf("destination %s did not resolve only to public IPv4 addresses", host)
+		}
+		public = append(public, address.To4())
+	}
+	return public, nil
+}
+
+func newHTTPClientWithPolicy(
+	timeout time.Duration,
+	bindIP string,
+	rejectPrivateDestinations bool,
+	lookup lookupIPFunc,
+) *http.Client {
 	dialer := &net.Dialer{
 		Timeout:   timeout,
 		KeepAlive: 30 * time.Second,
@@ -503,8 +713,32 @@ func newHTTPClient(timeout time.Duration, bindIP string) *http.Client {
 		dialer.LocalAddr = &net.TCPAddr{IP: parsedIP}
 	}
 	transport := http.DefaultTransport.(*http.Transport).Clone()
+	if lookup == nil {
+		lookup = net.DefaultResolver.LookupIP
+	}
 	transport.DialContext = func(ctx context.Context, _network, address string) (net.Conn, error) {
-		conn, err := dialer.DialContext(ctx, "tcp4", address)
+		dialAddress := address
+		if rejectPrivateDestinations {
+			host, port, err := net.SplitHostPort(address)
+			if err != nil {
+				return nil, err
+			}
+			addresses, err := resolvePublicIPv4(ctx, host, lookup)
+			if err != nil {
+				return nil, err
+			}
+			var lastError error
+			for _, destination := range addresses {
+				dialAddress = net.JoinHostPort(destination.String(), port)
+				conn, dialErr := dialer.DialContext(ctx, "tcp4", dialAddress)
+				if dialErr == nil {
+					return &idleTimeoutConn{Conn: conn, timeout: timeout}, nil
+				}
+				lastError = dialErr
+			}
+			return nil, lastError
+		}
+		conn, err := dialer.DialContext(ctx, "tcp4", dialAddress)
 		if err != nil {
 			return nil, err
 		}
@@ -514,7 +748,24 @@ func newHTTPClient(timeout time.Duration, bindIP string) *http.Client {
 	transport.DisableCompression = true
 	transport.ResponseHeaderTimeout = timeout
 	transport.TLSHandshakeTimeout = timeout
-	return &http.Client{Transport: transport}
+	client := &http.Client{Transport: transport}
+	if rejectPrivateDestinations {
+		transport.Proxy = nil
+		client.CheckRedirect = func(request *http.Request, via []*http.Request) error {
+			if len(via) > 3 {
+				return fmt.Errorf("more than three redirects are not allowed")
+			}
+			if request.URL.Scheme != "http" && request.URL.Scheme != "https" {
+				return fmt.Errorf("redirect target must use HTTP or HTTPS")
+			}
+			if request.URL.User != nil || request.URL.Fragment != "" {
+				return fmt.Errorf("redirect target cannot contain credentials or a fragment")
+			}
+			_, err := resolvePublicIPv4(request.Context(), request.URL.Hostname(), lookup)
+			return err
+		}
+	}
+	return client
 }
 
 func downloadOnce(ctx context.Context, client *http.Client, url string, workerID string) (int64, error) {

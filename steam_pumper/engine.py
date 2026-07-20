@@ -4,9 +4,11 @@ import json
 import os
 import signal
 import subprocess
+import tempfile
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from pathlib import Path
 
 from .config import CommonConfig, MAX_CONNECTIONS_PER_LINE
 from .topology import LogicalLine
@@ -37,7 +39,14 @@ class EngineState:
     restarts: int = 0
 
 
-def build_engine_command(cfg: CommonConfig, line: LogicalLine, sources: list[str]) -> list[str]:
+def build_engine_command(
+    cfg: CommonConfig,
+    line: LogicalLine,
+    sources: list[str],
+    *,
+    sources_file: str | Path | None = None,
+    reject_private_destinations: bool = False,
+) -> list[str]:
     command = [
         "discarder",
         "--worker-id",
@@ -59,7 +68,11 @@ def build_engine_command(cfg: CommonConfig, line: LogicalLine, sources: list[str
     ]
     if line.bind_ip:
         command.extend(["--bind-ip", line.bind_ip])
-    return [*command, *sources]
+    if sources_file is not None:
+        command.extend(["--sources-file", str(sources_file)])
+    if reject_private_destinations:
+        command.append("--reject-private-destinations")
+    return command if sources_file is not None else [*command, *sources]
 
 
 class EngineProcess:
@@ -71,10 +84,15 @@ class EngineProcess:
         line: LogicalLine,
         sources: list[str],
         log: Callable[[str], None],
+        *,
+        sources_file: str | Path | None = None,
+        reject_private_destinations: bool = False,
     ) -> None:
         self.cfg = cfg
         self.line = line
         self.sources = list(sources)
+        self.sources_file = Path(sources_file) if sources_file is not None else None
+        self.reject_private_destinations = reject_private_destinations
         self.log = log
         self.state = EngineState(
             line_id=line.line_id,
@@ -96,8 +114,16 @@ class EngineProcess:
         self.state.status = "starting"
         self.state.last_error = ""
         try:
+            if self.sources_file is not None:
+                self._write_sources_file()
             self.process = subprocess.Popen(
-                build_engine_command(self.cfg, self.line, self.sources),
+                build_engine_command(
+                    self.cfg,
+                    self.line,
+                    self.sources,
+                    sources_file=self.sources_file,
+                    reject_private_destinations=self.reject_private_destinations,
+                ),
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 start_new_session=True,
@@ -114,6 +140,47 @@ class EngineProcess:
             f"line={self.line.line_id} engine_pid={self.process.pid} "
             f"connections={self.state.connections} start"
         )
+
+    def set_sources(self, sources: list[str]) -> bool:
+        if not sources:
+            raise ValueError("source list cannot be empty")
+        new_sources = list(sources)
+        changed = new_sources != self.sources
+        if self.sources_file is not None:
+            self._write_sources_file(new_sources)
+        self.sources = new_sources
+        process = self.process
+        if changed and process is not None and process.poll() is None:
+            try:
+                os.kill(process.pid, signal.SIGHUP)
+            except OSError as exc:
+                self.log(f"line={self.line.line_id} unable_to_reload_sources error={exc}")
+            else:
+                self.log(f"line={self.line.line_id} sources_reloaded count={len(new_sources)}")
+        return changed
+
+    def _write_sources_file(self, sources: list[str] | None = None) -> None:
+        if self.sources_file is None:
+            return
+        sources_to_write = self.sources if sources is None else sources
+        self.sources_file.parent.mkdir(parents=True, exist_ok=True)
+        descriptor, temporary_name = tempfile.mkstemp(
+            prefix=f".{self.sources_file.name}.",
+            dir=self.sources_file.parent,
+        )
+        try:
+            with os.fdopen(descriptor, "w", encoding="utf-8") as temporary:
+                json.dump(sources_to_write, temporary, ensure_ascii=True, separators=(",", ":"))
+                temporary.write("\n")
+                temporary.flush()
+                os.fsync(temporary.fileno())
+            os.replace(temporary_name, self.sources_file)
+        except Exception:
+            try:
+                os.unlink(temporary_name)
+            except FileNotFoundError:
+                pass
+            raise
 
     def poll(self, now: float | None = None) -> None:
         now = time.monotonic() if now is None else now

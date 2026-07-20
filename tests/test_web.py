@@ -27,6 +27,21 @@ class DummyController:
     def source_snapshot(self):
         return [{"url": "https://example.test/file", "ip": "203.0.113.1", "healthy": True}]
 
+    def source_list_status(self):
+        return {
+            "enabled": True,
+            "revision": 20260720031700,
+            "source_count": 3,
+            "origin": "remote",
+            "last_success_at": "2026-07-20T04:00:00+08:00",
+            "next_refresh_at": "2026-07-21T04:10:00+08:00",
+            "stale": False,
+            "last_error": "",
+        }
+
+    def refresh_source_list(self):
+        return self.source_list_status()
+
     def set_manual_enabled(self, _enabled):
         return None
 
@@ -88,6 +103,31 @@ class WebTests(unittest.TestCase):
         self.assertNotIn('name="egress_mode"', html)
         self.assertNotIn("新建连接数", html)
 
+    def test_multi_ip_console_displays_remote_source_list_status_and_refresh(self):
+        html = render_html("multi_ip")
+
+        for expected in (
+            "远程源清单",
+            "sourceListRevision",
+            "sourceListCount",
+            "sourceListOrigin",
+            "sourceListLastSuccess",
+            "sourceListNextRefresh",
+            "sourceListStale",
+            "sourceListError",
+            "立即刷新",
+            "/api/source-list/refresh",
+        ):
+            self.assertIn(expected, html)
+        self.assertNotIn('name="source_list_url"', html)
+        self.assertNotIn('name="source_list_public_key"', html)
+
+    def test_ikuai_console_does_not_show_remote_source_list_controls(self):
+        html = render_html("ikuai_line")
+
+        self.assertNotIn("远程源清单", html)
+        self.assertNotIn("/api/source-list/refresh", html)
+
     def test_console_escapes_table_values_and_uses_text_content_for_logs(self):
         html = render_html("multi_ip")
 
@@ -122,6 +162,55 @@ class WebTests(unittest.TestCase):
         self.assertEqual(metrics["target_mbps"], 800)
         self.assertEqual(sources[0]["ip"], "203.0.113.1")
         self.assertEqual(config["target_mbps"], 800)
+
+    def test_source_list_get_and_manual_refresh_endpoints(self):
+        Handler.controller = DummyController()
+        Handler.topology_name = "multi_ip"
+        server = HTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        base = f"http://127.0.0.1:{server.server_port}"
+        try:
+            current = self._get_json(f"{base}/api/source-list")
+            request = urllib.request.Request(f"{base}/api/source-list/refresh", data=b"", method="POST")
+            refreshed = json.loads(urllib.request.urlopen(request, timeout=2).read().decode("utf-8"))
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2)
+
+        self.assertEqual(current["origin"], "remote")
+        self.assertEqual(refreshed["revision"], 20260720031700)
+
+    def test_manual_refresh_failure_returns_503_json(self):
+        from steam_pumper.controller import SourceListRefreshError
+
+        class OfflineController(DummyController):
+            def refresh_source_list(self):
+                raise SourceListRefreshError("OSS offline")
+
+        Handler.controller = OfflineController()
+        Handler.topology_name = "multi_ip"
+        server = HTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        request = urllib.request.Request(
+            f"http://127.0.0.1:{server.server_port}/api/source-list/refresh",
+            data=b"",
+            method="POST",
+        )
+        try:
+            with self.assertRaises(urllib.error.HTTPError) as raised:
+                urllib.request.urlopen(request, timeout=2)
+            payload = json.loads(raised.exception.read().decode("utf-8"))
+            raised.exception.close()
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2)
+
+        self.assertEqual(raised.exception.code, 503)
+        self.assertEqual(payload, {"error": "OSS offline"})
 
     def test_api_errors_are_json(self):
         class RejectingController(DummyController):
