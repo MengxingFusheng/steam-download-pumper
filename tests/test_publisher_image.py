@@ -22,6 +22,7 @@ class PublisherImageTests(unittest.TestCase):
 
     def test_ossutil_archives_have_required_version_and_checksums(self):
         dockerfile = (ROOT / "Dockerfile.publisher").read_text(encoding="utf-8")
+        self.assertRegex(dockerfile, r"(?m)^ARG TARGETARCH=amd64$")
         self.assertIn("ossutil-2.3.0-linux-${TARGETARCH}.zip", dockerfile)
         self.assertIn("3ae4d9fc85a7a6e9f5654d1599766f1a3a42a3692870887b5ae9338d582ef65a", dockerfile)
         self.assertIn("f6c95ba0c2d2ef30290af686ce4d706c701f4734ce8090bee4288a77e3f1d764", dockerfile)

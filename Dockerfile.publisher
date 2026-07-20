@@ -1,4 +1,4 @@
-ARG TARGETARCH
+ARG TARGETARCH=amd64
 
 FROM golang:1.23 AS manifest-builder
 ARG TARGETARCH
