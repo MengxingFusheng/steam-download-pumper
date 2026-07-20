@@ -7,3 +7,7 @@ data/*
 dist/
 tests/
 docs/
+publisher-secrets/
+**/source_signing_private_key
+**/oss_access_key_id
+**/oss_access_key_secret

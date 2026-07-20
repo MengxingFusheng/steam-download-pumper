@@ -23,8 +23,9 @@ jobs:
         run: go vet ./...
       - name: Shell and Compose validation
         run: |
-          bash -n install-multi-ip.sh publish-images.sh
+          bash -n install-multi-ip.sh install-publisher.sh publish-images.sh publish-multi-ip-v2.sh publish-publisher-image.sh
           docker compose -f docker-compose.multi-ip.yml config >/dev/null
+          docker compose -f docker-compose.publisher.yml --env-file .env.publisher.example config >/dev/null
 
   images:
     needs: test
@@ -38,6 +39,9 @@ jobs:
           - name: multi-ip
             dockerfile: Dockerfile.multi-ip
             module: steam_pumper.multi_ip_main
+          - name: source-publisher
+            dockerfile: Dockerfile.publisher
+            module: source_publisher
     steps:
       - uses: actions/checkout@v4
       - name: Build image

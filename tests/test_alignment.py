@@ -86,6 +86,12 @@ class AlignmentTests(unittest.TestCase):
         self.assertIn("python3 -m unittest discover", workflow)
         self.assertIn("go test -race ./...", workflow)
 
+    def test_ci_also_builds_the_independent_publisher_image(self):
+        workflow = (ROOT / ".github/workflows/test.yml").read_text(encoding="utf-8")
+
+        self.assertIn("Dockerfile.publisher", workflow)
+        self.assertIn("source_publisher", workflow)
+
 
 if __name__ == "__main__":
     unittest.main()

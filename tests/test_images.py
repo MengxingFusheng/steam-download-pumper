@@ -11,10 +11,10 @@ def read(name: str) -> str:
 
 
 class ImageTests(unittest.TestCase):
-    def test_repository_has_exactly_two_dockerfiles(self):
+    def test_repository_has_exactly_three_dockerfiles(self):
         self.assertEqual(
             sorted(path.name for path in ROOT.glob("Dockerfile*")),
-            ["Dockerfile.ikuai-line", "Dockerfile.multi-ip"],
+            ["Dockerfile.ikuai-line", "Dockerfile.multi-ip", "Dockerfile.publisher"],
         )
 
     def test_supported_images_have_explicit_entrypoints_and_dependencies(self):
@@ -28,6 +28,17 @@ class ImageTests(unittest.TestCase):
         for content in (ikuai, multi):
             self.assertIn("MAX_CONNECTIONS_PER_LINE=12", content)
             self.assertNotIn("steamcmd", content.lower())
+
+    def test_multi_ip_and_publisher_package_manifestctl(self):
+        multi = read("Dockerfile.multi-ip")
+        publisher = read("Dockerfile.publisher")
+
+        self.assertIn("cmd/manifestctl", multi)
+        self.assertIn("/usr/local/bin/manifestctl", multi)
+        self.assertIn("cmd/manifestctl", publisher)
+        self.assertIn("/usr/local/bin/manifestctl", publisher)
+        self.assertIn("/usr/local/bin/ossutil", publisher)
+        self.assertNotIn("EXPOSE", publisher)
 
     def test_multi_ip_compose_uses_only_new_image_and_fields(self):
         compose = read("docker-compose.multi-ip.yml")
@@ -59,6 +70,8 @@ class ImageTests(unittest.TestCase):
         self.assertIn("*.pyc", dockerignore)
         self.assertIn("dist", dockerignore)
         self.assertIn("data/*", dockerignore)
+        self.assertIn("publisher-secrets", dockerignore)
+        self.assertIn("source_signing_private_key", dockerignore)
 
 
 if __name__ == "__main__":
