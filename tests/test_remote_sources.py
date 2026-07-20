@@ -1,6 +1,5 @@
 import base64
 import json
-import os
 import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
@@ -94,7 +93,7 @@ class RemoteSourceSettingsTests(unittest.TestCase):
         self.assertNotIn("source_list_url", config)
         self.assertNotIn("source_list_public_key", config)
 
-    def test_settings_accept_short_runtime_variable_names(self):
+    def test_settings_ignore_undeclared_generic_aliases(self):
         from steam_pumper.remote_sources import RemoteSourceSettings
 
         settings = RemoteSourceSettings.from_env(
@@ -110,10 +109,10 @@ class RemoteSourceSettingsTests(unittest.TestCase):
             }
         )
 
-        self.assertEqual(settings.refresh_jitter_seconds, 17)
-        self.assertEqual(settings.fetch_timeout_seconds, 9)
-        self.assertEqual(settings.max_bytes, 4096)
-        self.assertEqual(settings.min_sources, 4)
+        self.assertEqual(settings.refresh_jitter_seconds, 1800)
+        self.assertEqual(settings.fetch_timeout_seconds, 15)
+        self.assertEqual(settings.max_bytes, 524_288)
+        self.assertEqual(settings.min_sources, 3)
 
     def test_enabled_settings_reject_non_https_and_invalid_public_keys(self):
         from steam_pumper.remote_sources import RemoteSourceSettings
@@ -128,8 +127,8 @@ class RemoteSourceSettingsTests(unittest.TestCase):
             ({**base, "SOURCE_LIST_URL": "http://bucket.example.test/latest.json"}, "HTTPS"),
             ({**base, "SOURCE_LIST_PUBLIC_KEY": base64.b64encode(b"short").decode()}, "32 bytes"),
             ({**base, "SOURCE_LIST_KEY_ID": ""}, "KEY_ID"),
-            ({**base, "JITTER": "-1"}, "JITTER"),
-            ({**base, "MIN_SOURCES": "101"}, "MIN_SOURCES"),
+            ({**base, "SOURCE_LIST_REFRESH_JITTER_SECONDS": "-1"}, "SOURCE_LIST_REFRESH_JITTER_SECONDS"),
+            ({**base, "SOURCE_LIST_MIN_SOURCES": "101"}, "SOURCE_LIST_MIN_SOURCES"),
         )
         for env, message in cases:
             with self.subTest(message=message):
@@ -162,6 +161,9 @@ class ManifestValidationTests(unittest.TestCase):
         cases = (
             ({"schema": 2}, "schema"),
             ({"revision": 12}, "revision"),
+            ({"revision": 20260230031700}, "revision"),
+            ({"revision": 20261320031700}, "revision"),
+            ({"revision": 20260720241700}, "revision"),
             ({"generated_at": (NOW + timedelta(minutes=11)).isoformat()}, "future"),
             ({"expires_at": (generated + timedelta(hours=71)).isoformat()}, "72 hours"),
             ({"sources": valid_sources[:2]}, "at least 3"),
@@ -204,10 +206,13 @@ class RemoteSourceManagerTests(unittest.TestCase):
         self.addCleanup(self.tempdir.cleanup)
         self.data_dir = Path(self.tempdir.name)
         self.verifier = self.data_dir / "manifestctl"
+        self.verifier_record = self.data_dir / "manifestctl-record.json"
         self.verifier.write_text(
             "#!/usr/bin/env python3\n"
             "import base64,json,sys\n"
-            "body=json.load(sys.stdin)\n"
+            "raw=sys.stdin.buffer.read()\n"
+            f"open({str(self.verifier_record)!r},'w').write(json.dumps({{'argv':sys.argv[1:],'stdin':base64.b64encode(raw).decode()}}))\n"
+            "body=json.loads(raw)\n"
             "sys.stdout.buffer.write(base64.b64decode(body['payload']))\n",
             encoding="utf-8",
         )
@@ -222,7 +227,7 @@ class RemoteSourceManagerTests(unittest.TestCase):
                 "SOURCE_LIST_URL": "https://bucket.example.test/latest.json",
                 "SOURCE_LIST_PUBLIC_KEY": PUBLIC_KEY,
                 "SOURCE_LIST_KEY_ID": "test-key",
-                "JITTER": "0",
+                "SOURCE_LIST_REFRESH_JITTER_SECONDS": "0",
             }
         )
 
@@ -237,6 +242,8 @@ class RemoteSourceManagerTests(unittest.TestCase):
             item = queued.pop(0)
             if isinstance(item, Exception):
                 raise item
+            if isinstance(item, FakeResponse):
+                return item
             return FakeResponse(item, headers={"ETag": '"revision"'})
 
         return RemoteSourceManager(
@@ -248,10 +255,11 @@ class RemoteSourceManagerTests(unittest.TestCase):
             hostname="stable-host",
         )
 
-    def test_refresh_verifies_and_atomically_persists_envelope_and_state(self):
-        manager = self.manager([signed_envelope(manifest_payload())])
+    def test_refresh_verifies_protocol_and_commits_state_before_envelope(self):
+        envelope = signed_envelope(manifest_payload())
+        manager = self.manager([envelope])
 
-        with patch("steam_pumper.remote_sources.os.replace", wraps=os.replace) as replace:
+        with patch.object(manager, "_atomic_write", wraps=manager._atomic_write) as atomic_write:
             changed, sources, snapshot = manager.refresh(NOW)
 
         self.assertTrue(changed)
@@ -261,9 +269,26 @@ class RemoteSourceManagerTests(unittest.TestCase):
         self.assertEqual(snapshot.status, "ok")
         self.assertEqual(snapshot.last_success_at, NOW.isoformat())
         self.assertEqual(snapshot.next_refresh_at, (NOW + timedelta(days=1)).isoformat())
-        self.assertEqual(replace.call_count, 2)
+        self.assertEqual(
+            [call.args[0].name for call in atomic_write.call_args_list],
+            ["source-list-state.json", "source-list-envelope.json"],
+        )
         self.assertTrue((self.data_dir / "source-list-envelope.json").exists())
         self.assertTrue((self.data_dir / "source-list-state.json").exists())
+        verifier_record = json.loads(self.verifier_record.read_text(encoding="utf-8"))
+        self.assertEqual(
+            verifier_record["argv"],
+            [
+                "verify",
+                "--public-key-base64",
+                PUBLIC_KEY,
+                "--key-id",
+                "test-key",
+                "--max-bytes",
+                "524288",
+            ],
+        )
+        self.assertEqual(base64.b64decode(verifier_record["stdin"]), envelope)
 
     def test_startup_loads_expired_lkg_and_marks_it_stale(self):
         old_now = NOW - timedelta(days=4)
@@ -276,6 +301,23 @@ class RemoteSourceManagerTests(unittest.TestCase):
         self.assertEqual(len(sources), 3)
         self.assertTrue(snapshot.stale)
         self.assertEqual(snapshot.status, "stale")
+
+    def test_expired_lkg_remains_stale_after_not_modified_response(self):
+        old_now = NOW - timedelta(days=4)
+        manager = self.manager(
+            [
+                signed_envelope(manifest_payload(reference_now=old_now)),
+                FakeResponse(b"", status=304),
+            ]
+        )
+        manager.refresh(old_now)
+
+        changed, sources, snapshot = manager.refresh(NOW)
+
+        self.assertFalse(changed)
+        self.assertEqual(len(sources), 3)
+        self.assertEqual(snapshot.status, "stale")
+        self.assertTrue(snapshot.stale)
 
     def test_startup_refresh_is_due_even_when_lkg_has_a_future_schedule(self):
         manager = self.manager([signed_envelope(manifest_payload())])
@@ -310,6 +352,140 @@ class RemoteSourceManagerTests(unittest.TestCase):
         self.assertIn("offline", failed.last_error)
         self.assertEqual(failed.next_refresh_at, (NOW + timedelta(minutes=32)).isoformat())
         self.assertEqual((self.data_dir / "source-list-envelope.json").read_bytes(), envelope_before)
+
+    def test_equal_revision_requires_identical_envelope_and_payload(self):
+        initial_payload = manifest_payload()
+        initial_envelope = signed_envelope(initial_payload)
+        changed_document = json.loads(initial_payload)
+        changed_document["sources"][0]["probe_mbps"] += 1
+        changed_payload = json.dumps(changed_document, separators=(",", ":")).encode("utf-8")
+        manager = self.manager(
+            [
+                initial_envelope,
+                signed_envelope(changed_payload),
+                initial_envelope + b"\n",
+                initial_envelope,
+            ]
+        )
+        manager.refresh(NOW)
+
+        for offset in (1, 2):
+            changed, sources, snapshot = manager.refresh(NOW + timedelta(minutes=offset))
+            self.assertFalse(changed)
+            self.assertEqual(len(sources), 3)
+            self.assertIn("revision", snapshot.last_error)
+            self.assertEqual((self.data_dir / "source-list-envelope.json").read_bytes(), initial_envelope)
+
+        changed, sources, snapshot = manager.refresh(NOW + timedelta(minutes=3))
+        self.assertFalse(changed)
+        self.assertEqual(len(sources), 3)
+        self.assertEqual(snapshot.status, "ok")
+
+    def test_missing_corrupt_or_interrupted_state_recovers_from_authoritative_envelope(self):
+        envelope = signed_envelope(manifest_payload())
+        manager = self.manager([envelope])
+        manager.refresh(NOW)
+        state_path = self.data_dir / "source-list-state.json"
+
+        mutations = (
+            lambda: state_path.unlink(),
+            lambda: state_path.write_bytes(b"{"),
+            lambda: state_path.write_text(
+                json.dumps(
+                    {
+                        "revision": 20260721031700,
+                        "failure_count": 0,
+                        "last_success_at": (NOW + timedelta(days=1)).isoformat(),
+                        "next_refresh_at": (NOW + timedelta(days=2)).isoformat(),
+                    }
+                ),
+                encoding="utf-8",
+            ),
+        )
+        for index, mutate in enumerate(mutations):
+            with self.subTest(index=index):
+                mutate()
+                reloaded = self.manager([])
+                sources, snapshot = reloaded.load_last_known_good(NOW)
+                self.assertEqual(len(sources), 3)
+                self.assertEqual(snapshot.revision, 20260720031700)
+                self.assertEqual(snapshot.status, "ok")
+
+    def test_state_write_failure_keeps_previous_complete_lkg(self):
+        old_envelope = signed_envelope(manifest_payload())
+        new_envelope = signed_envelope(manifest_payload(revision=20260721031700, reference_now=NOW + timedelta(days=1)))
+        manager = self.manager([old_envelope, new_envelope])
+        manager.refresh(NOW)
+        old_sources = list(manager.current_urls)
+        original_write = manager._atomic_write
+        failed = False
+
+        def fail_state_once(path, data):
+            nonlocal failed
+            if path == manager.state_path and not failed:
+                failed = True
+                raise OSError("state disk error")
+            return original_write(path, data)
+
+        with patch.object(manager, "_atomic_write", side_effect=fail_state_once):
+            changed, sources, snapshot = manager.refresh(NOW + timedelta(days=1))
+
+        self.assertFalse(changed)
+        self.assertEqual(sources, old_sources)
+        self.assertIn("state disk error", snapshot.last_error)
+        reloaded_sources, _snapshot = self.manager([]).load_last_known_good(NOW + timedelta(days=1))
+        self.assertEqual(reloaded_sources, old_sources)
+        self.assertEqual((self.data_dir / "source-list-envelope.json").read_bytes(), old_envelope)
+
+    def test_envelope_write_failure_or_interruption_keeps_previous_lkg(self):
+        old_envelope = signed_envelope(manifest_payload())
+        new_envelope = signed_envelope(manifest_payload(revision=20260721031700, reference_now=NOW + timedelta(days=1)))
+        manager = self.manager([old_envelope, new_envelope])
+        manager.refresh(NOW)
+        old_sources = list(manager.current_urls)
+        original_write = manager._atomic_write
+
+        def fail_envelope(path, data):
+            if path == manager.envelope_path:
+                raise OSError("envelope disk error")
+            return original_write(path, data)
+
+        with patch.object(manager, "_atomic_write", side_effect=fail_envelope):
+            changed, sources, snapshot = manager.refresh(NOW + timedelta(days=1))
+
+        self.assertFalse(changed)
+        self.assertEqual(sources, old_sources)
+        self.assertIn("envelope disk error", snapshot.last_error)
+        reloaded_sources, reloaded_snapshot = self.manager([]).load_last_known_good(NOW + timedelta(days=1))
+        self.assertEqual(reloaded_sources, old_sources)
+        self.assertEqual(reloaded_snapshot.revision, 20260720031700)
+
+    def test_no_lkg_failure_backoff_persists_across_restarts(self):
+        import urllib.error
+
+        attempt_times = [
+            NOW,
+            NOW + timedelta(seconds=300),
+            NOW + timedelta(seconds=2100),
+            NOW + timedelta(seconds=9300),
+        ]
+        delays = [300, 1800, 7200, 21600]
+        for index, (attempt_at, delay) in enumerate(zip(attempt_times, delays), start=1):
+            manager = self.manager([urllib.error.URLError(f"offline-{index}")])
+            sources, loaded = manager.load_last_known_good(attempt_at)
+            self.assertEqual(sources, [])
+            if index > 1:
+                self.assertEqual(manager.failure_count, index - 1)
+            _changed, sources, failed = manager.refresh(attempt_at)
+            self.assertEqual(sources, [])
+            self.assertEqual(failed.next_refresh_at, (attempt_at + timedelta(seconds=delay)).isoformat())
+            state = json.loads((self.data_dir / "source-list-state.json").read_text(encoding="utf-8"))
+            self.assertEqual(state["revision"], 0)
+            self.assertEqual(state["failure_count"], index)
+            restarted = self.manager([])
+            restarted.load_last_known_good(attempt_at + timedelta(seconds=1))
+            self.assertFalse(restarted.due(attempt_at + timedelta(seconds=1)))
+        self.assertFalse((self.data_dir / "source-list-envelope.json").exists())
 
     def test_oversized_envelope_is_rejected_before_verification(self):
         manager = self.manager([b"x" * (524_288 + 1)])

@@ -41,12 +41,12 @@ def _load_json(data: bytes | str, description: str) -> Any:
         raise ValueError(f"invalid {description}: {exc}") from exc
 
 
-def _env_int(env: Mapping[str, str], short_name: str, long_name: str, default: int) -> int:
-    raw = env.get(short_name, env.get(long_name, str(default)))
+def _env_int(env: Mapping[str, str], name: str, default: int) -> int:
+    raw = env.get(name, str(default))
     try:
         return int(raw)
     except (TypeError, ValueError) as exc:
-        raise ValueError(f"{short_name} must be an integer") from exc
+        raise ValueError(f"{name} must be an integer") from exc
 
 
 def _env_bool(env: Mapping[str, str], name: str, default: bool) -> bool:
@@ -96,23 +96,23 @@ class RemoteSourceSettings:
         public_key = env.get("SOURCE_LIST_PUBLIC_KEY", "").strip()
         key_id = env.get("SOURCE_LIST_KEY_ID", "").strip()
         refresh_time = env.get("SOURCE_LIST_REFRESH_TIME", "04:00").strip()
-        jitter = _env_int(env, "JITTER", "SOURCE_LIST_REFRESH_JITTER_SECONDS", 1800)
-        timeout = _env_int(env, "TIMEOUT", "SOURCE_LIST_FETCH_TIMEOUT_SECONDS", 15)
-        max_bytes = _env_int(env, "MAX_BYTES", "SOURCE_LIST_MAX_BYTES", 524_288)
-        min_sources = _env_int(env, "MIN_SOURCES", "SOURCE_LIST_MIN_SOURCES", 3)
+        jitter = _env_int(env, "SOURCE_LIST_REFRESH_JITTER_SECONDS", 1800)
+        timeout = _env_int(env, "SOURCE_LIST_FETCH_TIMEOUT_SECONDS", 15)
+        max_bytes = _env_int(env, "SOURCE_LIST_MAX_BYTES", 524_288)
+        min_sources = _env_int(env, "SOURCE_LIST_MIN_SOURCES", 3)
 
         try:
             datetime.strptime(refresh_time, "%H:%M")
         except ValueError as exc:
             raise ValueError("SOURCE_LIST_REFRESH_TIME must use HH:MM") from exc
         if not 0 <= jitter <= 3600:
-            raise ValueError("JITTER must be between 0 and 3600")
+            raise ValueError("SOURCE_LIST_REFRESH_JITTER_SECONDS must be between 0 and 3600")
         if not 1 <= timeout <= 300:
-            raise ValueError("TIMEOUT must be between 1 and 300")
+            raise ValueError("SOURCE_LIST_FETCH_TIMEOUT_SECONDS must be between 1 and 300")
         if not 1024 <= max_bytes <= 1_048_576:
-            raise ValueError("MAX_BYTES must be between 1024 and 1048576")
+            raise ValueError("SOURCE_LIST_MAX_BYTES must be between 1024 and 1048576")
         if not 3 <= min_sources <= 100:
-            raise ValueError("MIN_SOURCES must be between 3 and 100")
+            raise ValueError("SOURCE_LIST_MIN_SOURCES must be between 3 and 100")
 
         if enabled:
             parsed_url = urlsplit(url)
@@ -254,6 +254,10 @@ def parse_manifest_payload(
         or revision <= 0
     ):
         raise ValueError("manifest revision must be a positive 14-digit integer")
+    try:
+        datetime.strptime(str(revision), "%Y%m%d%H%M%S")
+    except ValueError as exc:
+        raise ValueError("manifest revision must be a valid YYYYMMDDHHMMSS Asia/Shanghai timestamp") from exc
 
     current = _aware_now(now)
     generated_at = _parse_timestamp(document["generated_at"], "generated_at")
@@ -338,6 +342,7 @@ class RemoteSourceManager:
         )
         self.current_urls: list[str] = []
         self.manifest: RemoteSourceManifest | None = None
+        self.envelope_bytes: bytes | None = None
         self.snapshot = SourceListSnapshot(enabled=settings.enabled)
         self.failure_count = 0
         self.startup_refresh_pending = settings.enabled
@@ -350,10 +355,19 @@ class RemoteSourceManager:
         if not self.settings.enabled:
             self.snapshot = SourceListSnapshot(enabled=False, status="disabled")
             return [], self.snapshot
+
+        state: dict[str, Any] | None = None
+        state_error = ""
         try:
-            state = _load_json(self.state_path.read_bytes(), "source list state")
-            if not isinstance(state, dict):
-                raise ValueError("source list state must be a JSON object")
+            state = self._read_state()
+        except (OSError, ValueError, TypeError) as exc:
+            if not isinstance(exc, FileNotFoundError):
+                state_error = str(exc)
+
+        envelope: bytes | None = None
+        manifest: RemoteSourceManifest | None = None
+        envelope_error = ""
+        try:
             envelope = self.envelope_path.read_bytes()
             payload = self._verify_envelope(envelope)
             manifest = parse_manifest_payload(
@@ -363,34 +377,54 @@ class RemoteSourceManager:
                 resolver=self.resolver,
                 allow_expired=True,
             )
-            if state.get("revision") != manifest.revision:
-                raise ValueError("source list state revision does not match envelope")
+        except (OSError, ValueError, TypeError, subprocess.SubprocessError) as exc:
+            if not isinstance(exc, FileNotFoundError):
+                envelope_error = str(exc)
+
+        if manifest is not None and envelope is not None:
             self.manifest = manifest
+            self.envelope_bytes = envelope
             self.current_urls = list(manifest.urls)
-            self.failure_count = max(0, int(state.get("failure_count", 0)))
-            stale = manifest.expires_at <= current
+            if state is not None and state["revision"] == manifest.revision:
+                self.failure_count = state["failure_count"]
+                self.snapshot = self._snapshot_for_manifest(manifest, current, state)
+            else:
+                self.failure_count = 0
+                self.snapshot = self._snapshot_for_manifest(manifest, current)
+                try:
+                    self._save_state(self.snapshot, self.failure_count)
+                except OSError:
+                    pass
+            self.startup_refresh_pending = True
+            return list(self.current_urls), self.snapshot
+
+        self.manifest = None
+        self.envelope_bytes = None
+        self.current_urls = []
+        if state is not None and state["revision"] == 0:
+            self.failure_count = state["failure_count"]
+            last_error = self._state_text(state, "last_error")
             self.snapshot = SourceListSnapshot(
                 enabled=True,
-                status="stale" if stale else "ok",
-                revision=manifest.revision,
-                generated_at=manifest.generated_at.isoformat(),
-                expires_at=manifest.expires_at.isoformat(),
-                source_count=len(self.current_urls),
-                last_checked_at=str(state.get("last_checked_at", "")),
-                last_success_at=str(state.get("last_success_at", "")),
-                next_refresh_at=str(state.get("next_refresh_at", "")),
-                etag=str(state.get("etag", "")),
-                last_error=str(state.get("last_error", "")),
-                stale=stale,
+                status="error" if last_error else "pending",
+                revision=0,
+                last_checked_at=self._state_text(state, "last_checked_at"),
+                last_success_at=self._state_text(state, "last_success_at"),
+                next_refresh_at=self._state_text(state, "next_refresh_at"),
+                etag=self._state_text(state, "etag"),
+                last_error=last_error,
             )
-        except (OSError, ValueError, TypeError, subprocess.SubprocessError) as exc:
-            self.manifest = None
-            self.current_urls = []
+            self.startup_refresh_pending = not bool(
+                self.failure_count and self.snapshot.next_refresh_at
+            )
+        else:
+            self.failure_count = 0
             self.snapshot = SourceListSnapshot(
                 enabled=True,
                 status="pending",
-                last_error="" if isinstance(exc, FileNotFoundError) else str(exc),
+                last_error=envelope_error or state_error,
             )
+            self.startup_refresh_pending = True
         return list(self.current_urls), self.snapshot
 
     def due(self, now: datetime | None = None) -> bool:
@@ -416,12 +450,17 @@ class RemoteSourceManager:
             return False, list(self.current_urls), self.snapshot
         self.startup_refresh_pending = False
         checked_at = current.isoformat()
+        previous_manifest = self.manifest
+        previous_envelope = self.envelope_bytes
+        previous_urls = list(self.current_urls)
+        previous_snapshot = self.snapshot
+        previous_failure_count = self.failure_count
         try:
             envelope, etag, not_modified = self._fetch_envelope()
             if not_modified:
-                if self.manifest is None:
+                if previous_manifest is None:
                     raise ValueError("server returned 304 without a last-known-good source list")
-                manifest = self.manifest
+                manifest = previous_manifest
             else:
                 payload = self._verify_envelope(envelope)
                 manifest = parse_manifest_payload(
@@ -430,45 +469,50 @@ class RemoteSourceManager:
                     now=current,
                     resolver=self.resolver,
                 )
-                if self.manifest is not None and manifest.revision < self.manifest.revision:
+                if previous_manifest is not None and manifest.revision < previous_manifest.revision:
                     raise ValueError(
-                        f"source list rollback rejected: {manifest.revision} < {self.manifest.revision}"
+                        f"source list rollback rejected: {manifest.revision} < {previous_manifest.revision}"
                     )
-                if (
-                    self.manifest is not None
-                    and manifest.revision == self.manifest.revision
-                    and manifest.urls != self.manifest.urls
-                ):
-                    raise ValueError("source list changed without a revision increase")
+                if previous_manifest is not None and manifest.revision == previous_manifest.revision:
+                    if previous_envelope is None or envelope != previous_envelope:
+                        raise ValueError("equal revision requires an identical accepted envelope and payload")
 
-            changed = self.manifest is None or manifest.urls != self.manifest.urls
-            self.manifest = manifest
-            self.current_urls = list(manifest.urls)
-            self.failure_count = 0
+            changed = previous_manifest is None or manifest.urls != previous_manifest.urls
+            stale = manifest.expires_at <= current
             next_refresh = self._next_daily_refresh(current)
-            self.snapshot = SourceListSnapshot(
+            candidate_snapshot = SourceListSnapshot(
                 enabled=True,
-                status="ok",
+                status="stale" if stale else "ok",
                 revision=manifest.revision,
                 generated_at=manifest.generated_at.isoformat(),
                 expires_at=manifest.expires_at.isoformat(),
-                source_count=len(self.current_urls),
+                source_count=len(manifest.urls),
                 last_checked_at=checked_at,
                 last_success_at=checked_at,
                 next_refresh_at=next_refresh.isoformat(),
-                etag=etag or self.snapshot.etag,
-                stale=False,
+                etag=etag or previous_snapshot.etag,
+                stale=stale,
             )
-            if not not_modified:
+            self._save_state(candidate_snapshot, 0)
+            if not not_modified and manifest.revision != (
+                previous_manifest.revision if previous_manifest is not None else None
+            ):
                 self._atomic_write(self.envelope_path, envelope)
-            self._save_state()
+            self.manifest = manifest
+            self.envelope_bytes = previous_envelope if not_modified else envelope
+            self.current_urls = list(manifest.urls)
+            self.failure_count = 0
+            self.snapshot = candidate_snapshot
             return changed, list(self.current_urls), self.snapshot
         except (OSError, ValueError, urllib.error.URLError, subprocess.SubprocessError) as exc:
-            self.failure_count += 1
+            self.manifest = previous_manifest
+            self.envelope_bytes = previous_envelope
+            self.current_urls = previous_urls
+            self.failure_count = previous_failure_count + 1
             delay = RETRY_DELAYS_SECONDS[min(self.failure_count - 1, len(RETRY_DELAYS_SECONDS) - 1)]
-            stale = bool(self.manifest and self.manifest.expires_at <= current)
+            stale = bool(previous_manifest and previous_manifest.expires_at <= current)
             self.snapshot = replace(
-                self.snapshot,
+                previous_snapshot,
                 enabled=True,
                 status="stale" if stale else "error",
                 last_checked_at=checked_at,
@@ -476,8 +520,10 @@ class RemoteSourceManager:
                 last_error=str(exc),
                 stale=stale,
             )
-            if self.manifest is not None:
-                self._save_state()
+            try:
+                self._save_state(self.snapshot, self.failure_count)
+            except OSError:
+                pass
             return False, list(self.current_urls), self.snapshot
 
     def _fetch_envelope(self) -> tuple[bytes, str, bool]:
@@ -558,11 +604,64 @@ class RemoteSourceManager:
         scheduled = datetime.combine(tomorrow, datetime_time(hour, minute), tzinfo=now.tzinfo)
         return scheduled + timedelta(seconds=self.stable_jitter_seconds)
 
-    def _save_state(self) -> None:
+    def _read_state(self) -> dict[str, Any]:
+        raw_state = self.state_path.read_bytes()
+        if len(raw_state) > self.settings.max_bytes:
+            raise ValueError("source list state is too large")
+        state = _load_json(raw_state, "source list state")
+        if not isinstance(state, dict):
+            raise ValueError("source list state must be a JSON object")
+        revision = state.get("revision")
+        failure_count = state.get("failure_count")
+        if not isinstance(revision, int) or isinstance(revision, bool) or revision < 0:
+            raise ValueError("source list state revision must be a non-negative integer")
+        if (
+            not isinstance(failure_count, int)
+            or isinstance(failure_count, bool)
+            or failure_count < 0
+        ):
+            raise ValueError("source list state failure_count must be a non-negative integer")
+        return state
+
+    @staticmethod
+    def _state_text(state: Mapping[str, Any], field_name: str) -> str:
+        value = state.get(field_name, "")
+        return value if isinstance(value, str) else ""
+
+    def _snapshot_for_manifest(
+        self,
+        manifest: RemoteSourceManifest,
+        now: datetime,
+        state: Mapping[str, Any] | None = None,
+    ) -> SourceListSnapshot:
+        metadata = {} if state is None else state
+        stale = manifest.expires_at <= now
+        last_error = self._state_text(metadata, "last_error")
+        return SourceListSnapshot(
+            enabled=True,
+            status="stale" if stale else ("error" if last_error else "ok"),
+            revision=manifest.revision,
+            generated_at=manifest.generated_at.isoformat(),
+            expires_at=manifest.expires_at.isoformat(),
+            source_count=len(manifest.urls),
+            last_checked_at=self._state_text(metadata, "last_checked_at"),
+            last_success_at=self._state_text(metadata, "last_success_at"),
+            next_refresh_at=self._state_text(metadata, "next_refresh_at"),
+            etag=self._state_text(metadata, "etag"),
+            last_error=last_error,
+            stale=stale,
+        )
+
+    def _save_state(
+        self,
+        snapshot: SourceListSnapshot | None = None,
+        failure_count: int | None = None,
+    ) -> None:
+        state_snapshot = self.snapshot if snapshot is None else snapshot
+        state_failure_count = self.failure_count if failure_count is None else failure_count
         payload = {
-            **self.snapshot.to_dict(),
-            "sources": list(self.current_urls),
-            "failure_count": self.failure_count,
+            **state_snapshot.to_dict(),
+            "failure_count": state_failure_count,
         }
         self._atomic_write(
             self.state_path,
