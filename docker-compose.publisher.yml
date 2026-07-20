@@ -1,0 +1,56 @@
+services:
+  source-publisher:
+    image: ${PUBLISHER_IMAGE:-traveler1314/pumper-source-publisher:publisher-v1}
+    container_name: pumper-source-publisher
+    restart: unless-stopped
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 64
+    mem_limit: 192m
+    cpus: 0.50
+    tmpfs:
+      - /tmp:size=64m,noexec,nosuid,nodev,mode=1777
+    volumes:
+      - ./publisher-config/candidates.json:/config/candidates.json:ro
+      - source_publisher_state:/state
+    secrets:
+      - source: source_signing_private_key
+        target: /run/secrets/source_signing_private_key
+      - source: oss_access_key_id
+        target: /run/secrets/oss_access_key_id
+      - source: oss_access_key_secret
+        target: /run/secrets/oss_access_key_secret
+    environment:
+      OSS_BUCKET: ${OSS_BUCKET}
+      OSS_REGION: ${OSS_REGION:-cn-beijing}
+      OSS_ENDPOINT: ${OSS_ENDPOINT:-https://oss-cn-beijing.aliyuncs.com}
+      OSS_PUBLIC_BASE_URL: ${OSS_PUBLIC_BASE_URL}
+      SOURCE_LIST_KEY_ID: ${SOURCE_LIST_KEY_ID}
+      PUBLISH_TIME: ${PUBLISH_TIME:-03:17}
+      PUBLISH_TIMEZONE: ${PUBLISH_TIMEZONE:-Asia/Shanghai}
+      PUBLISH_RETRY_SECONDS: ${PUBLISH_RETRY_SECONDS:-900,3600,21600}
+      MIN_HEALTHY_SOURCES: ${MIN_HEALTHY_SOURCES:-3}
+      MAX_HEALTHY_SOURCES: ${MAX_HEALTHY_SOURCES:-100}
+      PROBE_CONCURRENCY: ${PROBE_CONCURRENCY:-4}
+      PROBE_BYTES: ${PROBE_BYTES:-8388608}
+      PROBE_TIMEOUT_SECONDS: ${PROBE_TIMEOUT_SECONDS:-20}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    logging:
+      driver: json-file
+      options:
+        max-size: 5m
+        max-file: "2"
+
+volumes:
+  source_publisher_state:
+
+secrets:
+  source_signing_private_key:
+    file: ./publisher-secrets/source_signing_private_key
+  oss_access_key_id:
+    file: ./publisher-secrets/oss_access_key_id
+  oss_access_key_secret:
+    file: ./publisher-secrets/oss_access_key_secret
