@@ -11,7 +11,9 @@ import (
 	"path/filepath"
 	"reflect"
 	"strings"
+	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -24,6 +26,16 @@ func TestValidateOptionsRejectsMoreThanTwelveConnections(t *testing.T) {
 		if err := validateOptions(&opts); err == nil || !strings.Contains(err.Error(), "12") {
 			t.Fatalf("expected hard-cap error, got %v", err)
 		}
+	}
+}
+
+func TestValidateOptionsRejectsUnlimitedRequestTimeout(t *testing.T) {
+	opts := options{
+		connections: 1, maxConnections: 1, readTimeoutSeconds: 0,
+		urls: []string{"http://example.test/file"},
+	}
+	if err := validateOptions(&opts); err == nil || !strings.Contains(err.Error(), "read-timeout") {
+		t.Fatalf("zero request timeout was accepted: %v", err)
 	}
 }
 
@@ -313,9 +325,10 @@ func TestSourceFileLoadsAndAtomicallyReplacesNonEmptyURLs(t *testing.T) {
 	}
 
 	for name, contents := range map[string]string{
-		"empty":      `[]`,
-		"malformed":  `{`,
-		"bad-scheme": `["file:///tmp/a"]`,
+		"empty":              `[]`,
+		"malformed":          `{`,
+		"bad-scheme":         `["file:///tmp/a"]`,
+		"missing-generation": `{"sources":["https://one.example/file"]}`,
 	} {
 		t.Run(name, func(t *testing.T) {
 			if err := os.WriteFile(path, []byte(contents), 0o600); err != nil {
@@ -325,6 +338,21 @@ func TestSourceFileLoadsAndAtomicallyReplacesNonEmptyURLs(t *testing.T) {
 				t.Fatal("invalid source file was accepted")
 			}
 		})
+	}
+}
+
+func TestSourceFileObjectCarriesGeneration(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "sources.json")
+	data := `{"generation":"20260721031700","sources":["https://one.example/file"]}`
+	if err := os.WriteFile(path, []byte(data), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	config, err := loadSourceConfig(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if config.Generation != "20260721031700" || !reflect.DeepEqual(config.Sources, []string{"https://one.example/file"}) {
+		t.Fatalf("config = %+v", config)
 	}
 }
 
@@ -353,6 +381,99 @@ func TestReloadSourcesPreservesSharedCircuitBreakerStateAndRejectsEmpty(t *testi
 	}
 	if got := set.snapshot(); !reflect.DeepEqual(got, before) {
 		t.Fatalf("failed reload changed sources to %v", got)
+	}
+}
+
+func TestRemovedSourceLateResultCannotPolluteReaddedURL(t *testing.T) {
+	health := newSourceHealth()
+	url := "https://source.example/file"
+	health.retain([]string{url})
+	oldEpoch := health.epoch(url)
+	health.retain([]string{"https://other.example/file"})
+	health.retain([]string{"https://other.example/file", url})
+	newEpoch := health.epoch(url)
+	if oldEpoch == newEpoch {
+		t.Fatalf("readded URL retained epoch %d", oldEpoch)
+	}
+	health.failedCurrent(url, oldEpoch, time.Now(), "late timeout", false)
+	if got := health.snapshot(url, time.Now()).ConsecutiveFailures; got != 0 {
+		t.Fatalf("late failure polluted readded URL: %d", got)
+	}
+}
+
+type lockedBuffer struct {
+	mu sync.Mutex
+	bytes.Buffer
+}
+
+func (buffer *lockedBuffer) Write(data []byte) (int, error) {
+	buffer.mu.Lock()
+	defer buffer.mu.Unlock()
+	return buffer.Buffer.Write(data)
+}
+
+func (buffer *lockedBuffer) String() string {
+	buffer.mu.Lock()
+	defer buffer.mu.Unlock()
+	return buffer.Buffer.String()
+}
+
+func TestReloadAcknowledgesGenerationAndCancelsRemovedSourceRequest(t *testing.T) {
+	started := make(chan struct{}, 1)
+	cancelled := make(chan struct{}, 1)
+	old := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, request *http.Request) {
+		started <- struct{}{}
+		<-request.Context().Done()
+		cancelled <- struct{}{}
+	}))
+	defer old.Close()
+	newSource := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, _ *http.Request) {
+		_, _ = response.Write([]byte("ok"))
+	}))
+	defer newSource.Close()
+
+	path := filepath.Join(t.TempDir(), "sources.json")
+	writeConfig := func(generation string, sources []string) {
+		data, err := json.Marshal(sourceFileConfig{Generation: generation, Sources: sources})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, data, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	writeConfig("rev-1", []string{old.URL})
+	ctx, stop := context.WithCancel(context.Background())
+	defer stop()
+	signals := make(chan os.Signal, 1)
+	output := &lockedBuffer{}
+	done := make(chan error, 1)
+	go func() {
+		done <- run(ctx, options{
+			workerID: "test", lineID: "line-1", connections: 1, maxConnections: 1,
+			readTimeoutSeconds: 30, sourcesFile: path, statusWriter: output,
+			controlSignals: signals,
+		})
+	}()
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("old source request did not start")
+	}
+	writeConfig("rev-2", []string{newSource.URL})
+	signals <- syscall.SIGHUP
+	select {
+	case <-cancelled:
+	case <-time.After(2 * time.Second):
+		t.Fatal("removed source request was not cancelled")
+	}
+	stop()
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	if got := output.String(); !strings.Contains(got, `"type":"source-list"`) ||
+		!strings.Contains(got, `"state":"reloaded"`) || !strings.Contains(got, `"generation":"rev-2"`) {
+		t.Fatalf("missing reload acknowledgement: %s", got)
 	}
 }
 
@@ -400,6 +521,22 @@ func TestHTTPDestinationPolicyChecksDNSAndEveryRedirect(t *testing.T) {
 	}
 	if err := client.CheckRedirect(publicRequest, tooMany); err == nil || !strings.Contains(err.Error(), "three") {
 		t.Fatalf("redirect limit error = %v", err)
+	}
+}
+
+func TestHTTPDestinationDNSValidationHasControlledTimeout(t *testing.T) {
+	lookup := func(ctx context.Context, _network, _host string) ([]net.IP, error) {
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
+	client := newHTTPClientWithPolicy(50*time.Millisecond, "", true, lookup)
+	started := time.Now()
+	_, err := client.Get("http://blocked.example/file")
+	if err == nil || !strings.Contains(err.Error(), "deadline") {
+		t.Fatalf("bounded DNS lookup error = %v", err)
+	}
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("DNS validation exceeded bound: %s", elapsed)
 	}
 }
 

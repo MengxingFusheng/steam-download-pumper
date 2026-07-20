@@ -1,10 +1,12 @@
 import base64
 import json
 import tempfile
+import threading
+import time
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import ANY, patch
 
 
 PUBLIC_KEY = base64.b64encode(bytes(range(32))).decode("ascii")
@@ -137,6 +139,20 @@ class RemoteSourceSettingsTests(unittest.TestCase):
 
 
 class ManifestValidationTests(unittest.TestCase):
+    def test_structural_validation_without_dns_still_rejects_private_ip_literals(self):
+        from steam_pumper.remote_sources import parse_manifest_payload
+
+        document = json.loads(manifest_payload())
+        document["sources"][0]["url"] = "https://169.254.169.254/latest/meta-data"
+
+        with self.assertRaisesRegex(ValueError, "public IPv4"):
+            parse_manifest_payload(
+                json.dumps(document).encode(),
+                min_sources=3,
+                now=NOW,
+                resolve_dns=False,
+            )
+
     def test_valid_payload_returns_ordered_urls(self):
         from steam_pumper.remote_sources import parse_manifest_payload
 
@@ -289,6 +305,70 @@ class RemoteSourceManagerTests(unittest.TestCase):
             ],
         )
         self.assertEqual(base64.b64decode(verifier_record["stdin"]), envelope)
+
+    def test_manifest_verifier_has_explicit_fetch_timeout(self):
+        envelope = signed_envelope(manifest_payload())
+        manager = self.manager([envelope])
+
+        with patch("steam_pumper.remote_sources.subprocess.run", wraps=__import__("subprocess").run) as run:
+            manager.refresh(NOW)
+
+        run.assert_called_once_with(
+            ANY,
+            input=envelope,
+            capture_output=True,
+            check=False,
+            timeout=15,
+        )
+
+    def test_atomic_write_fsyncs_parent_directory_after_replace(self):
+        from steam_pumper.remote_sources import RemoteSourceManager
+
+        target = self.data_dir / "nested" / "state.json"
+        real_fsync = __import__("os").fsync
+        fsynced = []
+
+        def record_fsync(descriptor):
+            fsynced.append(descriptor)
+            return real_fsync(descriptor)
+
+        with patch("steam_pumper.remote_sources.os.fsync", side_effect=record_fsync):
+            RemoteSourceManager._atomic_write(target, b"{}")
+
+        self.assertEqual(target.read_bytes(), b"{}")
+        self.assertEqual(len(fsynced), 2)
+
+    def test_lkg_load_does_not_require_dns_but_refresh_data_plane_will_validate(self):
+        envelope = signed_envelope(manifest_payload())
+        manager = self.manager([envelope])
+        manager.refresh(NOW)
+
+        def offline_dns(*_args):
+            raise OSError("temporary DNS outage")
+
+        from steam_pumper.remote_sources import RemoteSourceManager
+
+        reloaded = RemoteSourceManager(
+            self.settings(),
+            data_dir=self.data_dir,
+            verifier_path=self.verifier,
+            resolver=offline_dns,
+            hostname="stable-host",
+        )
+        sources, snapshot = reloaded.load_last_known_good(NOW)
+
+        self.assertEqual(len(sources), 3)
+        self.assertEqual(snapshot.revision, 20260720031700)
+
+    def test_next_daily_refresh_uses_today_when_scheduled_time_has_not_passed(self):
+        manager = self.manager([])
+        manager.stable_jitter_seconds = 600
+
+        before = manager._next_daily_refresh(NOW.replace(hour=3, minute=0))
+        after = manager._next_daily_refresh(NOW.replace(hour=5, minute=0))
+
+        self.assertEqual(before, NOW.replace(hour=4, minute=10))
+        self.assertEqual(after, (NOW + timedelta(days=1)).replace(hour=4, minute=10))
 
     def test_startup_loads_expired_lkg_and_marks_it_stale(self):
         old_now = NOW - timedelta(days=4)
@@ -495,6 +575,56 @@ class RemoteSourceManagerTests(unittest.TestCase):
         self.assertFalse(changed)
         self.assertEqual(sources, [])
         self.assertIn("too large", snapshot.last_error)
+
+
+class RemoteSourceRefreshWorkerTests(unittest.TestCase):
+    def test_request_is_non_blocking_and_coalesces_while_refresh_is_running(self):
+        from steam_pumper.remote_sources import RemoteSourceRefreshWorker, SourceListSnapshot
+
+        entered = threading.Event()
+        release = threading.Event()
+
+        class SlowManager:
+            def refresh(self, now=None):
+                entered.set()
+                release.wait(timeout=2)
+                return True, ["https://mirror.example/file"], SourceListSnapshot(
+                    status="ok", revision=20260720031700, source_count=1
+                )
+
+            def due(self, _now=None):
+                return True
+
+        worker = RemoteSourceRefreshWorker(SlowManager())
+        self.addCleanup(worker.shutdown)
+
+        started = time.monotonic()
+        self.assertEqual(worker.request(NOW), "queued")
+        self.assertLess(time.monotonic() - started, 0.2)
+        self.assertTrue(entered.wait(timeout=1))
+        self.assertEqual(worker.request(NOW), "running")
+        self.assertIsNone(worker.poll_result())
+
+        release.set()
+        deadline = time.monotonic() + 1
+        result = None
+        while result is None and time.monotonic() < deadline:
+            result = worker.poll_result()
+            time.sleep(0.01)
+        self.assertIsNotNone(result)
+        self.assertEqual(result[2].revision, 20260720031700)
+
+    def test_due_check_schedules_work_without_performing_refresh_inline(self):
+        from steam_pumper.remote_sources import RemoteSourceRefreshWorker, SourceListSnapshot
+
+        manager = unittest.mock.Mock()
+        manager.due.return_value = True
+        manager.refresh.return_value = (False, [], SourceListSnapshot(status="error"))
+        worker = RemoteSourceRefreshWorker(manager)
+        self.addCleanup(worker.shutdown)
+
+        self.assertEqual(worker.request_if_due(NOW), "queued")
+        manager.due.assert_called_once_with(NOW)
 
 
 if __name__ == "__main__":

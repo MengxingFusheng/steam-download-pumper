@@ -35,6 +35,7 @@ type options struct {
 	rejectPrivateDestinations bool
 	sourceSet                 *sourceSet
 	statusWriter              io.Writer
+	controlSignals            <-chan os.Signal
 }
 
 const maxConnectionLimit = 12
@@ -52,6 +53,7 @@ type statusEvent struct {
 	RetryInSeconds      int64  `json:"retry_in_seconds,omitempty"`
 	Error               string `json:"error,omitempty"`
 	Recovered           bool   `json:"recovered,omitempty"`
+	Generation          string `json:"generation,omitempty"`
 }
 
 type countingWriter struct {
@@ -69,8 +71,10 @@ type idleTimeoutConn struct {
 }
 
 type sourceHealth struct {
-	mu     sync.Mutex
-	states map[string]*sourceState
+	mu          sync.Mutex
+	states      map[string]*sourceState
+	activeEpoch map[string]uint64
+	nextEpoch   uint64
 }
 
 type sourceSet struct {
@@ -127,33 +131,59 @@ func validateSourceURLs(urls []string) error {
 	return nil
 }
 
-func loadSourcesFile(path string) ([]string, error) {
+type sourceFileConfig struct {
+	Generation string   `json:"generation"`
+	Sources    []string `json:"sources"`
+}
+
+func loadSourceConfig(path string) (sourceFileConfig, error) {
 	file, err := os.Open(path)
 	if err != nil {
-		return nil, err
+		return sourceFileConfig{}, err
 	}
 	defer file.Close()
 	limited := io.LimitReader(file, 1_048_577)
 	data, err := io.ReadAll(limited)
 	if err != nil {
-		return nil, err
+		return sourceFileConfig{}, err
 	}
 	if len(data) > 1_048_576 {
-		return nil, fmt.Errorf("sources file is too large")
+		return sourceFileConfig{}, fmt.Errorf("sources file is too large")
 	}
-	var urls []string
+	var raw json.RawMessage
 	decoder := json.NewDecoder(strings.NewReader(string(data)))
-	if err := decoder.Decode(&urls); err != nil {
-		return nil, fmt.Errorf("invalid sources file: %w", err)
+	if err := decoder.Decode(&raw); err != nil {
+		return sourceFileConfig{}, fmt.Errorf("invalid sources file: %w", err)
 	}
 	var trailing any
 	if err := decoder.Decode(&trailing); err != io.EOF {
-		return nil, fmt.Errorf("sources file contains trailing JSON")
+		return sourceFileConfig{}, fmt.Errorf("sources file contains trailing JSON")
 	}
-	if err := validateSourceURLs(urls); err != nil {
-		return nil, err
+	config := sourceFileConfig{}
+	trimmed := strings.TrimSpace(string(raw))
+	if strings.HasPrefix(trimmed, "[") {
+		if err := json.Unmarshal(raw, &config.Sources); err != nil {
+			return sourceFileConfig{}, fmt.Errorf("invalid sources file: %w", err)
+		}
+	} else {
+		objectDecoder := json.NewDecoder(strings.NewReader(trimmed))
+		objectDecoder.DisallowUnknownFields()
+		if err := objectDecoder.Decode(&config); err != nil {
+			return sourceFileConfig{}, fmt.Errorf("invalid sources file: %w", err)
+		}
+		if config.Generation == "" || len(config.Generation) > 128 {
+			return sourceFileConfig{}, fmt.Errorf("source generation must contain 1-128 characters")
+		}
 	}
-	return urls, nil
+	if err := validateSourceURLs(config.Sources); err != nil {
+		return sourceFileConfig{}, err
+	}
+	return config, nil
+}
+
+func loadSourcesFile(path string) ([]string, error) {
+	config, err := loadSourceConfig(path)
+	return config.Sources, err
 }
 
 func replaceSources(set *sourceSet, health *sourceHealth, urls []string) error {
@@ -185,28 +215,54 @@ func newSourceHealth() *sourceHealth {
 }
 
 func (health *sourceHealth) claim(url string, now time.Time) (bool, time.Duration, bool) {
+	allowed, retry, probe, _ := health.claimCurrent(url, now)
+	return allowed, retry, probe
+}
+
+func (health *sourceHealth) claimCurrent(url string, now time.Time) (bool, time.Duration, bool, uint64) {
 	health.mu.Lock()
 	defer health.mu.Unlock()
+	epoch := uint64(0)
+	if health.activeEpoch != nil {
+		var active bool
+		epoch, active = health.activeEpoch[url]
+		if !active {
+			return false, 0, false, 0
+		}
+	}
 	state := health.states[url]
 	if state == nil {
-		return true, 0, false
+		return true, 0, false, epoch
 	}
 	if now.Before(state.retryAfter) {
-		return false, state.retryAfter.Sub(now), false
+		return false, state.retryAfter.Sub(now), false, epoch
 	}
 	if state.quarantineLevel == 0 {
-		return true, 0, false
+		return true, 0, false, epoch
 	}
 	if state.probeInFlight {
-		return false, 250 * time.Millisecond, false
+		return false, 250 * time.Millisecond, false, epoch
 	}
 	state.probeInFlight = true
-	return true, 0, true
+	return true, 0, true, epoch
 }
 
 func (health *sourceHealth) failed(url string, now time.Time, lastError string, wasProbe bool) sourceSnapshot {
 	health.mu.Lock()
 	defer health.mu.Unlock()
+	return health.failedLocked(url, now, lastError, wasProbe)
+}
+
+func (health *sourceHealth) failedCurrent(url string, epoch uint64, now time.Time, lastError string, wasProbe bool) sourceSnapshot {
+	health.mu.Lock()
+	defer health.mu.Unlock()
+	if health.activeEpoch == nil || epoch == 0 || health.activeEpoch[url] != epoch {
+		return sourceSnapshot{State: "healthy"}
+	}
+	return health.failedLocked(url, now, lastError, wasProbe)
+}
+
+func (health *sourceHealth) failedLocked(url string, now time.Time, lastError string, wasProbe bool) sourceSnapshot {
 	state := health.states[url]
 	if state == nil {
 		state = &sourceState{}
@@ -237,12 +293,40 @@ func (health *sourceHealth) succeeded(url string) (bool, sourceSnapshot) {
 	return hadFailures, sourceSnapshot{State: "healthy"}
 }
 
+func (health *sourceHealth) succeededCurrent(url string, epoch uint64) (bool, sourceSnapshot) {
+	health.mu.Lock()
+	defer health.mu.Unlock()
+	if health.activeEpoch == nil || epoch == 0 || health.activeEpoch[url] != epoch {
+		return false, sourceSnapshot{State: "healthy"}
+	}
+	_, hadFailures := health.states[url]
+	delete(health.states, url)
+	return hadFailures, sourceSnapshot{State: "healthy"}
+}
+
 func (health *sourceHealth) releaseProbe(url string) {
 	health.mu.Lock()
 	defer health.mu.Unlock()
 	if state := health.states[url]; state != nil {
 		state.probeInFlight = false
 	}
+}
+
+func (health *sourceHealth) releaseProbeCurrent(url string, epoch uint64) {
+	health.mu.Lock()
+	defer health.mu.Unlock()
+	if health.activeEpoch != nil && health.activeEpoch[url] != epoch {
+		return
+	}
+	if state := health.states[url]; state != nil {
+		state.probeInFlight = false
+	}
+}
+
+func (health *sourceHealth) epoch(url string) uint64 {
+	health.mu.Lock()
+	defer health.mu.Unlock()
+	return health.activeEpoch[url]
 }
 
 func (health *sourceHealth) snapshot(url string, now time.Time) sourceSnapshot {
@@ -258,10 +342,38 @@ func (health *sourceHealth) retain(urls []string) {
 	}
 	health.mu.Lock()
 	defer health.mu.Unlock()
+	if health.activeEpoch == nil {
+		health.activeEpoch = make(map[string]uint64, len(urls))
+	}
+	for sourceURL := range health.activeEpoch {
+		if _, exists := keep[sourceURL]; !exists {
+			delete(health.activeEpoch, sourceURL)
+			delete(health.states, sourceURL)
+		}
+	}
+	for sourceURL := range keep {
+		if _, exists := health.activeEpoch[sourceURL]; !exists {
+			health.nextEpoch++
+			health.activeEpoch[sourceURL] = health.nextEpoch
+		}
+	}
 	for sourceURL := range health.states {
 		if _, exists := keep[sourceURL]; !exists {
 			delete(health.states, sourceURL)
 		}
+	}
+}
+
+func (health *sourceHealth) ensureTracked(urls []string) {
+	health.mu.Lock()
+	defer health.mu.Unlock()
+	if health.activeEpoch != nil {
+		return
+	}
+	health.activeEpoch = make(map[string]uint64, len(urls))
+	for _, sourceURL := range urls {
+		health.nextEpoch++
+		health.activeEpoch[sourceURL] = health.nextEpoch
 	}
 }
 
@@ -366,6 +478,9 @@ func validateOptions(opts *options) error {
 	if opts.statusIntervalSeconds < 0 {
 		return fmt.Errorf("status-interval-seconds must be 0 or greater")
 	}
+	if opts.readTimeoutSeconds < 1 {
+		return fmt.Errorf("read-timeout-seconds must be greater than 0")
+	}
 	if opts.bindIP != "" {
 		parsedIP := net.ParseIP(opts.bindIP)
 		if parsedIP == nil || parsedIP.To4() == nil {
@@ -387,11 +502,11 @@ func run(ctx context.Context, opts options) error {
 	}
 	initialSources := opts.urls
 	if opts.sourcesFile != "" {
-		loaded, err := loadSourcesFile(opts.sourcesFile)
+		config, err := loadSourceConfig(opts.sourcesFile)
 		if err != nil {
 			return fmt.Errorf("load sources file: %w", err)
 		}
-		initialSources = loaded
+		initialSources = config.Sources
 	}
 	set, err := newSourceSet(initialSources)
 	if err != nil {
@@ -414,6 +529,7 @@ func run(ctx context.Context, opts options) error {
 	results := make(chan workerResult, opts.maxConnections+1)
 	workers := make(map[int]context.CancelFunc, opts.maxConnections)
 	health := newSourceHealth()
+	health.retain(initialSources)
 	startWorker := func(id int) {
 		workerCtx, cancel := context.WithCancel(ctx)
 		workers[id] = cancel
@@ -428,9 +544,14 @@ func run(ctx context.Context, opts options) error {
 	for id := 1; id <= opts.connections; id++ {
 		startWorker(id)
 	}
-	controlSignals := make(chan os.Signal, 16)
-	signal.Notify(controlSignals, syscall.SIGUSR1, syscall.SIGUSR2, syscall.SIGHUP)
-	defer signal.Stop(controlSignals)
+	controlSignals := opts.controlSignals
+	var ownedSignals chan os.Signal
+	if controlSignals == nil {
+		ownedSignals = make(chan os.Signal, 16)
+		controlSignals = ownedSignals
+		signal.Notify(ownedSignals, syscall.SIGUSR1, syscall.SIGUSR2, syscall.SIGHUP)
+		defer signal.Stop(ownedSignals)
+	}
 	var statusTicker *time.Ticker
 	var statusUpdates <-chan time.Time
 	if opts.statusIntervalSeconds > 0 {
@@ -447,21 +568,27 @@ func run(ctx context.Context, opts options) error {
 			return nil
 		case controlSignal := <-controlSignals:
 			if controlSignal == syscall.SIGHUP {
-				var loaded []string
+				var config sourceFileConfig
 				var err error
 				if opts.sourcesFile == "" {
 					err = fmt.Errorf("sources-file is not configured")
 				} else {
-					loaded, err = loadSourcesFile(opts.sourcesFile)
+					config, err = loadSourceConfig(opts.sourcesFile)
 				}
 				if err == nil {
-					err = replaceSources(set, health, loaded)
+					err = replaceSources(set, health, config.Sources)
 				}
 				if err != nil {
 					fmt.Fprintf(os.Stderr, "source-list reload error=%v\n", err)
 					sink.emit(statusEvent{Type: "source-list", LineID: opts.lineID, Error: err.Error()})
 				} else {
-					fmt.Fprintf(os.Stderr, "source-list reloaded count=%d\n", len(loaded))
+					for _, cancel := range workers {
+						cancel()
+					}
+					fmt.Fprintf(os.Stderr, "source-list reloaded count=%d\n", len(config.Sources))
+					sink.emit(statusEvent{
+						Type: "source-list", LineID: opts.lineID, State: "reloaded", Generation: config.Generation,
+					})
 				}
 			} else if controlSignal == syscall.SIGUSR1 && len(workers) < opts.maxConnections {
 				for id := 1; id <= opts.maxConnections; id++ {
@@ -518,6 +645,11 @@ func runWorker(
 ) error {
 	timeout := time.Duration(opts.readTimeoutSeconds) * time.Second
 	client := newHTTPClientWithPolicy(timeout, opts.bindIP, opts.rejectPrivateDestinations, nil)
+	initialSources := opts.urls
+	if opts.sourceSet != nil {
+		initialSources = opts.sourceSet.snapshot()
+	}
+	health.ensureTracked(initialSources)
 	urlIndex := connectionID - 1
 	if opts.startupJitterSeconds > 0 {
 		jitter := time.Duration(rand.Float64() * opts.startupJitterSeconds * float64(time.Second))
@@ -533,6 +665,7 @@ func runWorker(
 		}
 		url := ""
 		probe := false
+		var sourceEpoch uint64
 		var nextRetry time.Duration
 		sources := opts.urls
 		if opts.sourceSet != nil {
@@ -541,10 +674,11 @@ func runWorker(
 		for checked := 0; checked < len(sources); checked++ {
 			candidate := sources[urlIndex%len(sources)]
 			urlIndex++
-			allowed, retryIn, claimedProbe := health.claim(candidate, time.Now())
+			allowed, retryIn, claimedProbe, epoch := health.claimCurrent(candidate, time.Now())
 			if allowed {
 				url = candidate
 				probe = claimedProbe
+				sourceEpoch = epoch
 				break
 			}
 			if retryIn > 0 && (nextRetry == 0 || retryIn < nextRetry) {
@@ -569,17 +703,17 @@ func runWorker(
 		if _, err := downloadOnceTracked(ctx, client, url, workerID, totalBytes); err != nil {
 			if ctx.Err() != nil {
 				if probe {
-					health.releaseProbe(url)
+					health.releaseProbeCurrent(url, sourceEpoch)
 				}
 				return nil
 			}
-			snapshot := health.failed(url, time.Now(), err.Error(), probe)
+			snapshot := health.failedCurrent(url, sourceEpoch, time.Now(), err.Error(), probe)
 			sink.emit(sourceStatusEvent(opts, url, snapshot, false))
 			fmt.Fprintf(os.Stderr, "worker=%s url=%s error=%v state=%s retry_in=%s\n",
 				workerID, url, err, snapshot.State, snapshot.RetryIn)
 			continue
 		}
-		if recovered, snapshot := health.succeeded(url); recovered {
+		if recovered, snapshot := health.succeededCurrent(url, sourceEpoch); recovered {
 			sink.emit(sourceStatusEvent(opts, url, snapshot, true))
 			fmt.Fprintf(os.Stderr, "worker=%s url=%s recovered=true\n", workerID, url)
 		}
@@ -694,6 +828,17 @@ func resolvePublicIPv4(ctx context.Context, host string, lookup lookupIPFunc) ([
 	return public, nil
 }
 
+func resolvePublicIPv4Bounded(
+	ctx context.Context,
+	host string,
+	lookup lookupIPFunc,
+	timeout time.Duration,
+) ([]net.IP, error) {
+	lookupContext, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	return resolvePublicIPv4(lookupContext, host, lookup)
+}
+
 func newHTTPClientWithPolicy(
 	timeout time.Duration,
 	bindIP string,
@@ -723,7 +868,7 @@ func newHTTPClientWithPolicy(
 			if err != nil {
 				return nil, err
 			}
-			addresses, err := resolvePublicIPv4(ctx, host, lookup)
+			addresses, err := resolvePublicIPv4Bounded(ctx, host, lookup, timeout)
 			if err != nil {
 				return nil, err
 			}
@@ -761,7 +906,9 @@ func newHTTPClientWithPolicy(
 			if request.URL.User != nil || request.URL.Fragment != "" {
 				return fmt.Errorf("redirect target cannot contain credentials or a fragment")
 			}
-			_, err := resolvePublicIPv4(request.Context(), request.URL.Hostname(), lookup)
+			_, err := resolvePublicIPv4Bounded(
+				request.Context(), request.URL.Hostname(), lookup, timeout,
+			)
 			return err
 		}
 	}

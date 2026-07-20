@@ -39,8 +39,8 @@ class DummyController:
             "last_error": "",
         }
 
-    def refresh_source_list(self):
-        return self.source_list_status()
+    def request_source_list_refresh(self):
+        return {**self.source_list_status(), "refresh_request_state": "queued"}
 
     def set_manual_enabled(self, _enabled):
         return None
@@ -115,6 +115,8 @@ class WebTests(unittest.TestCase):
             "sourceListNextRefresh",
             "sourceListStale",
             "sourceListError",
+            "sourceListRefreshState",
+            "sourceListApplyState",
             "立即刷新",
             "/api/source-list/refresh",
         ):
@@ -181,12 +183,13 @@ class WebTests(unittest.TestCase):
 
         self.assertEqual(current["origin"], "remote")
         self.assertEqual(refreshed["revision"], 20260720031700)
+        self.assertEqual(refreshed["refresh_request_state"], "queued")
 
     def test_manual_refresh_failure_returns_503_json(self):
         from steam_pumper.controller import SourceListRefreshError
 
         class OfflineController(DummyController):
-            def refresh_source_list(self):
+            def request_source_list_refresh(self):
                 raise SourceListRefreshError("OSS offline")
 
         Handler.controller = OfflineController()

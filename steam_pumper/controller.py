@@ -16,7 +16,7 @@ from urllib.parse import urlparse
 from .config import CommonConfig, load_config, save_config
 from .engine import EngineProcess, SourceRuntimeState
 from .metrics import ThroughputTracker, next_connection_count, theoretical_window_bytes
-from .remote_sources import RemoteSourceManager, SourceListSnapshot
+from .remote_sources import RemoteSourceManager, RemoteSourceRefreshWorker, SourceListSnapshot
 from .topology import LogicalLine, topology_for
 
 
@@ -48,6 +48,7 @@ class PumperController:
         env: Mapping[str, str] | None = None,
         remote_source_manager: RemoteSourceManager | None = None,
         remote_source_error: str = "",
+        remote_source_refresher: RemoteSourceRefreshWorker | None = None,
     ) -> None:
         self.topology_name = topology_name
         self.topology = topology_for(topology_name)
@@ -66,21 +67,39 @@ class PumperController:
         )
         self.effective_source_pool = list(self.cfg.source_pool)
         self.effective_source_origin = "local-fallback"
+        self.active_source_revision = 0
         if self.remote_source_manager is not None:
             remote_sources, self.remote_source_snapshot = self.remote_source_manager.load_last_known_good()
             if remote_sources:
                 self.effective_source_pool = list(remote_sources)
                 self.effective_source_origin = "last-known-good"
+                self.active_source_revision = self.remote_source_snapshot.revision
         runtime_dir = (os.environ if env is None else env).get("SOURCES_RUNTIME_DIR", "/run/pumper")
         self.sources_runtime_dir = Path(runtime_dir)
         self.lines = self.topology.lines(self.cfg)
         self.logs: list[str] = []
-        self.sources: list[SourceEndpoint] = []
+        self.sources: list[SourceEndpoint] = (
+            [SourceEndpoint(url=url) for url in self.effective_source_pool]
+            if self.topology_name == "multi_ip"
+            else []
+        )
         self.interface_tracker = ThroughputTracker()
         self.line_runtimes = self._build_runtimes()
         self._last_scale_check = 0.0
         self._last_schedule_tick: float | None = None
         self._last_metrics_tick: float | None = None
+        self.remote_source_refresher = (
+            remote_source_refresher if self.remote_source_manager is not None else None
+        )
+        if self.remote_source_manager is not None and self.remote_source_refresher is None:
+            self.remote_source_refresher = RemoteSourceRefreshWorker(self.remote_source_manager)
+            self.remote_source_refresher.request()
+        self._pending_source_pool: list[str] = []
+        self._pending_source_revision = 0
+        self._pending_source_generation = ""
+        self._source_apply_attempts = 0
+        self._source_apply_error = ""
+        self._source_apply_retry_at = 0.0
 
     def _build_runtimes(self) -> dict[str, LineRuntime]:
         return {
@@ -106,10 +125,13 @@ class PumperController:
     def tick(self, monotonic_now: float | None = None, wall_time: datetime | None = None) -> None:
         now = time.monotonic() if monotonic_now is None else monotonic_now
         current = datetime.now() if wall_time is None else wall_time
-        if self.remote_source_manager is not None:
+        if self.remote_source_refresher is not None:
             try:
-                if self.remote_source_manager.due(current):
-                    self.refresh_source_list(current)
+                result = self.remote_source_refresher.poll_result()
+                if result is not None:
+                    self._consume_source_refresh_result(result, now)
+                self.remote_source_refresher.request_if_due(current)
+                self._advance_pending_source_update(now)
             except Exception as exc:
                 self.log(f"source-list refresh error={exc}")
         if self._last_schedule_tick is None or now - self._last_schedule_tick >= self.cfg.schedule_poll_seconds:
@@ -134,6 +156,8 @@ class PumperController:
 
     def shutdown(self) -> None:
         self.stop_downloads()
+        if self.remote_source_refresher is not None:
+            self.remote_source_refresher.shutdown()
 
     def start_downloads(self) -> None:
         with self.lock:
@@ -142,7 +166,11 @@ class PumperController:
             self.downloads_starting = True
         try:
             self.topology.apply(self.cfg, self.log)
-            self.sources = self.resolve_sources(self.effective_source_pool)
+            self.sources = (
+                [SourceEndpoint(url=url) for url in self.effective_source_pool]
+                if self.topology_name == "multi_ip"
+                else self.resolve_sources(self.effective_source_pool)
+            )
             with self.lock:
                 for runtime in self.line_runtimes.values():
                     runtime.engine.start()
@@ -224,32 +252,106 @@ class PumperController:
             self.start_downloads()
         return self.cfg
 
-    def refresh_source_list(self, now: datetime | None = None) -> dict[str, Any]:
-        manager = self.remote_source_manager
-        if manager is None:
+    def request_source_list_refresh(self, now: datetime | None = None) -> dict[str, Any]:
+        refresher = self.remote_source_refresher
+        if refresher is None:
             raise SourceListRefreshError(self.remote_source_error or "remote source list is disabled")
-        changed, sources, snapshot = manager.refresh(now)
+        request_state = refresher.request(now)
+        status = self.source_list_status()
+        status["refresh_request_state"] = request_state
+        return status
+
+    def refresh_source_list(self, now: datetime | None = None) -> dict[str, Any]:
+        return self.request_source_list_refresh(now)
+
+    def _consume_source_refresh_result(
+        self,
+        result: tuple[bool, list[str], SourceListSnapshot] | Exception,
+        monotonic_now: float,
+    ) -> None:
+        if isinstance(result, Exception):
+            self.log(f"source-list refresh error={result}")
+            return
+        changed, sources, snapshot = result
         self.remote_source_snapshot = snapshot
         if snapshot.status in {"error", "stale"} and snapshot.last_error:
             if self.effective_source_origin == "remote":
                 self.effective_source_origin = "last-known-good"
             self.log(f"source-list refresh failed error={snapshot.last_error}")
-            return self.source_list_status()
+            return
         if sources:
             if changed:
-                with self.lock:
-                    self.effective_source_pool = list(sources)
-                    for runtime in self.line_runtimes.values():
-                        runtime.engine.set_sources(sources)
-                self.sources = self.resolve_sources(sources)
-                self.log(f"source-list revision={snapshot.revision} sources={len(sources)} reloaded")
-            self.effective_source_origin = "remote"
-        return self.source_list_status()
+                self._pending_source_pool = list(sources)
+                self._pending_source_revision = snapshot.revision
+                self._pending_source_generation = str(snapshot.revision)
+                self._source_apply_attempts = 0
+                self._source_apply_error = ""
+                self._stage_pending_source_update(monotonic_now)
+            elif not self._pending_source_generation:
+                self.effective_source_origin = "remote"
+                self.active_source_revision = snapshot.revision
+
+    def _stage_pending_source_update(self, monotonic_now: float) -> None:
+        if not self._pending_source_generation:
+            return
+        errors: list[str] = []
+        for runtime in self.line_runtimes.values():
+            try:
+                runtime.engine.stage_sources(
+                    self._pending_source_pool,
+                    self._pending_source_generation,
+                )
+            except Exception as exc:
+                errors.append(f"{runtime.spec.line_id}: {exc}")
+        self._source_apply_attempts += 1
+        self._source_apply_error = "; ".join(errors)
+        self._source_apply_retry_at = monotonic_now + 5.0
+
+    def _advance_pending_source_update(self, monotonic_now: float) -> None:
+        generation = self._pending_source_generation
+        if not generation:
+            return
+        confirmations = [
+            runtime.engine.source_generation_confirmed(generation)
+            for runtime in self.line_runtimes.values()
+        ]
+        if all(confirmations):
+            with self.lock:
+                self.effective_source_pool = list(self._pending_source_pool)
+                self.sources = [SourceEndpoint(url=url) for url in self.effective_source_pool]
+                self.effective_source_origin = "remote"
+                self.active_source_revision = self._pending_source_revision
+                self._pending_source_pool = []
+                self._pending_source_revision = 0
+                self._pending_source_generation = ""
+                self._source_apply_error = ""
+            self.log(
+                f"source-list revision={self.active_source_revision} "
+                f"sources={len(self.effective_source_pool)} applied"
+            )
+            return
+        helper_errors = [
+            runtime.engine.state.source_reload_error
+            for runtime in self.line_runtimes.values()
+            if runtime.engine.state.source_reload_error
+        ]
+        if helper_errors:
+            self._source_apply_error = "; ".join(helper_errors)
+        if monotonic_now >= self._source_apply_retry_at:
+            self._stage_pending_source_update(monotonic_now)
 
     def source_list_status(self) -> dict[str, Any]:
         with self.lock:
             status = self.remote_source_snapshot.to_dict()
             status["origin"] = self.effective_source_origin
+            status["active_revision"] = self.active_source_revision
+            status["refresh_state"] = (
+                self.remote_source_refresher.status() if self.remote_source_refresher is not None else "disabled"
+            )
+            status["apply_state"] = "pending" if self._pending_source_generation else "applied"
+            status["pending_revision"] = self._pending_source_revision
+            status["apply_attempts"] = self._source_apply_attempts
+            status["apply_error"] = self._source_apply_error
             return status
 
     def set_manual_enabled(self, enabled: bool) -> None:
@@ -332,7 +434,11 @@ class PumperController:
 
     def source_snapshot(self) -> list[dict[str, Any]]:
         with self.lock:
-            sources = self.sources or self.resolve_sources()
+            sources = self.sources or (
+                [SourceEndpoint(url=url) for url in self.effective_source_pool]
+                if self.topology_name == "multi_ip"
+                else self.resolve_sources()
+            )
             snapshots: list[dict[str, Any]] = []
             for source in sources:
                 line_states = [

@@ -9,6 +9,7 @@ import os
 import socket
 import subprocess
 import tempfile
+import threading
 import urllib.error
 import urllib.request
 from collections.abc import Callable, Mapping
@@ -183,6 +184,8 @@ class SourceListSnapshot:
 def _normalize_source_url(
     raw_url: Any,
     resolver: Callable[..., list[tuple[Any, ...]]],
+    *,
+    resolve_dns: bool,
 ) -> str:
     if not isinstance(raw_url, str) or not raw_url:
         raise ValueError("source URL must be a non-empty string")
@@ -202,12 +205,20 @@ def _normalize_source_url(
 
     hostname = parsed.hostname.lower()
     try:
-        infos = resolver(hostname, port, socket.AF_INET, socket.SOCK_STREAM)
-    except OSError as exc:
-        raise ValueError(f"source hostname did not resolve: {hostname}") from exc
-    addresses = {info[4][0] for info in infos if len(info) > 4 and info[4]}
-    if not addresses:
-        raise ValueError(f"source hostname has no public IPv4 address: {hostname}")
+        literal_address = ipaddress.ip_address(hostname)
+    except ValueError:
+        literal_address = None
+    addresses: set[str] = set()
+    if literal_address is not None:
+        addresses.add(hostname)
+    elif resolve_dns:
+        try:
+            infos = resolver(hostname, port, socket.AF_INET, socket.SOCK_STREAM)
+        except OSError as exc:
+            raise ValueError(f"source hostname did not resolve: {hostname}") from exc
+        addresses = {info[4][0] for info in infos if len(info) > 4 and info[4]}
+        if not addresses:
+            raise ValueError(f"source hostname has no public IPv4 address: {hostname}")
     for address in addresses:
         try:
             parsed_ip = ipaddress.ip_address(address)
@@ -236,6 +247,7 @@ def parse_manifest_payload(
     min_sources: int,
     now: datetime | None = None,
     resolver: Callable[..., list[tuple[Any, ...]]] = socket.getaddrinfo,
+    resolve_dns: bool = True,
     allow_expired: bool = False,
 ) -> RemoteSourceManifest:
     document = _load_json(payload, "manifest payload")
@@ -282,7 +294,11 @@ def parse_manifest_payload(
     for raw_entry in raw_sources:
         if not isinstance(raw_entry, dict) or set(raw_entry) != {"url", "checked_at", "probe_mbps"}:
             raise ValueError("manifest source entries have unsupported or missing fields")
-        normalized_url = _normalize_source_url(raw_entry["url"], resolver)
+        normalized_url = _normalize_source_url(
+            raw_entry["url"],
+            resolver,
+            resolve_dns=resolve_dns,
+        )
         if normalized_url in seen_urls:
             raise ValueError(f"manifest contains duplicate source URL: {normalized_url}")
         seen_urls.add(normalized_url)
@@ -375,6 +391,7 @@ class RemoteSourceManager:
                 min_sources=self.settings.min_sources,
                 now=current,
                 resolver=self.resolver,
+                resolve_dns=False,
                 allow_expired=True,
             )
         except (OSError, ValueError, TypeError, subprocess.SubprocessError) as exc:
@@ -468,6 +485,7 @@ class RemoteSourceManager:
                     min_sources=self.settings.min_sources,
                     now=current,
                     resolver=self.resolver,
+                    resolve_dns=False,
                 )
                 if previous_manifest is not None and manifest.revision < previous_manifest.revision:
                     raise ValueError(
@@ -549,7 +567,6 @@ class RemoteSourceManager:
             if exc.code == 304:
                 return b"", self.snapshot.etag, True
             raise
-
     def _verify_envelope(self, envelope: bytes) -> bytes:
         if len(envelope) > self.settings.max_bytes:
             raise ValueError("source list envelope is too large")
@@ -588,6 +605,7 @@ class RemoteSourceManager:
             input=envelope,
             capture_output=True,
             check=False,
+            timeout=self.settings.fetch_timeout_seconds,
         )
         if completed.returncode != 0:
             error = completed.stderr.decode("utf-8", errors="replace").strip()
@@ -600,9 +618,9 @@ class RemoteSourceManager:
 
     def _next_daily_refresh(self, now: datetime) -> datetime:
         hour, minute = (int(part) for part in self.settings.refresh_time.split(":"))
-        tomorrow = now.date() + timedelta(days=1)
-        scheduled = datetime.combine(tomorrow, datetime_time(hour, minute), tzinfo=now.tzinfo)
-        return scheduled + timedelta(seconds=self.stable_jitter_seconds)
+        scheduled = datetime.combine(now.date(), datetime_time(hour, minute), tzinfo=now.tzinfo)
+        scheduled += timedelta(seconds=self.stable_jitter_seconds)
+        return scheduled if now < scheduled else scheduled + timedelta(days=1)
 
     def _read_state(self) -> dict[str, Any]:
         raw_state = self.state_path.read_bytes()
@@ -678,9 +696,94 @@ class RemoteSourceManager:
                 temporary.flush()
                 os.fsync(temporary.fileno())
             os.replace(temporary_name, path)
+            directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+            directory_descriptor = os.open(path.parent, directory_flags)
+            try:
+                os.fsync(directory_descriptor)
+            finally:
+                os.close(directory_descriptor)
         except Exception:
             try:
                 os.unlink(temporary_name)
             except FileNotFoundError:
                 pass
             raise
+
+
+class RemoteSourceRefreshWorker:
+    """Run bounded remote refreshes away from the controller and HTTP server."""
+
+    def __init__(self, manager: RemoteSourceManager) -> None:
+        self.manager = manager
+        self._condition = threading.Condition()
+        self._state = "idle"
+        self._requested_at: datetime | None = None
+        self._result: tuple[bool, list[str], SourceListSnapshot] | Exception | None = None
+        self._stopped = False
+        self._thread = threading.Thread(
+            target=self._run,
+            name="source-list-refresh",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def request(self, now: datetime | None = None) -> str:
+        with self._condition:
+            if self._stopped:
+                return "stopped"
+            if self._state in {"queued", "running"}:
+                return self._state
+            if self._result is not None:
+                return "completed"
+            self._requested_at = _aware_now(now)
+            self._state = "queued"
+            self._condition.notify()
+            return self._state
+
+    def request_if_due(self, now: datetime | None = None) -> str:
+        current = _aware_now(now)
+        if not self.manager.due(current):
+            return self.status()
+        return self.request(current)
+
+    def poll_result(self) -> tuple[bool, list[str], SourceListSnapshot] | Exception | None:
+        with self._condition:
+            result = self._result
+            self._result = None
+            return result
+
+    def status(self) -> str:
+        with self._condition:
+            if self._result is not None:
+                return "completed"
+            return self._state
+
+    def shutdown(self) -> None:
+        with self._condition:
+            self._stopped = True
+            self._condition.notify_all()
+        settings = getattr(self.manager, "settings", None)
+        timeout = getattr(settings, "fetch_timeout_seconds", 15)
+        if not isinstance(timeout, (int, float)):
+            timeout = 15
+        self._thread.join(timeout=timeout + 1)
+
+    def _run(self) -> None:
+        while True:
+            with self._condition:
+                while not self._stopped and self._state != "queued":
+                    self._condition.wait()
+                if self._stopped:
+                    self._state = "stopped"
+                    return
+                requested_at = self._requested_at
+                self._state = "running"
+            try:
+                result: tuple[bool, list[str], SourceListSnapshot] | Exception = (
+                    self.manager.refresh(requested_at)
+                )
+            except Exception as exc:
+                result = exc
+            with self._condition:
+                self._result = result
+                self._state = "idle"

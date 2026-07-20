@@ -37,6 +37,9 @@ class EngineState:
     source_states: dict[str, SourceRuntimeState] = field(default_factory=dict)
     last_error: str = ""
     restarts: int = 0
+    pending_source_generation: str = ""
+    confirmed_source_generation: str = ""
+    source_reload_error: str = ""
 
 
 def build_engine_command(
@@ -106,6 +109,7 @@ class EngineProcess:
         self._output_buffer = ""
         self._byte_offset = 0
         self._process_bytes = 0
+        self._pending_sources: list[str] = []
 
     def start(self) -> None:
         if self.process and self.process.poll() is None:
@@ -115,7 +119,9 @@ class EngineProcess:
         self.state.last_error = ""
         try:
             if self.sources_file is not None:
-                self._write_sources_file()
+                self._write_sources_file(
+                    generation=self.state.pending_source_generation or None,
+                )
             self.process = subprocess.Popen(
                 build_engine_command(
                     self.cfg,
@@ -159,7 +165,62 @@ class EngineProcess:
                 self.log(f"line={self.line.line_id} sources_reloaded count={len(new_sources)}")
         return changed
 
-    def _write_sources_file(self, sources: list[str] | None = None) -> None:
+    def stage_sources(self, sources: list[str], generation: str) -> bool:
+        if not sources:
+            raise ValueError("source list cannot be empty")
+        if not generation:
+            raise ValueError("source generation cannot be empty")
+        new_sources = list(sources)
+        self._pending_sources = new_sources
+        self.state.pending_source_generation = generation
+        self.state.source_reload_error = ""
+        try:
+            if self.sources_file is not None:
+                self._write_sources_file(new_sources, generation=generation)
+        except Exception as exc:
+            self.state.source_reload_error = str(exc)[-500:]
+            raise
+        self.sources = new_sources
+        process = self.process
+        if process is None or process.poll() is not None:
+            self._confirm_source_generation(generation)
+            return True
+        try:
+            os.kill(process.pid, signal.SIGHUP)
+        except OSError as exc:
+            self.state.source_reload_error = str(exc)[-500:]
+            self.log(f"line={self.line.line_id} unable_to_reload_sources error={exc}")
+            raise
+        self.log(
+            f"line={self.line.line_id} sources_reload_pending "
+            f"generation={generation} count={len(new_sources)}"
+        )
+        return True
+
+    def source_generation_confirmed(self, generation: str) -> bool:
+        return self.state.confirmed_source_generation == generation
+
+    def _confirm_source_generation(self, generation: str) -> None:
+        if generation != self.state.pending_source_generation:
+            return
+        active = set(self._pending_sources or self.sources)
+        self.state.source_failures = {
+            url: failures for url, failures in self.state.source_failures.items() if url in active
+        }
+        self.state.source_states = {
+            url: source_state for url, source_state in self.state.source_states.items() if url in active
+        }
+        self.state.confirmed_source_generation = generation
+        self.state.pending_source_generation = ""
+        self.state.source_reload_error = ""
+        self._pending_sources = []
+
+    def _write_sources_file(
+        self,
+        sources: list[str] | None = None,
+        *,
+        generation: str | None = None,
+    ) -> None:
         if self.sources_file is None:
             return
         sources_to_write = self.sources if sources is None else sources
@@ -170,7 +231,10 @@ class EngineProcess:
         )
         try:
             with os.fdopen(descriptor, "w", encoding="utf-8") as temporary:
-                json.dump(sources_to_write, temporary, ensure_ascii=True, separators=(",", ":"))
+                payload: Any = sources_to_write
+                if generation is not None:
+                    payload = {"generation": generation, "sources": sources_to_write}
+                json.dump(payload, temporary, ensure_ascii=True, separators=(",", ":"))
                 temporary.write("\n")
                 temporary.flush()
                 os.fsync(temporary.fileno())
@@ -268,6 +332,16 @@ class EngineProcess:
         if not isinstance(event, dict) or event.get("line_id") != self.line.line_id:
             return
         event_type = event.get("type")
+        if event_type == "source-list":
+            generation = event.get("generation")
+            error = event.get("error")
+            if isinstance(error, str) and error:
+                if not generation or generation == self.state.pending_source_generation:
+                    self.state.source_reload_error = error[-500:]
+                return
+            if event.get("state") == "reloaded" and isinstance(generation, str):
+                self._confirm_source_generation(generation)
+            return
         if event_type == "status":
             total_bytes = event.get("bytes")
             connections = event.get("connections")
@@ -284,6 +358,8 @@ class EngineProcess:
         if event_type != "source" or not isinstance(event.get("url"), str):
             return
         url = event["url"]
+        if url not in self.sources:
+            return
         if event.get("recovered") is True:
             self.state.source_failures[url] = 0
             self.state.source_states[url] = SourceRuntimeState()

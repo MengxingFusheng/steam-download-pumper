@@ -67,7 +67,7 @@ class EngineTests(unittest.TestCase):
         engine = EngineProcess(
             IkuaiLineConfig(connections_per_line=4),
             LogicalLine("line-1", 400),
-            ["http://a.test/file"],
+            ["http://a.test/file", "http://bad.test/file"],
             lambda _message: None,
         )
 
@@ -278,6 +278,116 @@ class EngineTests(unittest.TestCase):
 
         self.assertEqual(engine.sources, ["https://old.test/file"])
         kill.assert_not_called()
+
+    def test_stage_sources_waits_for_matching_helper_ack_and_prunes_removed_state(self):
+        from steam_pumper.engine import EngineProcess, SourceRuntimeState
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            source_file = Path(tmpdir) / "line-1.sources.json"
+            engine = EngineProcess(
+                IkuaiLineConfig(),
+                LogicalLine("line-1", 400),
+                ["https://old.test/file", "https://keep.test/file"],
+                lambda _message: None,
+                sources_file=source_file,
+            )
+            process = Mock(pid=789)
+            process.poll.return_value = None
+            engine.process = process
+            engine.state.source_failures["https://old.test/file"] = 3
+            engine.state.source_states["https://old.test/file"] = SourceRuntimeState(state="quarantined")
+
+            with patch("steam_pumper.engine.os.kill"):
+                engine.stage_sources(["https://keep.test/file", "https://new.test/file"], "20260721031700")
+
+            self.assertEqual(
+                json.loads(source_file.read_text(encoding="utf-8")),
+                {
+                    "generation": "20260721031700",
+                    "sources": ["https://keep.test/file", "https://new.test/file"],
+                },
+            )
+            self.assertFalse(engine.source_generation_confirmed("20260721031700"))
+            engine._consume_line(
+                '{"type":"source-list","line_id":"line-1","state":"reloaded",'
+                '"generation":"20260721031700"}'
+            )
+
+            self.assertTrue(engine.source_generation_confirmed("20260721031700"))
+            self.assertNotIn("https://old.test/file", engine.state.source_failures)
+            self.assertNotIn("https://old.test/file", engine.state.source_states)
+
+    def test_source_list_error_or_signal_failure_keeps_generation_pending_for_retry(self):
+        from steam_pumper.engine import EngineProcess
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            engine = EngineProcess(
+                IkuaiLineConfig(),
+                LogicalLine("line-1", 400),
+                ["https://old.test/file"],
+                lambda _message: None,
+                sources_file=Path(tmpdir) / "sources.json",
+            )
+            process = Mock(pid=999)
+            process.poll.return_value = None
+            engine.process = process
+
+            with patch("steam_pumper.engine.os.kill", side_effect=OSError("signal denied")):
+                with self.assertRaisesRegex(OSError, "signal denied"):
+                    engine.stage_sources(["https://new.test/file"], "rev-1")
+            self.assertEqual(engine.state.pending_source_generation, "rev-1")
+
+            engine._consume_line(
+                '{"type":"source-list","line_id":"line-1","generation":"rev-1",'
+                '"error":"invalid sources file"}'
+            )
+            self.assertEqual(engine.state.pending_source_generation, "rev-1")
+            self.assertIn("invalid sources", engine.state.source_reload_error)
+
+    def test_late_removed_source_event_cannot_reinsert_python_state(self):
+        from steam_pumper.engine import EngineProcess
+
+        engine = EngineProcess(
+            IkuaiLineConfig(),
+            LogicalLine("line-1", 400),
+            ["https://keep.test/file"],
+            lambda _message: None,
+        )
+        engine._consume_line(
+            '{"type":"source","line_id":"line-1","url":"https://removed.test/file",'
+            '"error":"late timeout","consecutive_failures":3}'
+        )
+
+        self.assertNotIn("https://removed.test/file", engine.state.source_failures)
+
+    def test_restart_preserves_pending_generation_in_sources_file(self):
+        from steam_pumper.engine import EngineProcess
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            source_file = Path(tmpdir) / "sources.json"
+            engine = EngineProcess(
+                IkuaiLineConfig(),
+                LogicalLine("line-1", 400),
+                ["https://old.test/file"],
+                lambda _message: None,
+                sources_file=source_file,
+            )
+            live = Mock(pid=999)
+            live.poll.return_value = None
+            engine.process = live
+            with patch("steam_pumper.engine.os.kill", side_effect=OSError("gone")):
+                with self.assertRaises(OSError):
+                    engine.stage_sources(["https://new.test/file"], "rev-2")
+            engine.process = None
+            replacement = Mock(pid=1000, stdout=None)
+            replacement.poll.return_value = None
+            with patch("steam_pumper.engine.subprocess.Popen", return_value=replacement):
+                engine.start()
+
+            self.assertEqual(
+                json.loads(source_file.read_text(encoding="utf-8")),
+                {"generation": "rev-2", "sources": ["https://new.test/file"]},
+            )
 
 
 if __name__ == "__main__":

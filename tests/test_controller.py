@@ -35,6 +35,31 @@ class FakeRemoteSourceManager:
         return self.refresh_result
 
 
+class FakeRemoteSourceRefresher:
+    def __init__(self):
+        self.result = None
+        self.requests = 0
+        self.state = "idle"
+
+    def request(self, _now=None):
+        self.requests += 1
+        self.state = "queued"
+        return self.state
+
+    def request_if_due(self, _now=None):
+        return self.request(_now)
+
+    def poll_result(self):
+        result, self.result = self.result, None
+        return result
+
+    def status(self):
+        return self.state
+
+    def shutdown(self):
+        self.state = "stopped"
+
+
 class ControllerTests(unittest.TestCase):
     def test_controller_does_not_create_background_threads(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -98,6 +123,23 @@ class ControllerTests(unittest.TestCase):
             self.assertEqual(runtime.engine.sources, remote.initial)
             self.assertTrue(runtime.engine.reject_private_destinations)
 
+    def test_multi_ip_source_status_does_not_resolve_dns_in_api_thread(self):
+        remote = FakeRemoteSourceManager(["https://offline-dns.example/file"])
+        refresher = FakeRemoteSourceRefresher()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            controller = PumperController(
+                "multi_ip",
+                Path(tmpdir) / "config.json",
+                env={"SOURCES_RUNTIME_DIR": tmpdir},
+                remote_source_manager=remote,
+                remote_source_refresher=refresher,
+            )
+            with patch("steam_pumper.controller.socket.getaddrinfo", side_effect=AssertionError("DNS called")):
+                sources = controller.source_snapshot()
+
+        self.assertEqual(sources[0]["url"], "https://offline-dns.example/file")
+        self.assertEqual(sources[0]["ip"], "")
+
     def test_ikuai_does_not_enable_remote_or_private_destination_mode(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             controller = PumperController("ikuai_line", Path(tmpdir) / "config.json", env={})
@@ -114,6 +156,8 @@ class ControllerTests(unittest.TestCase):
             SourceListSnapshot(status="ok", revision=20260721031700, source_count=2),
         )
         env = {"LINE_COUNT": "2", "LAN_IPS": "192.168.1.233,192.168.1.234"}
+        refresher = FakeRemoteSourceRefresher()
+        refresher.result = remote.refresh_result
         with tempfile.TemporaryDirectory() as tmpdir:
             env["SOURCES_RUNTIME_DIR"] = tmpdir
             controller = PumperController(
@@ -121,21 +165,26 @@ class ControllerTests(unittest.TestCase):
                 Path(tmpdir) / "config.json",
                 env=env,
                 remote_source_manager=remote,
+                remote_source_refresher=refresher,
             )
             runtimes = dict(controller.line_runtimes)
             with (
                 patch.object(controller, "start_downloads"),
                 patch.object(controller, "sample_metrics"),
                 patch.object(controller, "_scale_lines"),
-                patch.object(controller, "resolve_sources", return_value=[]),
-                patch.object(runtimes["line-1"].engine, "set_sources", return_value=True) as first,
-                patch.object(runtimes["line-2"].engine, "set_sources", return_value=True) as second,
+                patch.object(runtimes["line-1"].engine, "stage_sources", return_value=True) as first,
+                patch.object(runtimes["line-2"].engine, "stage_sources", return_value=True) as second,
+                patch.object(runtimes["line-1"].engine, "source_generation_confirmed", side_effect=[False, True]),
+                patch.object(runtimes["line-2"].engine, "source_generation_confirmed", side_effect=[False, True]),
             ):
                 controller.tick(monotonic_now=100, wall_time=datetime(2026, 7, 21, 4, 0))
+                self.assertEqual(controller.effective_source_pool, remote.initial)
+                self.assertEqual(controller.source_list_status()["apply_state"], "pending")
+                controller.tick(monotonic_now=101, wall_time=datetime(2026, 7, 21, 4, 0, 1))
 
-        self.assertEqual(remote.refresh_calls, 1)
-        first.assert_called_once_with(remote.refresh_result[1])
-        second.assert_called_once_with(remote.refresh_result[1])
+        self.assertEqual(remote.refresh_calls, 0)
+        first.assert_called_once_with(remote.refresh_result[1], "20260721031700")
+        second.assert_called_once_with(remote.refresh_result[1], "20260721031700")
         self.assertIs(controller.line_runtimes["line-1"], runtimes["line-1"])
         self.assertEqual(controller.effective_source_origin, "remote")
 
@@ -147,21 +196,76 @@ class ControllerTests(unittest.TestCase):
             initial,
             SourceListSnapshot(status="error", revision=20260720031700, source_count=1, last_error="offline"),
         )
+        refresher = FakeRemoteSourceRefresher()
+        refresher.result = remote.refresh_result
         with tempfile.TemporaryDirectory() as tmpdir:
             controller = PumperController(
                 "multi_ip",
                 Path(tmpdir) / "config.json",
                 env={"SOURCES_RUNTIME_DIR": tmpdir},
                 remote_source_manager=remote,
+                remote_source_refresher=refresher,
             )
             runtime = controller.line_runtimes["line-1"]
-            with patch.object(runtime.engine, "set_sources") as update:
-                status = controller.refresh_source_list()
+            with patch.object(runtime.engine, "stage_sources") as update:
+                controller.tick(monotonic_now=100, wall_time=datetime(2026, 7, 21, 4, 0))
+                status = controller.source_list_status()
 
         update.assert_not_called()
         self.assertEqual(controller.effective_source_pool, initial)
         self.assertEqual(controller.effective_source_origin, "last-known-good")
         self.assertEqual(status["last_error"], "offline")
+
+    def test_manual_refresh_only_queues_background_work(self):
+        remote = FakeRemoteSourceManager(["https://old.test/file"])
+        refresher = FakeRemoteSourceRefresher()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            controller = PumperController(
+                "multi_ip",
+                Path(tmpdir) / "config.json",
+                env={"SOURCES_RUNTIME_DIR": tmpdir},
+                remote_source_manager=remote,
+                remote_source_refresher=refresher,
+            )
+
+            status = controller.request_source_list_refresh()
+
+        self.assertEqual(status["refresh_request_state"], "queued")
+        self.assertEqual(refresher.requests, 1)
+
+    def test_partial_helper_ack_remains_pending_and_retries_all_lines(self):
+        remote = FakeRemoteSourceManager(["https://old.test/file"])
+        refresher = FakeRemoteSourceRefresher()
+        refresher.result = (
+            True,
+            ["https://new.test/file"],
+            SourceListSnapshot(status="ok", revision=20260721031700, source_count=1),
+        )
+        env = {"LINE_COUNT": "2", "LAN_IPS": "192.168.1.233,192.168.1.234"}
+        with tempfile.TemporaryDirectory() as tmpdir:
+            env["SOURCES_RUNTIME_DIR"] = tmpdir
+            controller = PumperController(
+                "multi_ip",
+                Path(tmpdir) / "config.json",
+                env=env,
+                remote_source_manager=remote,
+                remote_source_refresher=refresher,
+            )
+            engines = [runtime.engine for runtime in controller.line_runtimes.values()]
+            with (
+                patch.object(engines[0], "stage_sources") as first,
+                patch.object(engines[1], "stage_sources") as second,
+                patch.object(engines[0], "source_generation_confirmed", return_value=True),
+                patch.object(engines[1], "source_generation_confirmed", return_value=False),
+            ):
+                controller.tick(monotonic_now=100, wall_time=datetime(2026, 7, 21, 4, 0))
+                controller.tick(monotonic_now=104, wall_time=datetime(2026, 7, 21, 4, 0, 4))
+                self.assertEqual(first.call_count, 1)
+                controller.tick(monotonic_now=105, wall_time=datetime(2026, 7, 21, 4, 0, 5))
+
+        self.assertEqual(first.call_count, 2)
+        self.assertEqual(second.call_count, 2)
+        self.assertEqual(controller.effective_source_pool, remote.initial)
 
     def test_remote_pool_keeps_web_source_pool_as_fallback_only(self):
         remote = FakeRemoteSourceManager(["https://remote.test/file"])

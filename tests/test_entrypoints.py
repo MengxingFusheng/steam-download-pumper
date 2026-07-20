@@ -5,6 +5,31 @@ from pathlib import Path
 
 
 class EntrypointTests(unittest.TestCase):
+    def test_multi_ip_deployment_passes_only_canonical_remote_source_environment(self):
+        root = Path(__file__).parents[1]
+        compose = (root / "docker-compose.multi-ip.yml").read_text(encoding="utf-8")
+        installer = (root / "install-multi-ip.sh").read_text(encoding="utf-8")
+        variables = (
+            "REMOTE_SOURCE_LIST_ENABLED",
+            "SOURCE_LIST_URL",
+            "SOURCE_LIST_PUBLIC_KEY",
+            "SOURCE_LIST_KEY_ID",
+            "SOURCE_LIST_REFRESH_TIME",
+            "SOURCE_LIST_REFRESH_JITTER_SECONDS",
+            "SOURCE_LIST_FETCH_TIMEOUT_SECONDS",
+            "SOURCE_LIST_MAX_BYTES",
+            "SOURCE_LIST_MIN_SOURCES",
+        )
+
+        for variable in variables:
+            with self.subTest(variable=variable):
+                self.assertIn(f"{variable}: ${{{variable}", compose)
+                self.assertIn(f'{variable}="${{{variable}:-', installer)
+                self.assertIn(f"{variable}=${{{variable}}}", installer)
+        for alias in ("JITTER", "TIMEOUT", "MAX_BYTES", "MIN_SOURCES"):
+            self.assertNotIn(f"\n{alias}=", installer)
+            self.assertNotIn(f"\n      {alias}:", compose)
+
     def test_entrypoints_select_explicit_topologies(self):
         from steam_pumper.ikuai_main import TOPOLOGY as ikuai_topology
         from steam_pumper.multi_ip_main import TOPOLOGY as multi_ip_topology
