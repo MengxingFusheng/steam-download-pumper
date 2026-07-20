@@ -22,8 +22,9 @@ def default_source_pool() -> list[str]:
     return [
         "http://mobile.shunicomtest.com:8080/speedtest/random4000x4000.jpg",
         "http://speedtest1.online.sh.cn:8080/speedtest/random4000x4000.jpg",
-        "http://5gzhenjiang.speedtest.jsinfo.net:8080/speedtest/random4000x4000.jpg",
-        "http://4gsuzhou1.speedtest.jsinfo.net:8080/speedtest/random4000x4000.jpg",
+        "https://mirror.iscas.ac.cn/ubuntu-releases/24.04.4/ubuntu-24.04.4-live-server-amd64.iso",
+        "https://mirrors.pku.edu.cn/ubuntu-releases/24.04.4/ubuntu-24.04.4-live-server-amd64.iso",
+        "https://mirrors.huaweicloud.com/ubuntu-releases/24.04/ubuntu-24.04.4-live-server-amd64.iso",
     ]
 
 
@@ -141,7 +142,7 @@ def validate_source_pool(values: list[str]) -> list[str]:
         raise ValueError("source_pool must be a list of HTTP/HTTPS URLs")
     if any(not isinstance(value, str) for value in values):
         raise ValueError("source_pool items must be strings")
-    cleaned = [value.strip() for value in values if value.strip()]
+    cleaned = list(dict.fromkeys(value.strip() for value in values if value.strip()))
     if not cleaned:
         raise ValueError("source_pool must contain at least one URL")
     for url in cleaned:

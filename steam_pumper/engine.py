@@ -13,6 +13,15 @@ from .topology import LogicalLine
 
 
 @dataclass
+class SourceRuntimeState:
+    state: str = "healthy"
+    consecutive_failures: int = 0
+    retry_after: str = ""
+    retry_in_seconds: int = 0
+    last_error: str = ""
+
+
+@dataclass
 class EngineState:
     line_id: str
     bind_ip: str = ""
@@ -23,6 +32,7 @@ class EngineState:
     has_metrics: bool = False
     current_source: str = ""
     source_failures: dict[str, int] = field(default_factory=dict)
+    source_states: dict[str, SourceRuntimeState] = field(default_factory=dict)
     last_error: str = ""
     restarts: int = 0
 
@@ -209,8 +219,32 @@ class EngineProcess:
         url = event["url"]
         if event.get("recovered") is True:
             self.state.source_failures[url] = 0
+            self.state.source_states[url] = SourceRuntimeState()
             return
         error = event.get("error")
+        raw_state = event.get("state")
+        state = raw_state if raw_state in {"healthy", "degraded", "quarantined", "probing"} else "degraded"
+        failures = event.get("consecutive_failures")
+        if not isinstance(failures, int) or isinstance(failures, bool) or failures < 0:
+            failures = self.state.source_failures.get(url, 0) + (1 if error else 0)
+        retry_after = event.get("retry_after")
+        if not isinstance(retry_after, str):
+            retry_after = ""
+        retry_in_seconds = event.get("retry_in_seconds")
+        if (
+            not isinstance(retry_in_seconds, int)
+            or isinstance(retry_in_seconds, bool)
+            or retry_in_seconds < 0
+        ):
+            retry_in_seconds = 0
+        last_error = error if isinstance(error, str) else ""
+        self.state.source_failures[url] = failures
+        self.state.source_states[url] = SourceRuntimeState(
+            state=state,
+            consecutive_failures=failures,
+            retry_after=retry_after,
+            retry_in_seconds=retry_in_seconds,
+            last_error=last_error,
+        )
         if isinstance(error, str) and error:
-            self.state.source_failures[url] = self.state.source_failures.get(url, 0) + 1
             self.state.last_error = error[-500:]

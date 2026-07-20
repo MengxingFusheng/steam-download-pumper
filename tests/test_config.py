@@ -12,8 +12,10 @@ from steam_pumper.config import (
     CommonConfig,
     IkuaiLineConfig,
     MultiIPConfig,
+    default_source_pool,
     load_config,
     save_config,
+    validate_source_pool,
 )
 
 
@@ -99,6 +101,33 @@ class ConfigTests(unittest.TestCase):
             with self.subTest(source_pool=source_pool):
                 with self.assertRaises(ValueError):
                     IkuaiLineConfig(source_pool=source_pool).validate()
+
+    def test_default_source_pool_contains_only_verified_endpoints(self):
+        sources = default_source_pool()
+
+        self.assertEqual(
+            sources,
+            [
+                "http://mobile.shunicomtest.com:8080/speedtest/random4000x4000.jpg",
+                "http://speedtest1.online.sh.cn:8080/speedtest/random4000x4000.jpg",
+                "https://mirror.iscas.ac.cn/ubuntu-releases/24.04.4/ubuntu-24.04.4-live-server-amd64.iso",
+                "https://mirrors.pku.edu.cn/ubuntu-releases/24.04.4/ubuntu-24.04.4-live-server-amd64.iso",
+                "https://mirrors.huaweicloud.com/ubuntu-releases/24.04/ubuntu-24.04.4-live-server-amd64.iso",
+            ],
+        )
+        self.assertEqual(len(sources), len(set(sources)))
+        self.assertFalse(any("jsinfo.net" in source for source in sources))
+
+    def test_source_pool_deduplicates_urls_without_reordering(self):
+        sources = validate_source_pool(
+            [
+                "https://one.test/file",
+                "https://two.test/file",
+                "https://one.test/file",
+            ]
+        )
+
+        self.assertEqual(sources, ["https://one.test/file", "https://two.test/file"])
 
     def test_multi_ip_requires_two_to_ten_unique_ipv4_addresses(self):
         with self.assertRaisesRegex(ValueError, "between 2 and 10"):

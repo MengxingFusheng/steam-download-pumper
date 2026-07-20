@@ -1,19 +1,20 @@
 from __future__ import annotations
 
 import logging
+import math
 import os
 import socket
 import threading
 import time
 from collections.abc import Mapping
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
 from .config import CommonConfig, load_config, save_config
-from .engine import EngineProcess
+from .engine import EngineProcess, SourceRuntimeState
 from .metrics import ThroughputTracker, next_connection_count, theoretical_window_bytes
 from .topology import LogicalLine, topology_for
 
@@ -259,19 +260,74 @@ class PumperController:
     def source_snapshot(self) -> list[dict[str, Any]]:
         with self.lock:
             sources = self.sources or self.resolve_sources()
-            failures: dict[str, int] = {}
-            for runtime in self.line_runtimes.values():
-                for url, count in runtime.engine.state.source_failures.items():
-                    failures[url] = failures.get(url, 0) + count
-            return [
-                {
-                    "url": source.url,
-                    "ip": source.ip,
-                    "healthy": source.healthy and failures.get(source.url, 0) == 0,
-                    "failures": source.failures + failures.get(source.url, 0),
-                }
-                for source in sources
-            ]
+            snapshots: list[dict[str, Any]] = []
+            for source in sources:
+                line_states = [
+                    self._line_source_snapshot(runtime, source.url)
+                    for runtime in self.line_runtimes.values()
+                ]
+                states = [line["state"] for line in line_states]
+                if not source.healthy:
+                    state = "unhealthy"
+                elif "healthy" in states:
+                    state = "healthy"
+                elif "probing" in states:
+                    state = "probing"
+                elif states and all(value == "quarantined" for value in states):
+                    state = "quarantined"
+                else:
+                    state = "degraded"
+                retry_line = max(line_states, key=lambda line: line["retry_in_seconds"], default=None)
+                latest_error = next(
+                    (line["last_error"] for line in reversed(line_states) if line["last_error"]),
+                    "",
+                )
+                failures = source.failures + sum(line["consecutive_failures"] for line in line_states)
+                snapshots.append(
+                    {
+                        "url": source.url,
+                        "ip": source.ip,
+                        "healthy": source.healthy and "healthy" in states,
+                        "failures": failures,
+                        "state": state,
+                        "retry_after": retry_line["retry_after"] if retry_line else "",
+                        "retry_in_seconds": retry_line["retry_in_seconds"] if retry_line else 0,
+                        "last_error": latest_error,
+                        "lines": line_states,
+                    }
+                )
+            return snapshots
+
+    @staticmethod
+    def _line_source_snapshot(runtime: LineRuntime, url: str) -> dict[str, Any]:
+        source_state = runtime.engine.state.source_states.get(url)
+        if source_state is None:
+            failures = runtime.engine.state.source_failures.get(url, 0)
+            source_state = SourceRuntimeState(
+                state="degraded" if failures else "healthy",
+                consecutive_failures=failures,
+            )
+        retry_in_seconds = source_state.retry_in_seconds
+        if source_state.retry_after:
+            try:
+                retry_at = datetime.fromisoformat(source_state.retry_after.replace("Z", "+00:00"))
+                if retry_at.tzinfo is None:
+                    retry_at = retry_at.replace(tzinfo=timezone.utc)
+                retry_in_seconds = max(
+                    0,
+                    math.ceil((retry_at.astimezone(timezone.utc) - datetime.now(timezone.utc)).total_seconds()),
+                )
+            except ValueError:
+                pass
+        return {
+            "line_id": runtime.spec.line_id,
+            "bind_ip": runtime.spec.bind_ip,
+            "state": source_state.state,
+            "consecutive_failures": source_state.consecutive_failures,
+            "retry_after": source_state.retry_after,
+            "retry_in_seconds": retry_in_seconds,
+            "last_error": source_state.last_error,
+        }
 
     def resolve_sources(self) -> list[SourceEndpoint]:
         endpoints: list[SourceEndpoint] = []

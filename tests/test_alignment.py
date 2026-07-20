@@ -2,7 +2,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from steam_pumper.controller import PumperController
+from steam_pumper.controller import PumperController, SourceEndpoint
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -26,6 +26,20 @@ class AlignmentTests(unittest.TestCase):
 
         self.assertIs(type(ikuai), PumperController)
         self.assertIs(type(multi), PumperController)
+
+    def test_source_schema_is_aligned_for_both_topologies(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            ikuai_controller = PumperController("ikuai_line", root / "ikuai.json", env={})
+            multi_controller = PumperController("multi_ip", root / "multi.json", env={})
+            source = SourceEndpoint(url="http://source.test/file", ip="203.0.113.10")
+            ikuai_controller.sources = [source]
+            multi_controller.sources = [source]
+            ikuai = ikuai_controller.source_snapshot()[0]
+            multi = multi_controller.source_snapshot()[0]
+
+        self.assertEqual(set(ikuai), set(multi))
+        self.assertEqual(set(ikuai["lines"][0]), set(multi["lines"][0]))
 
     def test_removed_runtime_modules_do_not_exist(self):
         removed = (

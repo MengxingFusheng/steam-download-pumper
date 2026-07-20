@@ -11,7 +11,7 @@ The repository produces exactly two images from one shared runtime.
 
 ## Data Plane
 
-Each logical line owns one long-running Go `discarder` process. The helper forces IPv4, reads HTTP response bodies into `io.Discard`, and manages 1-12 concurrent connections. It emits newline-delimited JSON with cumulative bytes, active connections, source failures, and recovery events.
+Each logical line owns one long-running Go `discarder` process. The helper forces IPv4, reads HTTP response bodies into `io.Discard`, and manages 1-12 concurrent connections. A per-line circuit breaker is shared by all workers: three consecutive failures quarantine a source for 10 minutes, failed half-open probes escalate to 30 and 60 minutes, and only one worker may probe a quarantined source. It emits newline-delimited JSON with cumulative bytes, active connections, source state, retry time, failures, and recovery events.
 
 The Python `EngineProcess` drains that pipe without a reader thread, preserves monotonic byte totals across helper restarts, and hot-scales connections with `SIGUSR1` and `SIGUSR2`.
 

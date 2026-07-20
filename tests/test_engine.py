@@ -66,6 +66,40 @@ class EngineTests(unittest.TestCase):
         self.assertEqual(engine.state.source_failures["http://bad.test/file"], 1)
         self.assertIn("timeout", engine.state.last_error)
 
+    def test_engine_retains_structured_source_quarantine_and_recovery(self):
+        from steam_pumper.engine import EngineProcess
+
+        engine = EngineProcess(
+            IkuaiLineConfig(),
+            LogicalLine("line-1", 400),
+            ["http://bad.test/file"],
+            lambda _message: None,
+        )
+        engine._consume_line(
+            '{"type":"source","line_id":"line-1","url":"http://bad.test/file",'
+            '"state":"quarantined","consecutive_failures":3,'
+            '"retry_after":"2026-07-20T08:10:00Z","retry_in_seconds":600,'
+            '"error":"connection refused"}'
+        )
+
+        source = engine.state.source_states["http://bad.test/file"]
+        self.assertEqual(source.state, "quarantined")
+        self.assertEqual(source.consecutive_failures, 3)
+        self.assertEqual(source.retry_after, "2026-07-20T08:10:00Z")
+        self.assertEqual(source.retry_in_seconds, 600)
+        self.assertEqual(source.last_error, "connection refused")
+
+        engine._consume_line(
+            '{"type":"source","line_id":"line-1","url":"http://bad.test/file",'
+            '"state":"healthy","recovered":true}'
+        )
+
+        recovered = engine.state.source_states["http://bad.test/file"]
+        self.assertEqual(recovered.state, "healthy")
+        self.assertEqual(recovered.consecutive_failures, 0)
+        self.assertEqual(recovered.retry_in_seconds, 0)
+        self.assertEqual(engine.state.source_failures["http://bad.test/file"], 0)
+
     def test_engine_ignores_events_for_another_line(self):
         from steam_pumper.engine import EngineProcess
 

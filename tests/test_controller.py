@@ -5,6 +5,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from steam_pumper.controller import PumperController
+from steam_pumper.controller import SourceEndpoint
 
 
 class ControllerTests(unittest.TestCase):
@@ -125,6 +126,33 @@ class ControllerTests(unittest.TestCase):
 
         resize.assert_called_once_with(6)
         self.assertIs(controller.line_runtimes["line-1"], runtime)
+
+    def test_source_snapshot_exposes_quarantine_state_per_line(self):
+        from steam_pumper.engine import SourceRuntimeState
+
+        env = {"LINE_COUNT": "2", "LAN_IPS": "192.168.1.233,192.168.1.234"}
+        with tempfile.TemporaryDirectory() as tmpdir:
+            controller = PumperController("multi_ip", Path(tmpdir) / "config.json", env=env)
+            url = "http://bad.test/file"
+            controller.sources = [SourceEndpoint(url=url, ip="203.0.113.10")]
+            controller.line_runtimes["line-1"].engine.state.source_states[url] = SourceRuntimeState(
+                state="quarantined",
+                consecutive_failures=3,
+                retry_after="2026-07-20T08:10:00Z",
+                retry_in_seconds=600,
+                last_error="timeout",
+            )
+
+            source = controller.source_snapshot()[0]
+
+        self.assertTrue(source["healthy"])
+        self.assertEqual(source["state"], "healthy")
+        self.assertEqual(source["failures"], 3)
+        self.assertEqual(source["retry_in_seconds"], 0)
+        self.assertEqual(source["last_error"], "timeout")
+        self.assertEqual(len(source["lines"]), 2)
+        line_states = {line["line_id"]: line["state"] for line in source["lines"]}
+        self.assertEqual(line_states, {"line-1": "quarantined", "line-2": "healthy"})
 
 
 if __name__ == "__main__":

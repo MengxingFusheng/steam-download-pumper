@@ -96,6 +96,13 @@ class WebTests(unittest.TestCase):
         self.assertIn("escapeHtml(source.url", html)
         self.assertIn("logs').textContent", html)
 
+    def test_console_displays_source_circuit_breaker_state(self):
+        html = render_html("multi_ip")
+
+        self.assertIn("source.state", html)
+        self.assertIn("source.retry_in_seconds", html)
+        self.assertIn("隔离/重试", html)
+
     def test_metrics_sources_and_config_api_endpoints(self):
         Handler.controller = DummyController()
         Handler.topology_name = "ikuai_line"

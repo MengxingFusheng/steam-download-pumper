@@ -35,14 +35,18 @@ type options struct {
 const maxConnectionLimit = 12
 
 type statusEvent struct {
-	Type        string `json:"type"`
-	LineID      string `json:"line_id"`
-	BindIP      string `json:"bind_ip,omitempty"`
-	Bytes       int64  `json:"bytes"`
-	Connections int32  `json:"connections"`
-	URL         string `json:"url,omitempty"`
-	Error       string `json:"error,omitempty"`
-	Recovered   bool   `json:"recovered,omitempty"`
+	Type                string `json:"type"`
+	LineID              string `json:"line_id"`
+	BindIP              string `json:"bind_ip,omitempty"`
+	Bytes               int64  `json:"bytes"`
+	Connections         int32  `json:"connections"`
+	URL                 string `json:"url,omitempty"`
+	State               string `json:"state,omitempty"`
+	ConsecutiveFailures int    `json:"consecutive_failures,omitempty"`
+	RetryAfter          string `json:"retry_after,omitempty"`
+	RetryInSeconds      int64  `json:"retry_in_seconds,omitempty"`
+	Error               string `json:"error,omitempty"`
+	Recovered           bool   `json:"recovered,omitempty"`
 }
 
 type countingWriter struct {
@@ -60,37 +64,119 @@ type idleTimeoutConn struct {
 }
 
 type sourceHealth struct {
-	mu         sync.Mutex
-	failures   map[string]int
-	retryAfter map[string]time.Time
+	mu     sync.Mutex
+	states map[string]*sourceState
+}
+
+type sourceState struct {
+	consecutiveFailures int
+	quarantineLevel     int
+	retryAfter          time.Time
+	probeInFlight       bool
+	lastError           string
+}
+
+type sourceSnapshot struct {
+	State               string
+	ConsecutiveFailures int
+	RetryAfter          time.Time
+	RetryIn             time.Duration
+	LastError           string
 }
 
 func newSourceHealth() *sourceHealth {
-	return &sourceHealth{failures: make(map[string]int), retryAfter: make(map[string]time.Time)}
+	return &sourceHealth{states: make(map[string]*sourceState)}
 }
 
-func (health *sourceHealth) ready(url string, now time.Time) bool {
+func (health *sourceHealth) claim(url string, now time.Time) (bool, time.Duration, bool) {
 	health.mu.Lock()
 	defer health.mu.Unlock()
-	return !now.Before(health.retryAfter[url])
+	state := health.states[url]
+	if state == nil {
+		return true, 0, false
+	}
+	if now.Before(state.retryAfter) {
+		return false, state.retryAfter.Sub(now), false
+	}
+	if state.quarantineLevel == 0 {
+		return true, 0, false
+	}
+	if state.probeInFlight {
+		return false, 250 * time.Millisecond, false
+	}
+	state.probeInFlight = true
+	return true, 0, true
 }
 
-func (health *sourceHealth) failed(url string, now time.Time) time.Duration {
+func (health *sourceHealth) failed(url string, now time.Time, lastError string, wasProbe bool) sourceSnapshot {
 	health.mu.Lock()
 	defer health.mu.Unlock()
-	health.failures[url]++
-	delay := retryDelay(health.failures[url])
-	health.retryAfter[url] = now.Add(delay)
-	return delay
+	state := health.states[url]
+	if state == nil {
+		state = &sourceState{}
+		health.states[url] = state
+	}
+	state.consecutiveFailures++
+	state.lastError = lastError
+	if wasProbe {
+		state.probeInFlight = false
+		state.quarantineLevel = min(max(state.quarantineLevel+1, 1), 3)
+		state.retryAfter = now.Add(quarantineDelay(state.quarantineLevel))
+	} else if state.consecutiveFailures >= 3 {
+		if state.quarantineLevel == 0 {
+			state.quarantineLevel = 1
+			state.retryAfter = now.Add(quarantineDelay(state.quarantineLevel))
+		}
+	} else {
+		state.retryAfter = now.Add(retryDelay(state.consecutiveFailures))
+	}
+	return snapshotFor(state, now)
 }
 
-func (health *sourceHealth) recovered(url string) bool {
+func (health *sourceHealth) succeeded(url string) (bool, sourceSnapshot) {
 	health.mu.Lock()
 	defer health.mu.Unlock()
-	hadFailures := health.failures[url] > 0
-	delete(health.failures, url)
-	delete(health.retryAfter, url)
-	return hadFailures
+	_, hadFailures := health.states[url]
+	delete(health.states, url)
+	return hadFailures, sourceSnapshot{State: "healthy"}
+}
+
+func (health *sourceHealth) releaseProbe(url string) {
+	health.mu.Lock()
+	defer health.mu.Unlock()
+	if state := health.states[url]; state != nil {
+		state.probeInFlight = false
+	}
+}
+
+func (health *sourceHealth) snapshot(url string, now time.Time) sourceSnapshot {
+	health.mu.Lock()
+	defer health.mu.Unlock()
+	return snapshotFor(health.states[url], now)
+}
+
+func snapshotFor(state *sourceState, now time.Time) sourceSnapshot {
+	if state == nil {
+		return sourceSnapshot{State: "healthy"}
+	}
+	status := "degraded"
+	if state.quarantineLevel > 0 {
+		status = "quarantined"
+	}
+	if state.probeInFlight {
+		status = "probing"
+	}
+	retryIn := state.retryAfter.Sub(now)
+	if retryIn < 0 {
+		retryIn = 0
+	}
+	return sourceSnapshot{
+		State:               status,
+		ConsecutiveFailures: state.consecutiveFailures,
+		RetryAfter:          state.retryAfter,
+		RetryIn:             retryIn,
+		LastError:           state.lastError,
+	}
 }
 
 func (conn *idleTimeoutConn) Read(buffer []byte) (int, error) {
@@ -291,8 +377,6 @@ func runWorker(
 	timeout := time.Duration(opts.readTimeoutSeconds) * time.Second
 	client := newHTTPClient(timeout, opts.bindIP)
 	urlIndex := connectionID - 1
-	failures := 0
-	startedAt := time.Now()
 	if opts.startupJitterSeconds > 0 {
 		jitter := time.Duration(rand.Float64() * opts.startupJitterSeconds * float64(time.Second))
 		if err := sleepWithContext(ctx, jitter); err != nil {
@@ -306,40 +390,53 @@ func runWorker(
 		default:
 		}
 		url := ""
+		probe := false
+		var nextRetry time.Duration
 		for checked := 0; checked < len(opts.urls); checked++ {
 			candidate := opts.urls[urlIndex%len(opts.urls)]
 			urlIndex++
-			if health.ready(candidate, time.Now()) {
+			allowed, retryIn, claimedProbe := health.claim(candidate, time.Now())
+			if allowed {
 				url = candidate
+				probe = claimedProbe
 				break
+			}
+			if retryIn > 0 && (nextRetry == 0 || retryIn < nextRetry) {
+				nextRetry = retryIn
 			}
 		}
 		if url == "" {
-			if err := sleepWithContext(ctx, 250*time.Millisecond); err != nil {
+			if nextRetry <= 0 {
+				nextRetry = 250 * time.Millisecond
+			}
+			jitter := time.Duration(rand.Float64() * float64(250*time.Millisecond))
+			if err := sleepWithContext(ctx, nextRetry+jitter); err != nil {
 				return nil
 			}
 			continue
 		}
 		workerID := fmt.Sprintf("%s-%d", opts.workerID, connectionID)
 		currentSource.Store(url)
+		if probe {
+			sink.emit(sourceStatusEvent(opts, url, health.snapshot(url, time.Now()), false))
+		}
 		if _, err := downloadOnceTracked(ctx, client, url, workerID, totalBytes); err != nil {
 			if ctx.Err() != nil {
+				if probe {
+					health.releaseProbe(url)
+				}
 				return nil
 			}
-			failures++
-			delay := health.failed(url, time.Now())
-			sink.emit(statusEvent{Type: "source", LineID: opts.lineID, BindIP: opts.bindIP, URL: url, Error: err.Error()})
-			fmt.Fprintf(os.Stderr, "worker=%s url=%s error=%v retry_in=%s\n", workerID, url, err, delay)
-			if failures >= 12 && time.Since(startedAt) >= time.Duration(opts.minSessionSeconds)*time.Second {
-				return fmt.Errorf("all sources remained unavailable after %d attempts", failures)
-			}
+			snapshot := health.failed(url, time.Now(), err.Error(), probe)
+			sink.emit(sourceStatusEvent(opts, url, snapshot, false))
+			fmt.Fprintf(os.Stderr, "worker=%s url=%s error=%v state=%s retry_in=%s\n",
+				workerID, url, err, snapshot.State, snapshot.RetryIn)
 			continue
 		}
-		if health.recovered(url) {
-			sink.emit(statusEvent{Type: "source", LineID: opts.lineID, BindIP: opts.bindIP, URL: url, Recovered: true})
+		if recovered, snapshot := health.succeeded(url); recovered {
+			sink.emit(sourceStatusEvent(opts, url, snapshot, true))
 			fmt.Fprintf(os.Stderr, "worker=%s url=%s recovered=true\n", workerID, url)
 		}
-		failures = 0
 		if opts.restartJitterSeconds > 0 {
 			jitter := time.Duration(rand.Float64() * opts.restartJitterSeconds * float64(time.Second))
 			if err := sleepWithContext(ctx, jitter); err != nil {
@@ -347,6 +444,26 @@ func runWorker(
 			}
 		}
 	}
+}
+
+func sourceStatusEvent(opts options, url string, snapshot sourceSnapshot, recovered bool) statusEvent {
+	event := statusEvent{
+		Type:                "source",
+		LineID:              opts.lineID,
+		BindIP:              opts.bindIP,
+		URL:                 url,
+		State:               snapshot.State,
+		ConsecutiveFailures: snapshot.ConsecutiveFailures,
+		Error:               snapshot.LastError,
+		Recovered:           recovered,
+	}
+	if !snapshot.RetryAfter.IsZero() {
+		event.RetryAfter = snapshot.RetryAfter.UTC().Format(time.RFC3339)
+	}
+	if snapshot.RetryIn > 0 {
+		event.RetryInSeconds = int64((snapshot.RetryIn + time.Second - 1) / time.Second)
+	}
+	return event
 }
 
 func retryDelay(failures int) time.Duration {
@@ -359,6 +476,17 @@ func retryDelay(failures int) time.Duration {
 		return 30 * time.Second
 	}
 	return delay
+}
+
+func quarantineDelay(level int) time.Duration {
+	switch level {
+	case 1:
+		return 10 * time.Minute
+	case 2:
+		return 30 * time.Minute
+	default:
+		return 60 * time.Minute
+	}
 }
 
 func newHTTPClient(timeout time.Duration, bindIP string) *http.Client {
