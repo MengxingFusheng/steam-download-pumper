@@ -21,6 +21,10 @@ class OSSFailure(RuntimeError):
     pass
 
 
+class OSSNotFound(OSSFailure):
+    pass
+
+
 class OSSClient:
     def __init__(
         self,
@@ -45,7 +49,7 @@ class OSSClient:
             "OSS_ENDPOINT": self.config.endpoint,
         }
 
-    def upload(self, source: Path, object_key: str) -> None:
+    def upload(self, source: Path, object_key: str, *, overwrite: bool = True) -> None:
         if not object_key.startswith("pumper/v1/") or ".." in object_key:
             raise OSSFailure("OSS object key is invalid")
         command = [
@@ -53,8 +57,9 @@ class OSSClient:
             "cp",
             str(source),
             f"oss://{self.config.bucket}/{object_key}",
-            "--force",
         ]
+        if overwrite:
+            command.append("--force")
         try:
             completed = subprocess.run(
                 command,
@@ -116,6 +121,8 @@ class OSSClient:
             )
         except (OSError, ValueError, http.client.HTTPException) as exc:
             raise OSSFailure("public verification failed") from exc
+        if response.status == 404:
+            raise OSSNotFound("public object was not found")
         if response.status != 200:
             raise OSSFailure("public verification rejected redirect or non-200 response")
         if not response.body or len(response.body) > MAX_MANIFEST_BYTES:

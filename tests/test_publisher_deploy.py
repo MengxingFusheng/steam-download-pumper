@@ -1,4 +1,7 @@
+import os
 import re
+import subprocess
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -43,6 +46,50 @@ class PublisherDeployTests(unittest.TestCase):
         self.assertIn("up -d", installer)
         self.assertRegex(installer, r"(?:stat|find).*(?:600|%a)")
         self.assertNotRegex(installer, r"(?i)(cat|printf|echo).*ACCESS_KEY_SECRET")
+
+    def test_installer_never_executes_malicious_dotenv_content(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "publisher-config").mkdir()
+            secrets = root / "publisher-secrets"
+            secrets.mkdir()
+            (root / "docker-compose.publisher.yml").write_text("services: {}\n", encoding="utf-8")
+            (root / "publisher-config" / "candidates.json").write_text("{}\n", encoding="utf-8")
+            for name in (
+                "source_signing_private_key", "oss_access_key_id", "oss_access_key_secret"
+            ):
+                path = secrets / name
+                path.write_text("fixture\n", encoding="utf-8")
+                path.chmod(0o600)
+            marker = root / "dotenv-executed"
+            (root / ".env.publisher").write_text(
+                f"OSS_BUCKET=$(touch {marker}; printf pumper-source-list-example)\n"
+                "OSS_REGION=cn-beijing\n"
+                "OSS_ENDPOINT=https://oss-cn-beijing.aliyuncs.com\n"
+                "OSS_PUBLIC_BASE_URL=https://pumper-source-list-example.oss-cn-beijing.aliyuncs.com/pumper/v1\n"
+                "SOURCE_LIST_KEY_ID=pumper-source-2026-01\n",
+                encoding="utf-8",
+            )
+            fake_bin = root / "bin"
+            fake_bin.mkdir()
+            docker = fake_bin / "docker"
+            docker.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            docker.chmod(0o755)
+            completed = subprocess.run(
+                ["bash", str(ROOT / "install-publisher.sh")],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=10,
+                env={
+                    **os.environ,
+                    "PATH": f"{fake_bin}:{os.environ['PATH']}",
+                    "INSTALL_DIR": str(root),
+                },
+                check=False,
+            )
+            self.assertNotEqual(completed.returncode, 0)
+            self.assertFalse(marker.exists(), completed.stderr)
 
 
 if __name__ == "__main__":

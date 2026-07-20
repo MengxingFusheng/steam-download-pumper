@@ -3,6 +3,7 @@ from __future__ import annotations
 import fcntl
 import json
 import os
+import sys
 import threading
 from contextlib import contextmanager
 from datetime import datetime, time, timedelta
@@ -93,8 +94,9 @@ def health_is_healthy(health_path: Path, now: datetime) -> bool:
     success = _parse_datetime(value.get("last_success_at"))
     if heartbeat is None or now - heartbeat > timedelta(minutes=5) or heartbeat - now > timedelta(minutes=1):
         return False
-    if started is not None and now - started > timedelta(minutes=30):
-        return False
+    if started is not None:
+        active_for = now - started
+        return timedelta(0) <= active_for <= timedelta(minutes=30)
     if success is not None:
         return now - success <= timedelta(hours=36) and success - now <= timedelta(minutes=1)
     return first_due is not None and now <= first_due + timedelta(hours=2)
@@ -104,18 +106,43 @@ def _write_health(path: Path, value: dict[str, object]) -> None:
     atomic_write(path, json.dumps(value, separators=(",", ":"), sort_keys=True).encode("utf-8"))
 
 
+def _write_state(path: Path, updates: dict[str, object]) -> dict[str, object]:
+    state = read_state(path)
+    state.update(updates)
+    atomic_write(
+        path,
+        json.dumps(state, separators=(",", ":"), sort_keys=True).encode("utf-8"),
+    )
+    return state
+
+
+def _log_event(event: str, **fields: object) -> None:
+    document = {"event": event, **fields}
+    print(json.dumps(document, separators=(",", ":"), sort_keys=True), file=sys.stderr)
+
+
 def run_scheduler(
     config: PublisherConfig,
     service: PublicationService,
     stop_event: threading.Event,
     *,
     now_fn: Callable[[], datetime] | None = None,
+    sleep_fn: Callable[[threading.Event, float], bool] = interruptible_sleep,
+    heartbeat_interval_seconds: float = 60.0,
 ) -> int:
     clock = now_fn or (lambda: datetime.now(config.timezone))
-    state = read_state(config.state_dir / "state.json")
+    state_path = config.state_dir / "state.json"
+    state = read_state(state_path)
     last_success = _parse_datetime(state.get("last_success_at"))
     started_at = clock()
     due = next_due(started_at, config.publish_time, last_success)
+    try:
+        failures = max(0, int(state.get("consecutive_failures", 0)))
+    except (TypeError, ValueError):
+        failures = 0
+    persisted_retry = _parse_datetime(state.get("next_retry_at"))
+    if failures and persisted_retry is not None:
+        due = max(started_at, persisted_retry.astimezone(started_at.tzinfo))
     health_path = config.state_dir / "health.json"
     health: dict[str, object] = {
         "heartbeat_at": started_at.isoformat(timespec="seconds"),
@@ -124,32 +151,75 @@ def run_scheduler(
         "publication_started_at": "",
         "last_success_at": last_success.isoformat(timespec="seconds") if last_success else "",
     }
-    failures = 0
+    health_lock = threading.Lock()
+
+    def write_health() -> None:
+        with health_lock:
+            _write_health(health_path, dict(health))
+
     while not stop_event.is_set():
         now = clock()
         health["heartbeat_at"] = now.isoformat(timespec="seconds")
-        _write_health(health_path, health)
+        write_health()
         remaining = (due - now).total_seconds()
         if remaining > 0:
-            interruptible_sleep(stop_event, min(remaining, 60))
+            sleep_fn(stop_event, min(remaining, 60))
             continue
         health["publication_started_at"] = now.isoformat(timespec="seconds")
-        _write_health(health_path, health)
+        write_health()
+        publication_done = threading.Event()
+
+        def pulse_heartbeat() -> None:
+            while not publication_done.wait(max(0.01, heartbeat_interval_seconds)):
+                with health_lock:
+                    health["heartbeat_at"] = clock().isoformat(timespec="seconds")
+                    _write_health(health_path, dict(health))
+
+        heartbeat_thread = threading.Thread(
+            target=pulse_heartbeat,
+            name="publisher-heartbeat",
+            daemon=True,
+        )
+        heartbeat_thread.start()
         try:
             service.run(now, cancel_event=stop_event)
         except Exception:
-            if stop_event.is_set():
-                break
             failures += 1
-            due = clock() + timedelta(seconds=retry_delay(failures, config.retry_seconds))
+            failed_at = clock()
+            due = failed_at + timedelta(
+                seconds=retry_delay(failures, config.retry_seconds)
+            )
+            _write_state(state_path, {
+                "last_attempt_at": failed_at.isoformat(timespec="seconds"),
+                "last_error": "publication failed",
+                "consecutive_failures": failures,
+                "next_retry_at": due.isoformat(timespec="seconds"),
+            })
+            _log_event(
+                "publication_failed",
+                consecutive_failures=failures,
+                next_retry_at=due.isoformat(timespec="seconds"),
+            )
         else:
             failures = 0
             last_success = clock()
             health["last_success_at"] = last_success.isoformat(timespec="seconds")
+            _write_state(state_path, {
+                "last_attempt_at": last_success.isoformat(timespec="seconds"),
+                "last_success_at": last_success.isoformat(timespec="seconds"),
+                "last_error": "",
+                "consecutive_failures": 0,
+                "next_retry_at": "",
+            })
             due = next_due(last_success, config.publish_time, last_success)
         finally:
-            health["publication_started_at"] = ""
+            publication_done.set()
+            heartbeat_thread.join()
+            with health_lock:
+                health["publication_started_at"] = ""
+        if stop_event.is_set():
+            break
     health["heartbeat_at"] = clock().isoformat(timespec="seconds")
     health["publication_started_at"] = ""
-    _write_health(health_path, health)
+    write_health()
     return 0

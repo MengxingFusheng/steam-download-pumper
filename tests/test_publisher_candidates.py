@@ -32,6 +32,7 @@ class PublisherCandidateTests(unittest.TestCase):
             {"schema": 1, "sources": [{"url": "ftp://example.test/file", "enabled": True}]},
             {"schema": 1, "sources": [{"url": "https://user:pass@example.test/file", "enabled": True}]},
             {"schema": 1, "sources": [{"url": "https://example.test/file#fragment", "enabled": True}]},
+            {"schema": 1, "sources": [{"url": "https://example.test/file?token=secret", "enabled": True}]},
             {"schema": 1, "sources": [{"url": " https://example.test/file", "enabled": True}]},
             {"schema": 1, "sources": [{"url": "https://example.test:bad/file", "enabled": True}]},
             {"schema": 1, "sources": [{"url": "https://example.test/file", "enabled": 1}]},

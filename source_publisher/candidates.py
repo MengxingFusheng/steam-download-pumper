@@ -25,6 +25,8 @@ def validate_source_url(url: object) -> str:
         raise ValueError("candidate URL must not contain credentials")
     if parsed.fragment:
         raise ValueError("candidate URL must not contain a fragment")
+    if parsed.query:
+        raise ValueError("candidate URL must not contain a query")
     if port is not None and not 1 <= port <= 65535:
         raise ValueError("candidate URL has an invalid port")
     return url

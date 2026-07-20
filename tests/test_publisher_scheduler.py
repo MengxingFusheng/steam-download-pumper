@@ -1,17 +1,32 @@
+import contextlib
+import io
 import json
 import tempfile
 import threading
 import time
 import unittest
+from dataclasses import replace
 from datetime import datetime, timedelta, time as wall_time
 from pathlib import Path
 from zoneinfo import ZoneInfo
+from unittest.mock import patch
+
+from tests.test_publisher_config import BASE_ENV
 
 
 SHANGHAI = ZoneInfo("Asia/Shanghai")
 
 
 class PublisherSchedulerTests(unittest.TestCase):
+    def _config(self, root, now):
+        from source_publisher.config import PublisherConfig
+
+        config = PublisherConfig.from_env({**BASE_ENV, "STATE_DIR": str(root)})
+        return replace(
+            config,
+            publish_time=(now - timedelta(minutes=1)).timetz().replace(tzinfo=None),
+        )
+
     def test_before_publish_time_waits_when_yesterdays_run_succeeded(self):
         from source_publisher.scheduler import next_due
 
@@ -105,6 +120,139 @@ class PublisherSchedulerTests(unittest.TestCase):
             value["last_success_at"] = (due + timedelta(hours=2, minutes=30)).isoformat()
             health_path.write_text(json.dumps(value), encoding="utf-8")
             self.assertTrue(health_is_healthy(health_path, due + timedelta(hours=3)))
+
+    def test_active_publication_has_thirty_minute_health_grace(self):
+        from source_publisher.scheduler import health_is_healthy
+
+        with tempfile.TemporaryDirectory() as directory:
+            health_path = Path(directory) / "health.json"
+            now = datetime(2026, 7, 20, 4, 0, tzinfo=SHANGHAI)
+            value = {
+                "heartbeat_at": now.isoformat(),
+                "process_started_at": (now - timedelta(hours=3)).isoformat(),
+                "first_due_at": (now - timedelta(hours=3)).isoformat(),
+                "publication_started_at": (now - timedelta(minutes=29)).isoformat(),
+                "last_success_at": (now - timedelta(days=3)).isoformat(),
+            }
+            health_path.write_text(json.dumps(value), encoding="utf-8")
+            self.assertTrue(health_is_healthy(health_path, now))
+            value["publication_started_at"] = (now - timedelta(minutes=31)).isoformat()
+            health_path.write_text(json.dumps(value), encoding="utf-8")
+            self.assertFalse(health_is_healthy(health_path, now))
+
+    def test_scheduler_refreshes_heartbeat_during_publication(self):
+        from source_publisher import scheduler
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            now = datetime.now(SHANGHAI)
+            config = self._config(root, now)
+            stop = threading.Event()
+            health_writes = []
+            real_write = scheduler._write_health
+
+            def record_health(path, value):
+                health_writes.append(dict(value))
+                real_write(path, value)
+
+            class SlowService:
+                def run(self, _now, **_kwargs):
+                    time.sleep(0.18)
+                    stop.set()
+
+            with patch(
+                "source_publisher.scheduler._write_health", side_effect=record_health
+            ):
+                scheduler.run_scheduler(
+                    config,
+                    SlowService(),
+                    stop,
+                    heartbeat_interval_seconds=0.03,
+                )
+            active_writes = [
+                item for item in health_writes if item.get("publication_started_at")
+            ]
+            self.assertGreaterEqual(len(active_writes), 3)
+
+    def test_scheduler_persists_failure_and_restart_respects_backoff(self):
+        from source_publisher.scheduler import run_scheduler
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            failed_at = datetime(2026, 7, 20, 4, 0, tzinfo=SHANGHAI)
+            config = self._config(root, failed_at)
+            stop = threading.Event()
+
+            class FailingService:
+                def run(self, _now, **_kwargs):
+                    stop.set()
+                    raise RuntimeError("SENSITIVE FAILURE DETAIL")
+
+            stderr = io.StringIO()
+            with contextlib.redirect_stderr(stderr):
+                run_scheduler(config, FailingService(), stop, now_fn=lambda: failed_at)
+            state_path = root / "state.json"
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            self.assertEqual(state["last_error"], "publication failed")
+            self.assertEqual(state["consecutive_failures"], 1)
+            retry_at = datetime.fromisoformat(state["next_retry_at"])
+            self.assertEqual(retry_at, failed_at + timedelta(seconds=900))
+            self.assertIn("publication_failed", stderr.getvalue())
+            self.assertNotIn("SENSITIVE", stderr.getvalue())
+
+            calls = []
+            restart_stop = threading.Event()
+
+            class RecordingService:
+                def run(self, run_at, **_kwargs):
+                    calls.append(run_at)
+
+            def stop_sleep(_event, _seconds):
+                restart_stop.set()
+                return True
+
+            run_scheduler(
+                config,
+                RecordingService(),
+                restart_stop,
+                now_fn=lambda: failed_at + timedelta(minutes=1),
+                sleep_fn=stop_sleep,
+            )
+            self.assertEqual(calls, [])
+
+    def test_scheduler_clears_persisted_failure_after_retry_success(self):
+        from source_publisher.scheduler import run_scheduler
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            retry_at = datetime(2026, 7, 20, 4, 15, tzinfo=SHANGHAI)
+            config = self._config(root, retry_at)
+            root.mkdir(parents=True, exist_ok=True)
+            (root / "state.json").write_text(json.dumps({
+                "last_success_at": (retry_at - timedelta(days=2)).isoformat(),
+                "last_revision": 20260718031700,
+                "last_source_count": 3,
+                "last_error": "publication failed",
+                "consecutive_failures": 1,
+                "next_retry_at": retry_at.isoformat(),
+            }), encoding="utf-8")
+            stop = threading.Event()
+
+            class SuccessfulService:
+                def run(self, _now, **_kwargs):
+                    stop.set()
+
+            run_scheduler(
+                config,
+                SuccessfulService(),
+                stop,
+                now_fn=lambda: retry_at + timedelta(seconds=1),
+            )
+            state = json.loads((root / "state.json").read_text(encoding="utf-8"))
+            self.assertEqual(state["consecutive_failures"], 0)
+            self.assertEqual(state["next_retry_at"], "")
+            self.assertEqual(state["last_error"], "")
+            self.assertEqual(state["last_revision"], 20260718031700)
 
 
 if __name__ == "__main__":

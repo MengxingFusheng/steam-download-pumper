@@ -3,11 +3,13 @@ from __future__ import annotations
 import http.client
 import ipaddress
 import math
+import queue
+import socket
 import ssl
 import statistics
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Callable, Iterable, Mapping
@@ -71,13 +73,62 @@ def _default_connection_factory(
     return http.client.HTTPConnection(connect_ip, port=port, timeout=timeout)
 
 
+def _check_deadline(deadline: float, cancel_event: threading.Event) -> None:
+    if cancel_event.is_set():
+        raise InterruptedError("probe interrupted")
+    if time.monotonic() >= deadline:
+        raise TimeoutError("probe deadline exceeded")
+
+
+def _resolve_with_deadline(
+    resolver: Resolver,
+    hostname: str,
+    port: int,
+    deadline: float,
+    cancel_event: threading.Event,
+) -> tuple[str, ...]:
+    outcome: queue.Queue[tuple[bool, object]] = queue.Queue(maxsize=1)
+
+    def resolve() -> None:
+        try:
+            value: object = tuple(resolver(hostname, port))
+            item = (True, value)
+        except Exception as exc:
+            item = (False, exc)
+        try:
+            outcome.put_nowait(item)
+        except queue.Full:
+            pass
+
+    threading.Thread(
+        target=resolve,
+        name="publisher-dns",
+        daemon=True,
+    ).start()
+    while True:
+        _check_deadline(deadline, cancel_event)
+        remaining = deadline - time.monotonic()
+        try:
+            succeeded, value = outcome.get(timeout=min(0.05, remaining))
+        except queue.Empty:
+            continue
+        if succeeded:
+            return value  # type: ignore[return-value]
+        raise value  # type: ignore[misc]
+
+
 def _validated_addresses(
-    url: str, resolver: Resolver
+    url: str,
+    resolver: Resolver,
+    deadline: float,
+    cancel_event: threading.Event,
 ) -> tuple[str, str, int, str, tuple[str, ...]]:
     parsed = urlsplit(validate_source_url(url))
     hostname = parsed.hostname or ""
     port = parsed.port or (443 if parsed.scheme == "https" else 80)
-    raw_addresses = tuple(resolver(hostname, port))
+    raw_addresses = _resolve_with_deadline(
+        resolver, hostname, port, deadline, cancel_event
+    )
     addresses: list[str] = []
     for raw in raw_addresses:
         try:
@@ -112,21 +163,70 @@ def pinned_request(
     timeout: float,
     resolver: Resolver = resolve_public_ipv4,
     connection_factory: ConnectionFactory = _default_connection_factory,
+    deadline: float | None = None,
+    cancel_event: threading.Event | None = None,
 ) -> PinnedResponse:
-    scheme, hostname, port, target, addresses = _validated_addresses(url, resolver)
+    cancellation = cancel_event or threading.Event()
+    absolute_deadline = deadline or (time.monotonic() + max(0.1, timeout))
+    scheme, hostname, port, target, addresses = _validated_addresses(
+        url, resolver, absolute_deadline, cancellation
+    )
+    _check_deadline(absolute_deadline, cancellation)
     default_port = 443 if scheme == "https" else 80
     host_header = hostname if port == default_port else f"{hostname}:{port}"
     request_headers = dict(headers)
     request_headers["Host"] = host_header
-    connection = connection_factory(scheme, addresses[0], hostname, port, timeout)
+    connection = connection_factory(
+        scheme,
+        addresses[0],
+        hostname,
+        port,
+        min(max(0.1, timeout), max(0.1, absolute_deadline - time.monotonic())),
+    )
     response: http.client.HTTPResponse | None = None
+    finished = threading.Event()
+    transport: list[object] = []
+
+    def abort_at_deadline() -> None:
+        while not finished.wait(0.05):
+            if cancellation.is_set() or time.monotonic() >= absolute_deadline:
+                sock = transport[0] if transport else getattr(connection, "sock", None)
+                if sock is not None:
+                    try:
+                        sock.shutdown(socket.SHUT_RDWR)
+                    except OSError:
+                        pass
+                connection.close()
+                return
+
+    watcher = threading.Thread(
+        target=abort_at_deadline,
+        name="publisher-request-deadline",
+        daemon=True,
+    )
+    watcher.start()
     try:
         connection.request("GET", target, headers=request_headers)
+        if connection.sock is not None:
+            transport.append(connection.sock)
+        _check_deadline(absolute_deadline, cancellation)
         response = connection.getresponse()
         response_headers = {name.lower(): value for name, value in response.getheaders()}
-        body = b"" if response.status in {301, 302, 303, 307, 308} else response.read(max_bytes)
+        chunks: list[bytes] = []
+        remaining_bytes = max_bytes
+        if response.status not in {301, 302, 303, 307, 308}:
+            while remaining_bytes > 0:
+                _check_deadline(absolute_deadline, cancellation)
+                chunk = response.read(min(64 * 1024, remaining_bytes))
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                remaining_bytes -= len(chunk)
+        _check_deadline(absolute_deadline, cancellation)
+        body = b"".join(chunks)
         return PinnedResponse(response.status, response_headers, body)
     finally:
+        finished.set()
         if response is not None:
             response.close()
         connection.close()
@@ -138,12 +238,12 @@ def _probe_once(
     resolver: Resolver,
     cancel_event: threading.Event,
     connection_factory: ConnectionFactory,
+    deadline: float,
 ) -> tuple[int, float]:
     current_url = url
     started = time.monotonic()
     for redirect_count in range(MAX_REDIRECTS + 1):
-        if cancel_event.is_set():
-            raise InterruptedError("probe interrupted")
+        _check_deadline(deadline, cancel_event)
         response = pinned_request(
             current_url,
             headers={
@@ -155,6 +255,8 @@ def _probe_once(
             timeout=max(0.1, timeout),
             resolver=resolver,
             connection_factory=connection_factory,
+            deadline=deadline,
+            cancel_event=cancel_event,
         )
         if response.status in {301, 302, 303, 307, 308}:
             location = response.headers.get("location", "")
@@ -182,15 +284,18 @@ def probe_source(
     resolver: Resolver = resolve_public_ipv4,
     cancel_event: threading.Event | None = None,
     connection_factory: ConnectionFactory = _default_connection_factory,
+    deadline: float | None = None,
 ) -> ProbeResult:
     cancellation = cancel_event or threading.Event()
     checked_at = datetime.now(timezone.utc)
-    deadline = time.monotonic() + min(25.0, max(0.1, timeout * 2))
+    absolute_deadline = deadline or (
+        time.monotonic() + min(25.0, max(0.1, timeout * 2))
+    )
     speeds: list[float] = []
     total_bytes = 0
     try:
         for _ in range(2):
-            remaining = deadline - time.monotonic()
+            remaining = absolute_deadline - time.monotonic()
             if remaining <= 0:
                 raise TimeoutError("probe deadline exceeded")
             read, mbps = _probe_once(
@@ -199,6 +304,7 @@ def probe_source(
                 resolver,
                 cancellation,
                 connection_factory,
+                absolute_deadline,
             )
             total_bytes += read
             speeds.append(mbps)
@@ -224,10 +330,12 @@ def probe_candidates(
     resolver: Resolver = resolve_public_ipv4,
     cancel_event: threading.Event | None = None,
     connection_factory: ConnectionFactory = _default_connection_factory,
+    deadline: float | None = None,
 ) -> list[ProbeResult]:
     candidates = list(urls)
     cancellation = cancel_event or threading.Event()
     workers = min(MAX_WORKERS, max(1, concurrency))
+    absolute_deadline = deadline or (time.monotonic() + 25.0)
 
     def run(url: str) -> ProbeResult:
         return probe_source(
@@ -236,7 +344,49 @@ def probe_candidates(
             resolver=resolver,
             cancel_event=cancellation,
             connection_factory=connection_factory,
+            deadline=absolute_deadline,
         )
 
-    with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="publisher-probe") as pool:
-        return list(pool.map(run, candidates))
+    pool = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="publisher-probe")
+    futures = {pool.submit(run, url): index for index, url in enumerate(candidates)}
+    pending = set(futures)
+    results: list[ProbeResult | None] = [None] * len(candidates)
+    try:
+        while pending:
+            if cancellation.is_set() or time.monotonic() >= absolute_deadline:
+                break
+            completed, pending = wait(
+                pending,
+                timeout=min(0.05, max(0.0, absolute_deadline - time.monotonic())),
+                return_when=FIRST_COMPLETED,
+            )
+            for future in completed:
+                index = futures[future]
+                try:
+                    results[index] = future.result()
+                except Exception:
+                    results[index] = ProbeResult(
+                        candidates[index],
+                        datetime.now(timezone.utc),
+                        0.0,
+                        0,
+                        False,
+                        "probe failed",
+                    )
+    finally:
+        for future in pending:
+            future.cancel()
+        pool.shutdown(wait=False, cancel_futures=True)
+
+    error = "interrupted" if cancellation.is_set() else "probe failed"
+    for index, result in enumerate(results):
+        if result is None:
+            results[index] = ProbeResult(
+                candidates[index],
+                datetime.now(timezone.utc),
+                0.0,
+                0,
+                False,
+                error,
+            )
+    return [result for result in results if result is not None]

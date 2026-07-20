@@ -12,6 +12,8 @@ class _ProbeHandler(BaseHTTPRequestHandler):
     hosts = []
     statuses = []
     bytes_to_send = 2 * 1024 * 1024
+    chunk_size = 65536
+    drip_delay = 0.0
 
     def do_GET(self):
         type(self).ranges.append(self.headers.get("Range"))
@@ -27,7 +29,7 @@ class _ProbeHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Length", str(type(self).bytes_to_send))
         self.end_headers()
         if status in (200, 206):
-            chunk = b"x" * 65536
+            chunk = b"x" * type(self).chunk_size
             remaining = type(self).bytes_to_send
             while remaining:
                 data = chunk[:remaining]
@@ -36,6 +38,8 @@ class _ProbeHandler(BaseHTTPRequestHandler):
                 except BrokenPipeError:
                     break
                 remaining -= len(data)
+                if type(self).drip_delay:
+                    time.sleep(type(self).drip_delay)
 
     def log_message(self, _format, *_args):
         pass
@@ -47,6 +51,8 @@ class PublisherProbeTests(unittest.TestCase):
         _ProbeHandler.hosts = []
         _ProbeHandler.statuses = []
         _ProbeHandler.bytes_to_send = 2 * 1024 * 1024
+        _ProbeHandler.chunk_size = 65536
+        _ProbeHandler.drip_delay = 0.0
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), _ProbeHandler)
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
@@ -174,6 +180,87 @@ class PublisherProbeTests(unittest.TestCase):
             raw_socket, server_hostname="secure.example"
         )
         self.assertIs(connection.sock, wrapped_socket)
+
+    def test_slow_drip_cannot_extend_absolute_deadline(self):
+        from source_publisher.probe import probe_source
+
+        _ProbeHandler.chunk_size = 1024
+        _ProbeHandler.drip_delay = 0.05
+        dialed = []
+        started = time.monotonic()
+        with patch("socket.create_connection", side_effect=self._dial_validated_ip_to_fixture(dialed)):
+            result = probe_source(
+                self.url,
+                resolver=lambda *_args: ("93.184.216.34",),
+                deadline=time.monotonic() + 0.2,
+            )
+        self.assertFalse(result.success)
+        self.assertLess(time.monotonic() - started, 1.0)
+
+    def test_blocking_dns_is_bounded_by_deadline(self):
+        from source_publisher.probe import probe_source
+
+        blocked = threading.Event()
+
+        def resolver(_host, _port):
+            blocked.wait(10)
+            return ("93.184.216.34",)
+
+        started = time.monotonic()
+        result = probe_source(self.url, resolver=resolver, deadline=started + 0.2)
+        self.assertFalse(result.success)
+        self.assertLess(time.monotonic() - started, 1.0)
+
+    def test_cancellation_interrupts_blocking_dns(self):
+        from source_publisher.probe import probe_source
+
+        entered = threading.Event()
+        release = threading.Event()
+        cancel = threading.Event()
+
+        def resolver(_host, _port):
+            entered.set()
+            release.wait(10)
+            return ("93.184.216.34",)
+
+        outcome = []
+        worker = threading.Thread(
+            target=lambda: outcome.append(
+                probe_source(
+                    self.url,
+                    resolver=resolver,
+                    cancel_event=cancel,
+                    deadline=time.monotonic() + 10,
+                )
+            )
+        )
+        worker.start()
+        self.assertTrue(entered.wait(1))
+        cancel.set()
+        worker.join(1)
+        release.set()
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(outcome[0].error, "interrupted")
+
+    def test_probe_pool_returns_without_waiting_for_blocked_dns_workers(self):
+        from source_publisher.probe import probe_candidates
+
+        release = threading.Event()
+
+        def resolver(_host, _port):
+            release.wait(10)
+            return ("93.184.216.34",)
+
+        started = time.monotonic()
+        results = probe_candidates(
+            [f"https://blocked{i}.example/file" for i in range(12)],
+            resolver=resolver,
+            deadline=started + 0.2,
+        )
+        release.set()
+        self.assertEqual(len(results), 12)
+        self.assertFalse(any(result.success for result in results))
+        self.assertLess(time.monotonic() - started, 1.0)
 
     def test_probe_pool_never_exceeds_four_workers(self):
         from source_publisher.probe import ProbeResult, probe_candidates

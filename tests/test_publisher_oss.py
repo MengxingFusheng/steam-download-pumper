@@ -44,6 +44,33 @@ class PublisherOSSTests(unittest.TestCase):
             self.assertNotIn("--acl", recorded["argv"])
             self.assertEqual(dict(os.environ), before)
 
+    def test_immutable_release_upload_never_uses_force(self):
+        from source_publisher.config import PublisherConfig, PublisherSecrets
+        from source_publisher.oss import OSSClient
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            capture = root / "capture.json"
+            fake = root / "ossutil"
+            fake.write_text(
+                "#!/usr/bin/env python3\n"
+                "import json,os,sys\n"
+                "p=os.path.join(os.path.dirname(sys.argv[0]),'capture.json')\n"
+                "json.dump(sys.argv[1:],open(p,'w'))\n",
+                encoding="utf-8",
+            )
+            fake.chmod(0o700)
+            source = root / "release.json"
+            source.write_text("{}", encoding="utf-8")
+            config = PublisherConfig.from_env({**BASE_ENV, "OSSUTIL_PATH": str(fake)})
+            client = OSSClient(config, PublisherSecrets("private", "id", "secret"))
+            client.upload(
+                source,
+                "pumper/v1/releases/20260720031700.json",
+                overwrite=False,
+            )
+            self.assertNotIn("--force", json.loads(capture.read_text(encoding="utf-8")))
+
     def test_public_read_requires_https_and_is_bounded(self):
         from source_publisher.config import PublisherConfig, PublisherSecrets
         from source_publisher.oss import OSSClient, OSSFailure

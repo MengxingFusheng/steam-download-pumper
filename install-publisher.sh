@@ -47,16 +47,32 @@ if [ ! -f "${CONFIG_DIR}/candidates.json" ]; then
   fi
 fi
 
-set -a
-# shellcheck disable=SC1090
-. "$ENV_PATH"
-set +a
+declare -A dotenv=()
+while IFS= read -r line || [ -n "$line" ]; do
+  line="${line%$'\r'}"
+  [[ -z "$line" || "$line" =~ ^[[:space:]]*# ]] && continue
+  [[ "$line" =~ ^([A-Z][A-Z0-9_]*)=(.*)$ ]] || fail "invalid dotenv syntax"
+  key="${BASH_REMATCH[1]}"
+  value="${BASH_REMATCH[2]}"
+  case "$key" in
+    PUBLISHER_IMAGE|OSS_BUCKET|OSS_REGION|OSS_ENDPOINT|OSS_PUBLIC_BASE_URL|SOURCE_LIST_KEY_ID|PUBLISH_TIME|PUBLISH_TIMEZONE|PUBLISH_RETRY_SECONDS|MIN_HEALTHY_SOURCES|MAX_HEALTHY_SOURCES|PROBE_CONCURRENCY|PROBE_TIMEOUT_SECONDS|LOG_LEVEL) ;;
+    *) fail "unsupported dotenv key: ${key}" ;;
+  esac
+  [[ "$value" =~ ^[A-Za-z0-9_./,:@+-]+$ ]] || fail "unsafe dotenv value for ${key}"
+  [[ -z "${dotenv[$key]+present}" ]] || fail "duplicate dotenv key: ${key}"
+  dotenv["$key"]="$value"
+done < "$ENV_PATH"
 
-[[ "${OSS_BUCKET:-}" =~ ^[a-z0-9][a-z0-9-]{1,61}[a-z0-9]$ ]] || fail "OSS_BUCKET is invalid"
-[ "${OSS_REGION:-}" = "cn-beijing" ] || fail "OSS_REGION must be cn-beijing"
-[[ "${OSS_ENDPOINT:-}" =~ ^https://[^/?#]+$ ]] || fail "OSS_ENDPOINT must be an HTTPS origin"
-[[ "${OSS_PUBLIC_BASE_URL:-}" =~ ^https://[^/?#]+/[^?#]+$ ]] || fail "OSS_PUBLIC_BASE_URL must be HTTPS"
-[[ "${SOURCE_LIST_KEY_ID:-}" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$ ]] || fail "SOURCE_LIST_KEY_ID is invalid"
+OSS_BUCKET_VALUE="${dotenv[OSS_BUCKET]:-}"
+OSS_REGION_VALUE="${dotenv[OSS_REGION]:-cn-beijing}"
+OSS_ENDPOINT_VALUE="${dotenv[OSS_ENDPOINT]:-}"
+OSS_PUBLIC_BASE_URL_VALUE="${dotenv[OSS_PUBLIC_BASE_URL]:-}"
+SOURCE_LIST_KEY_ID_VALUE="${dotenv[SOURCE_LIST_KEY_ID]:-}"
+[[ "$OSS_BUCKET_VALUE" =~ ^[a-z0-9][a-z0-9-]{1,61}[a-z0-9]$ ]] || fail "OSS_BUCKET is invalid"
+[ "$OSS_REGION_VALUE" = "cn-beijing" ] || fail "OSS_REGION must be cn-beijing"
+[[ "$OSS_ENDPOINT_VALUE" =~ ^https://[^/?#]+$ ]] || fail "OSS_ENDPOINT must be an HTTPS origin"
+[[ "$OSS_PUBLIC_BASE_URL_VALUE" =~ ^https://[^/?#]+/pumper/v1$ ]] || fail "OSS_PUBLIC_BASE_URL must be the HTTPS pumper/v1 prefix"
+[[ "$SOURCE_LIST_KEY_ID_VALUE" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$ ]] || fail "SOURCE_LIST_KEY_ID is invalid"
 
 for name in source_signing_private_key oss_access_key_id oss_access_key_secret; do
   path="${SECRET_DIR}/${name}"
@@ -69,5 +85,5 @@ compose=(docker compose --env-file "$ENV_PATH" -f "$COMPOSE_PATH")
 "${compose[@]}" pull
 "${compose[@]}" run --rm --no-deps source-publisher validate-only
 "${compose[@]}" up -d
-printf 'publisher scheduled for %s %s; current status:\n' "${PUBLISH_TIME:-03:17}" "${PUBLISH_TIMEZONE:-Asia/Shanghai}"
+printf 'publisher scheduled for %s %s; current status:\n' "${dotenv[PUBLISH_TIME]:-03:17}" "${dotenv[PUBLISH_TIMEZONE]:-Asia/Shanghai}"
 "${compose[@]}" ps source-publisher

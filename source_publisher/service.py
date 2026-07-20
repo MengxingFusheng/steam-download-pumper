@@ -12,7 +12,7 @@ from typing import Callable
 from .candidates import load_candidates
 from .config import PublisherConfig, PublisherSecrets
 from .manifest import build_payload, sign_payload, verify_envelope_with_private_key
-from .oss import OSSClient, OSSFailure
+from .oss import OSSClient, OSSFailure, OSSNotFound
 from .probe import ProbeResult, probe_candidates
 
 
@@ -43,6 +43,12 @@ def atomic_write(path: Path, data: bytes, mode: int = 0o600) -> None:
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(temporary, path)
+        directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+        directory_descriptor = os.open(path.parent, directory_flags)
+        try:
+            os.fsync(directory_descriptor)
+        finally:
+            os.close(directory_descriptor)
     finally:
         if descriptor >= 0:
             os.close(descriptor)
@@ -96,6 +102,27 @@ class PublicationService:
         cancel_event: threading.Event | None = None,
     ) -> PublicationResult:
         cancellation = cancel_event or threading.Event()
+        state_path = self.config.state_dir / "state.json"
+        previous = read_state(state_path)
+        client: OSSClient | None = None
+        private_key_path: Path | None = None
+        recovered: PublicationResult | None = None
+        if not validate_only:
+            if self.secrets is None:
+                raise ValueError("publisher secrets are required")
+            client = self.oss_client or OSSClient(self.config, self.secrets)
+            private_key_path = self.config.secret_dir / "source_signing_private_key"
+            recovered = self._recover_remote_commit(client, private_key_path)
+            if recovered is not None:
+                remote_generated = datetime.fromisoformat(
+                    json.loads(recovered.payload)["generated_at"]
+                )
+                if remote_generated.astimezone(self.config.timezone).date() == now.astimezone(
+                    self.config.timezone
+                ).date():
+                    self._write_success_state(state_path, now, recovered)
+                    return recovered
+
         urls = load_candidates(self.config.candidates_path)
         results = self.probe_fn(
             urls,
@@ -108,12 +135,12 @@ class PublicationService:
         healthy = [result for result in results if result.success]
         if len(healthy) < self.config.min_healthy_sources:
             raise InsufficientSources("fewer than the required healthy sources")
-        state_path = self.config.state_dir / "state.json"
-        previous = read_state(state_path)
         try:
             previous_revision = int(previous.get("last_revision", 0))
         except (TypeError, ValueError) as exc:
             raise ValueError("publisher state revision is invalid") from exc
+        if recovered is not None:
+            previous_revision = max(previous_revision, recovered.revision)
         payload, revision = build_payload(
             healthy,
             now,
@@ -122,10 +149,8 @@ class PublicationService:
         )
         if validate_only:
             return PublicationResult(revision, len(healthy), payload, None)
-        if self.secrets is None:
-            raise ValueError("publisher secrets are required")
-
-        private_key_path = self.config.secret_dir / "source_signing_private_key"
+        assert private_key_path is not None
+        assert client is not None
         envelope = self.sign_fn(
             payload, private_key_path, self.config.key_id, self.config.manifestctl_path
         )
@@ -139,26 +164,75 @@ class PublicationService:
         latest_path = staging / "latest.json"
         atomic_write(release_path, envelope)
         atomic_write(latest_path, envelope)
-        client = self.oss_client or OSSClient(self.config, self.secrets)
         relative_release = f"releases/{revision}.json"
-        client.upload(release_path, f"pumper/v1/{relative_release}")
+        try:
+            existing_release = client.read_public(relative_release)
+        except (OSSNotFound, KeyError):
+            client.upload(
+                release_path,
+                f"pumper/v1/{relative_release}",
+                overwrite=False,
+            )
+        else:
+            self._verify_public(
+                existing_release, envelope, payload, private_key_path
+            )
         self._verify_public(client.read_public(relative_release), envelope, payload, private_key_path)
-        client.upload(latest_path, "pumper/v1/latest.json")
+        client.upload(latest_path, "pumper/v1/latest.json", overwrite=True)
         self._verify_public(client.read_public("latest.json"), envelope, payload, private_key_path)
 
+        result = PublicationResult(revision, len(healthy), payload, envelope)
+        self._write_success_state(state_path, now, result)
+        return result
+
+    def _write_success_state(
+        self, state_path: Path, now: datetime, result: PublicationResult
+    ) -> None:
         successful_state = {
             "last_attempt_at": now.isoformat(timespec="seconds"),
             "last_success_at": now.isoformat(timespec="seconds"),
-            "last_revision": revision,
-            "last_source_count": len(healthy),
+            "last_revision": result.revision,
+            "last_source_count": result.source_count,
             "last_error": "",
             "consecutive_failures": 0,
+            "next_retry_at": "",
         }
         atomic_write(
             state_path,
             json.dumps(successful_state, separators=(",", ":"), sort_keys=True).encode("utf-8"),
         )
-        return PublicationResult(revision, len(healthy), payload, envelope)
+
+    def _recover_remote_commit(
+        self, client: OSSClient, private_key_path: Path
+    ) -> PublicationResult | None:
+        try:
+            latest = client.read_public("latest.json")
+        except (OSSNotFound, KeyError):
+            return None
+        payload = self.verify_fn(
+            latest,
+            private_key_path,
+            self.config.key_id,
+            self.config.manifestctl_path,
+        )
+        try:
+            document = json.loads(payload)
+            revision = int(document["revision"])
+            generated = datetime.fromisoformat(document["generated_at"])
+            sources = document["sources"]
+            if (
+                not isinstance(document, dict)
+                or document.get("schema") != 1
+                or len(str(revision)) != 14
+                or generated.tzinfo is None
+                or not isinstance(sources, list)
+            ):
+                raise ValueError
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise OSSFailure("remote latest payload is invalid") from exc
+        release = client.read_public(f"releases/{revision}.json")
+        self._verify_public(release, latest, payload, private_key_path)
+        return PublicationResult(revision, len(sources), payload, latest)
 
     def _verify_public(
         self,
