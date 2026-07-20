@@ -99,7 +99,6 @@ class PublicationService:
         urls = load_candidates(self.config.candidates_path)
         results = self.probe_fn(
             urls,
-            probe_bytes=self.config.probe_bytes,
             timeout=self.config.probe_timeout_seconds,
             concurrency=self.config.probe_concurrency,
             cancel_event=cancellation,

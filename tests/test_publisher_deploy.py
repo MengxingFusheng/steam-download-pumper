@@ -28,9 +28,10 @@ class PublisherDeployTests(unittest.TestCase):
             "OSS_BUCKET", "OSS_REGION", "OSS_ENDPOINT", "OSS_PUBLIC_BASE_URL",
             "SOURCE_LIST_KEY_ID", "PUBLISH_TIME", "PUBLISH_TIMEZONE",
             "PUBLISH_RETRY_SECONDS", "MIN_HEALTHY_SOURCES", "MAX_HEALTHY_SOURCES",
-            "PROBE_CONCURRENCY", "PROBE_BYTES", "PROBE_TIMEOUT_SECONDS",
+            "PROBE_CONCURRENCY", "PROBE_TIMEOUT_SECONDS",
         ):
             self.assertRegex(env, rf"(?m)^{name}=")
+        self.assertNotRegex(env, r"(?m)^PROBE_BYTES=")
         self.assertNotRegex(env, r"(?i)(ACCESS_KEY|PRIVATE_KEY)=")
 
     def test_installer_validates_secret_permissions_and_compose_before_start(self):

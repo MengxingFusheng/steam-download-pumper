@@ -1,8 +1,10 @@
 import json
+import http.client
 import os
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 from tests.test_publisher_config import BASE_ENV
 
@@ -50,6 +52,80 @@ class PublisherOSSTests(unittest.TestCase):
         client = OSSClient(config, PublisherSecrets("private", "id", "secret"))
         with self.assertRaises(OSSFailure):
             client.read_url("http://example.test/latest.json")
+
+    def test_public_read_is_limited_to_configured_origin_and_object_path(self):
+        from source_publisher.config import PublisherConfig, PublisherSecrets
+        from source_publisher.oss import OSSClient, OSSFailure
+
+        calls = []
+
+        def request(url, **kwargs):
+            calls.append((url, kwargs))
+            return SimpleNamespace(status=200, headers={}, body=b"{}")
+
+        config = PublisherConfig.from_env(BASE_ENV)
+        client = OSSClient(
+            config,
+            PublisherSecrets("private", "id", "secret"),
+            resolver=lambda *_args: ("93.184.216.34",),
+            request_fn=request,
+        )
+        self.assertEqual(client.read_public("latest.json"), b"{}")
+        self.assertEqual(
+            calls[0][0],
+            "https://pumper-source-list-example.oss-cn-beijing.aliyuncs.com/pumper/v1/latest.json",
+        )
+        for url in (
+            "https://evil.example/pumper/v1/latest.json",
+            "http://pumper-source-list-example.oss-cn-beijing.aliyuncs.com/pumper/v1/latest.json",
+            "https://pumper-source-list-example.oss-cn-beijing.aliyuncs.com/other/latest.json",
+            "https://pumper-source-list-example.oss-cn-beijing.aliyuncs.com/pumper/v1/latest.json?x=1",
+        ):
+            with self.subTest(url=url), self.assertRaises(OSSFailure):
+                client.read_url(url)
+        self.assertEqual(len(calls), 1)
+
+    def test_public_read_rejects_private_resolution_and_all_redirects(self):
+        from source_publisher.config import PublisherConfig, PublisherSecrets
+        from source_publisher.oss import OSSClient, OSSFailure
+
+        config = PublisherConfig.from_env(BASE_ENV)
+        private = OSSClient(
+            config,
+            PublisherSecrets("private", "id", "secret"),
+            resolver=lambda *_args: ("127.0.0.1",),
+        )
+        with self.assertRaises(OSSFailure):
+            private.read_public("latest.json")
+
+        redirect = OSSClient(
+            config,
+            PublisherSecrets("private", "id", "secret"),
+            resolver=lambda *_args: ("93.184.216.34",),
+            request_fn=lambda *_args, **_kwargs: SimpleNamespace(
+                status=302,
+                headers={"Location": "https://evil.example/pumper/v1/latest.json"},
+                body=b"",
+            ),
+        )
+        with self.assertRaises(OSSFailure):
+            redirect.read_public("latest.json")
+
+    def test_public_read_maps_malformed_http_response_to_oss_failure(self):
+        from source_publisher.config import PublisherConfig, PublisherSecrets
+        from source_publisher.oss import OSSClient, OSSFailure
+
+        config = PublisherConfig.from_env(BASE_ENV)
+        client = OSSClient(
+            config,
+            PublisherSecrets("private", "id", "secret"),
+            resolver=lambda *_args: ("93.184.216.34",),
+            request_fn=lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                http.client.BadStatusLine("malformed")
+            ),
+        )
+        with self.assertRaises(OSSFailure):
+            client.read_public("latest.json")
 
 
 if __name__ == "__main__":

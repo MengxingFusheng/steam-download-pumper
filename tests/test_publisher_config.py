@@ -56,6 +56,32 @@ class PublisherConfigTests(unittest.TestCase):
         cfg = PublisherConfig.from_env(BASE_ENV)
         self.assertEqual(cfg.bucket, BASE_ENV["OSS_BUCKET"])
 
+    def test_probe_size_is_fixed_to_eight_mib(self):
+        from source_publisher.config import PublisherConfig
+
+        self.assertEqual(
+            PublisherConfig.from_env({**BASE_ENV, "PROBE_BYTES": "8388608"}).probe_bytes,
+            8 * 1024 * 1024,
+        )
+        for value in ("2097152", "4194304", "16777216"):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                PublisherConfig.from_env({**BASE_ENV, "PROBE_BYTES": value})
+
+    def test_secret_directory_cannot_be_overridden_by_environment(self):
+        from source_publisher.config import PublisherConfig
+
+        cfg = PublisherConfig.from_env({**BASE_ENV, "SECRETS_DIR": "/tmp/attacker"})
+        self.assertEqual(cfg.secret_dir, Path("/run/secrets"))
+
+    def test_public_base_url_must_be_exact_pumper_v1_prefix(self):
+        from source_publisher.config import PublisherConfig
+
+        with self.assertRaises(ValueError):
+            PublisherConfig.from_env({
+                **BASE_ENV,
+                "OSS_PUBLIC_BASE_URL": "https://bucket.example/other/v1",
+            })
+
 
 class PublisherSecretsTests(unittest.TestCase):
     def test_reads_regular_nonempty_secret_files(self):

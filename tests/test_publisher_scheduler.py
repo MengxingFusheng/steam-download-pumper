@@ -25,6 +25,13 @@ class PublisherSchedulerTests(unittest.TestCase):
         before = datetime(2026, 12, 31, 2, 0, tzinfo=SHANGHAI)
         self.assertEqual(next_due(before, wall_time(3, 17), None).date(), before.date())
 
+    def test_previous_day_success_is_overdue_even_before_today_publish_time(self):
+        from source_publisher.scheduler import next_due
+
+        now = datetime(2026, 7, 20, 2, 0, tzinfo=SHANGHAI)
+        yesterday = datetime(2026, 7, 19, 3, 18, tzinfo=SHANGHAI)
+        self.assertEqual(next_due(now, wall_time(3, 17), yesterday), now)
+
     def test_retry_schedule_is_capped(self):
         from source_publisher.scheduler import retry_delay
 

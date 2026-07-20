@@ -2,6 +2,7 @@ import base64
 import json
 import tempfile
 import unittest
+from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -49,12 +50,12 @@ class PublisherServiceTests(unittest.TestCase):
         secret_dir.mkdir()
         (secret_dir / "source_signing_private_key").write_text("private", encoding="utf-8")
         from source_publisher.config import PublisherConfig
-        return PublisherConfig.from_env({
+        config = PublisherConfig.from_env({
             **BASE_ENV,
             "CANDIDATES_PATH": str(candidates),
             "STATE_DIR": str(root / "state"),
-            "SECRETS_DIR": str(secret_dir),
         })
+        return replace(config, secret_dir=secret_dir)
 
     def test_transaction_updates_state_only_after_both_public_verifications(self):
         from source_publisher.config import PublisherSecrets

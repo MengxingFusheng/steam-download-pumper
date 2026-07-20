@@ -14,6 +14,8 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 BUCKET_RE = re.compile(r"^[a-z0-9][a-z0-9-]{1,61}[a-z0-9]$")
 KEY_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 TIME_RE = re.compile(r"^(\d{2}):(\d{2})$")
+FIXED_PROBE_BYTES = 8 * 1024 * 1024
+SECRET_DIR = Path("/run/secrets")
 
 
 def _required(env: Mapping[str, str], name: str) -> str:
@@ -85,6 +87,8 @@ class PublisherConfig:
         public_base_url = _https_url(
             _required(values, "OSS_PUBLIC_BASE_URL"), "OSS_PUBLIC_BASE_URL"
         )
+        if urlsplit(public_base_url).path != "/pumper/v1":
+            raise ValueError("OSS_PUBLIC_BASE_URL path must be /pumper/v1")
         key_id = _required(values, "SOURCE_LIST_KEY_ID")
         if not KEY_ID_RE.fullmatch(key_id):
             raise ValueError("SOURCE_LIST_KEY_ID contains invalid characters")
@@ -111,7 +115,7 @@ class PublisherConfig:
         minimum = _integer(values, "MIN_HEALTHY_SOURCES", 3)
         maximum = _integer(values, "MAX_HEALTHY_SOURCES", 100)
         concurrency = _integer(values, "PROBE_CONCURRENCY", 4)
-        probe_bytes = _integer(values, "PROBE_BYTES", 8 * 1024 * 1024)
+        probe_bytes = _integer(values, "PROBE_BYTES", FIXED_PROBE_BYTES)
         timeout = _integer(values, "PROBE_TIMEOUT_SECONDS", 20)
         if minimum < 3:
             raise ValueError("MIN_HEALTHY_SOURCES must be at least 3")
@@ -119,8 +123,8 @@ class PublisherConfig:
             raise ValueError("MAX_HEALTHY_SOURCES must be between the minimum and 100")
         if not 1 <= concurrency <= 8:
             raise ValueError("PROBE_CONCURRENCY must be between 1 and 8")
-        if not 2 * 1024 * 1024 <= probe_bytes <= 16 * 1024 * 1024:
-            raise ValueError("PROBE_BYTES must be between 2 MiB and 16 MiB")
+        if probe_bytes != FIXED_PROBE_BYTES:
+            raise ValueError("PROBE_BYTES is fixed at 8388608")
         if not 1 <= timeout <= 25:
             raise ValueError("PROBE_TIMEOUT_SECONDS must be between 1 and 25")
 
@@ -140,7 +144,7 @@ class PublisherConfig:
             probe_timeout_seconds=timeout,
             candidates_path=Path(values.get("CANDIDATES_PATH", "/config/candidates.json")),
             state_dir=Path(values.get("STATE_DIR", "/state")),
-            secret_dir=Path(values.get("SECRETS_DIR", "/run/secrets")),
+            secret_dir=SECRET_DIR,
             manifestctl_path=values.get("MANIFESTCTL_PATH", "/usr/local/bin/manifestctl"),
             ossutil_path=values.get("OSSUTIL_PATH", "/usr/local/bin/ossutil"),
             log_level=values.get("LOG_LEVEL", "INFO").upper(),

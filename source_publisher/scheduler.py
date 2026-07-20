@@ -21,9 +21,14 @@ def next_due(now: datetime, publish_time: time, last_success: datetime | None) -
     if now.tzinfo is None:
         raise ValueError("scheduler clock must be timezone-aware")
     today_due = datetime.combine(now.date(), publish_time, tzinfo=now.tzinfo)
-    succeeded_today = last_success is not None and last_success.astimezone(now.tzinfo).date() == now.date()
+    local_success_date = (
+        last_success.astimezone(now.tzinfo).date() if last_success is not None else None
+    )
+    succeeded_today = local_success_date == now.date()
     if succeeded_today:
         return datetime.combine(now.date() + timedelta(days=1), publish_time, tzinfo=now.tzinfo)
+    if local_success_date is not None and local_success_date < now.date():
+        return now
     if now >= today_due:
         return now
     return today_due
