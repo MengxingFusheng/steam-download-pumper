@@ -4,6 +4,7 @@ import json
 import os
 import tempfile
 import threading
+import time
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -22,6 +23,20 @@ class InsufficientSources(RuntimeError):
 
 class PublicationInterrupted(RuntimeError):
     pass
+
+
+class PublicationDeadline(RuntimeError):
+    pass
+
+
+PUBLICATION_TIMEOUT_SECONDS = 30 * 60
+
+
+def _ensure_active(cancel_event: threading.Event, deadline: float) -> None:
+    if cancel_event.is_set():
+        raise PublicationInterrupted("publication interrupted")
+    if time.monotonic() >= deadline:
+        raise PublicationDeadline("publication deadline exceeded")
 
 
 @dataclass(frozen=True)
@@ -100,10 +115,21 @@ class PublicationService:
         *,
         validate_only: bool = False,
         cancel_event: threading.Event | None = None,
+        deadline: float | None = None,
     ) -> PublicationResult:
         cancellation = cancel_event or threading.Event()
+        absolute_deadline = (
+            deadline
+            if deadline is not None
+            else time.monotonic() + PUBLICATION_TIMEOUT_SECONDS
+        )
+        _ensure_active(cancellation, absolute_deadline)
         state_path = self.config.state_dir / "state.json"
         previous = read_state(state_path)
+        try:
+            previous_revision = int(previous.get("last_revision", 0))
+        except (TypeError, ValueError) as exc:
+            raise ValueError("publisher state revision is invalid") from exc
         client: OSSClient | None = None
         private_key_path: Path | None = None
         recovered: PublicationResult | None = None
@@ -112,8 +138,10 @@ class PublicationService:
                 raise ValueError("publisher secrets are required")
             client = self.oss_client or OSSClient(self.config, self.secrets)
             private_key_path = self.config.secret_dir / "source_signing_private_key"
-            recovered = self._recover_remote_commit(client, private_key_path)
-            if recovered is not None:
+            recovered = self._recover_remote_commit(
+                client, private_key_path, absolute_deadline, cancellation
+            )
+            if recovered is not None and recovered.revision >= previous_revision:
                 remote_generated = datetime.fromisoformat(
                     json.loads(recovered.payload)["generated_at"]
                 )
@@ -124,21 +152,18 @@ class PublicationService:
                     return recovered
 
         urls = load_candidates(self.config.candidates_path)
+        probe_deadline = min(absolute_deadline, time.monotonic() + 25.0)
         results = self.probe_fn(
             urls,
             timeout=self.config.probe_timeout_seconds,
             concurrency=self.config.probe_concurrency,
             cancel_event=cancellation,
+            deadline=probe_deadline,
         )
-        if cancellation.is_set():
-            raise PublicationInterrupted("publication interrupted")
+        _ensure_active(cancellation, absolute_deadline)
         healthy = [result for result in results if result.success]
         if len(healthy) < self.config.min_healthy_sources:
             raise InsufficientSources("fewer than the required healthy sources")
-        try:
-            previous_revision = int(previous.get("last_revision", 0))
-        except (TypeError, ValueError) as exc:
-            raise ValueError("publisher state revision is invalid") from exc
         if recovered is not None:
             previous_revision = max(previous_revision, recovered.revision)
         payload, revision = build_payload(
@@ -152,10 +177,21 @@ class PublicationService:
         assert private_key_path is not None
         assert client is not None
         envelope = self.sign_fn(
-            payload, private_key_path, self.config.key_id, self.config.manifestctl_path
+            payload,
+            private_key_path,
+            self.config.key_id,
+            self.config.manifestctl_path,
+            deadline=absolute_deadline,
+            cancel_event=cancellation,
         )
+        _ensure_active(cancellation, absolute_deadline)
         if self.verify_fn(
-            envelope, private_key_path, self.config.key_id, self.config.manifestctl_path
+            envelope,
+            private_key_path,
+            self.config.key_id,
+            self.config.manifestctl_path,
+            deadline=absolute_deadline,
+            cancel_event=cancellation,
         ) != payload:
             raise OSSFailure("local manifest verification failed")
 
@@ -165,23 +201,68 @@ class PublicationService:
         atomic_write(release_path, envelope)
         atomic_write(latest_path, envelope)
         relative_release = f"releases/{revision}.json"
+        _ensure_active(cancellation, absolute_deadline)
         try:
-            existing_release = client.read_public(relative_release)
+            existing_release = client.read_public(
+                relative_release,
+                deadline=absolute_deadline,
+                cancel_event=cancellation,
+            )
         except (OSSNotFound, KeyError):
+            _ensure_active(cancellation, absolute_deadline)
             client.upload(
                 release_path,
                 f"pumper/v1/{relative_release}",
                 overwrite=False,
+                deadline=absolute_deadline,
+                cancel_event=cancellation,
             )
         else:
             self._verify_public(
-                existing_release, envelope, payload, private_key_path
+                existing_release,
+                envelope,
+                payload,
+                private_key_path,
+                absolute_deadline,
+                cancellation,
             )
-        self._verify_public(client.read_public(relative_release), envelope, payload, private_key_path)
-        client.upload(latest_path, "pumper/v1/latest.json", overwrite=True)
-        self._verify_public(client.read_public("latest.json"), envelope, payload, private_key_path)
+        _ensure_active(cancellation, absolute_deadline)
+        self._verify_public(
+            client.read_public(
+                relative_release,
+                deadline=absolute_deadline,
+                cancel_event=cancellation,
+            ),
+            envelope,
+            payload,
+            private_key_path,
+            absolute_deadline,
+            cancellation,
+        )
+        _ensure_active(cancellation, absolute_deadline)
+        client.upload(
+            latest_path,
+            "pumper/v1/latest.json",
+            overwrite=True,
+            deadline=absolute_deadline,
+            cancel_event=cancellation,
+        )
+        _ensure_active(cancellation, absolute_deadline)
+        self._verify_public(
+            client.read_public(
+                "latest.json",
+                deadline=absolute_deadline,
+                cancel_event=cancellation,
+            ),
+            envelope,
+            payload,
+            private_key_path,
+            absolute_deadline,
+            cancellation,
+        )
 
         result = PublicationResult(revision, len(healthy), payload, envelope)
+        _ensure_active(cancellation, absolute_deadline)
         self._write_success_state(state_path, now, result)
         return result
 
@@ -203,10 +284,17 @@ class PublicationService:
         )
 
     def _recover_remote_commit(
-        self, client: OSSClient, private_key_path: Path
+        self,
+        client: OSSClient,
+        private_key_path: Path,
+        deadline: float,
+        cancel_event: threading.Event,
     ) -> PublicationResult | None:
+        _ensure_active(cancel_event, deadline)
         try:
-            latest = client.read_public("latest.json")
+            latest = client.read_public(
+                "latest.json", deadline=deadline, cancel_event=cancel_event
+            )
         except (OSSNotFound, KeyError):
             return None
         payload = self.verify_fn(
@@ -214,6 +302,8 @@ class PublicationService:
             private_key_path,
             self.config.key_id,
             self.config.manifestctl_path,
+            deadline=deadline,
+            cancel_event=cancel_event,
         )
         try:
             document = json.loads(payload)
@@ -230,8 +320,20 @@ class PublicationService:
                 raise ValueError
         except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
             raise OSSFailure("remote latest payload is invalid") from exc
-        release = client.read_public(f"releases/{revision}.json")
-        self._verify_public(release, latest, payload, private_key_path)
+        _ensure_active(cancel_event, deadline)
+        release = client.read_public(
+            f"releases/{revision}.json",
+            deadline=deadline,
+            cancel_event=cancel_event,
+        )
+        self._verify_public(
+            release,
+            latest,
+            payload,
+            private_key_path,
+            deadline,
+            cancel_event,
+        )
         return PublicationResult(revision, len(sources), payload, latest)
 
     def _verify_public(
@@ -240,11 +342,19 @@ class PublicationService:
         expected_envelope: bytes,
         expected_payload: bytes,
         private_key_path: Path,
+        deadline: float,
+        cancel_event: threading.Event,
     ) -> None:
+        _ensure_active(cancel_event, deadline)
         if fetched != expected_envelope:
             raise OSSFailure("public manifest differs from uploaded manifest")
         verified = self.verify_fn(
-            fetched, private_key_path, self.config.key_id, self.config.manifestctl_path
+            fetched,
+            private_key_path,
+            self.config.key_id,
+            self.config.manifestctl_path,
+            deadline=deadline,
+            cancel_event=cancel_event,
         )
         if verified != expected_payload:
             raise OSSFailure("public manifest verification failed")

@@ -1,5 +1,7 @@
 import json
 import tempfile
+import threading
+import time
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
@@ -64,6 +66,35 @@ class PublisherManifestTests(unittest.TestCase):
                 payload,
             )
             self.assertNotIn(b"private-material", envelope)
+
+    def test_signing_subprocess_is_terminated_on_cancellation(self):
+        from source_publisher.manifest import ManifestError, sign_payload
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            private_key = root / "private.key"
+            private_key.write_text("private-material", encoding="utf-8")
+            fake = root / "manifestctl"
+            fake.write_text(
+                "#!/usr/bin/env python3\nimport time\ntime.sleep(30)\n",
+                encoding="utf-8",
+            )
+            fake.chmod(0o700)
+            cancel = threading.Event()
+            timer = threading.Timer(0.15, cancel.set)
+            timer.start()
+            started = time.monotonic()
+            with self.assertRaises(ManifestError):
+                sign_payload(
+                    b'{"schema":1}',
+                    private_key,
+                    "test-key",
+                    str(fake),
+                    cancel_event=cancel,
+                    deadline=started + 10,
+                )
+            timer.cancel()
+            self.assertLess(time.monotonic() - started, 1.5)
 
 
 if __name__ == "__main__":

@@ -27,6 +27,85 @@ Resolver = Callable[[str, int], tuple[str, ...]]
 ConnectionFactory = Callable[[str, str, str, int, float], http.client.HTTPConnection]
 
 
+@dataclass
+class _ResolverTask:
+    resolver: Resolver
+    hostname: str
+    port: int
+    outcome: queue.Queue[tuple[bool, object]]
+    cancelled: threading.Event
+
+
+class _ResolverPool:
+    def __init__(self, workers: int = MAX_WORKERS) -> None:
+        self.tasks: queue.Queue[_ResolverTask] = queue.Queue(maxsize=workers)
+        for index in range(workers):
+            threading.Thread(
+                target=self._worker,
+                name=f"publisher-dns-{index}",
+                daemon=True,
+            ).start()
+
+    def _worker(self) -> None:
+        while True:
+            task = self.tasks.get()
+            try:
+                if task.cancelled.is_set():
+                    continue
+                try:
+                    item: tuple[bool, object] = (
+                        True,
+                        tuple(task.resolver(task.hostname, task.port)),
+                    )
+                except Exception as exc:
+                    item = (False, exc)
+                if not task.cancelled.is_set():
+                    try:
+                        task.outcome.put_nowait(item)
+                    except queue.Full:
+                        pass
+            finally:
+                self.tasks.task_done()
+
+    def submit(
+        self,
+        resolver: Resolver,
+        hostname: str,
+        port: int,
+        deadline: float,
+        cancel_event: threading.Event,
+    ) -> _ResolverTask:
+        task = _ResolverTask(
+            resolver,
+            hostname,
+            port,
+            queue.Queue(maxsize=1),
+            threading.Event(),
+        )
+        while True:
+            _check_deadline(deadline, cancel_event)
+            try:
+                self.tasks.put(
+                    task,
+                    timeout=min(0.05, max(0.0, deadline - time.monotonic())),
+                )
+                return task
+            except queue.Full:
+                continue
+
+
+_resolver_pool: _ResolverPool | None = None
+_resolver_pool_lock = threading.Lock()
+
+
+def _get_resolver_pool() -> _ResolverPool:
+    global _resolver_pool
+    with _resolver_pool_lock:
+        if _resolver_pool is None:
+            _resolver_pool = _ResolverPool()
+        return _resolver_pool
+
+
 @dataclass(frozen=True)
 class ProbeResult:
     url: str
@@ -87,34 +166,22 @@ def _resolve_with_deadline(
     deadline: float,
     cancel_event: threading.Event,
 ) -> tuple[str, ...]:
-    outcome: queue.Queue[tuple[bool, object]] = queue.Queue(maxsize=1)
-
-    def resolve() -> None:
-        try:
-            value: object = tuple(resolver(hostname, port))
-            item = (True, value)
-        except Exception as exc:
-            item = (False, exc)
-        try:
-            outcome.put_nowait(item)
-        except queue.Full:
-            pass
-
-    threading.Thread(
-        target=resolve,
-        name="publisher-dns",
-        daemon=True,
-    ).start()
-    while True:
-        _check_deadline(deadline, cancel_event)
-        remaining = deadline - time.monotonic()
-        try:
-            succeeded, value = outcome.get(timeout=min(0.05, remaining))
-        except queue.Empty:
-            continue
-        if succeeded:
-            return value  # type: ignore[return-value]
-        raise value  # type: ignore[misc]
+    task = _get_resolver_pool().submit(
+        resolver, hostname, port, deadline, cancel_event
+    )
+    try:
+        while True:
+            _check_deadline(deadline, cancel_event)
+            remaining = deadline - time.monotonic()
+            try:
+                succeeded, value = task.outcome.get(timeout=min(0.05, remaining))
+            except queue.Empty:
+                continue
+            if succeeded:
+                return value  # type: ignore[return-value]
+            raise value  # type: ignore[misc]
+    finally:
+        task.cancelled.set()
 
 
 def _validated_addresses(

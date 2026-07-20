@@ -2,6 +2,8 @@ import json
 import http.client
 import os
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -69,7 +71,66 @@ class PublisherOSSTests(unittest.TestCase):
                 "pumper/v1/releases/20260720031700.json",
                 overwrite=False,
             )
-            self.assertNotIn("--force", json.loads(capture.read_text(encoding="utf-8")))
+            argv = json.loads(capture.read_text(encoding="utf-8"))
+            self.assertNotIn("--force", argv)
+            self.assertIn("--forbid-overwrite", argv)
+            self.assertEqual(argv[argv.index("--forbid-overwrite") + 1], "true")
+
+    def test_upload_subprocess_is_terminated_on_cancellation(self):
+        from source_publisher.config import PublisherConfig, PublisherSecrets
+        from source_publisher.oss import OSSClient, OSSFailure
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            fake = root / "ossutil"
+            fake.write_text(
+                "#!/usr/bin/env python3\n"
+                "import os,time\n"
+                "open(os.path.join(os.path.dirname(__file__),'pid'),'w').write(str(os.getpid()))\n"
+                "time.sleep(30)\n",
+                encoding="utf-8",
+            )
+            fake.chmod(0o700)
+            source = root / "release.json"
+            source.write_text("{}", encoding="utf-8")
+            config = PublisherConfig.from_env({**BASE_ENV, "OSSUTIL_PATH": str(fake)})
+            cancel = threading.Event()
+            timer = threading.Timer(0.15, cancel.set)
+            timer.start()
+            started = time.monotonic()
+            with self.assertRaises(OSSFailure):
+                OSSClient(config, PublisherSecrets("private", "id", "secret")).upload(
+                    source,
+                    "pumper/v1/releases/20260720031700.json",
+                    overwrite=False,
+                    cancel_event=cancel,
+                    deadline=started + 10,
+                )
+            timer.cancel()
+            self.assertLess(time.monotonic() - started, 1.5)
+
+    def test_public_read_forwards_publication_deadline_and_cancellation(self):
+        from source_publisher.config import PublisherConfig, PublisherSecrets
+        from source_publisher.oss import OSSClient
+
+        calls = []
+        cancel = threading.Event()
+
+        def request(_url, **kwargs):
+            calls.append(kwargs)
+            return SimpleNamespace(status=200, headers={}, body=b"{}")
+
+        config = PublisherConfig.from_env(BASE_ENV)
+        deadline = time.monotonic() + 10
+        client = OSSClient(
+            config,
+            PublisherSecrets("private", "id", "secret"),
+            resolver=lambda *_args: ("93.184.216.34",),
+            request_fn=request,
+        )
+        client.read_public("latest.json", deadline=deadline, cancel_event=cancel)
+        self.assertIs(calls[0]["cancel_event"], cancel)
+        self.assertEqual(calls[0]["deadline"], deadline)
 
     def test_public_read_requires_https_and_is_bounded(self):
         from source_publisher.config import PublisherConfig, PublisherSecrets

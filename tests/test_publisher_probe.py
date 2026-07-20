@@ -208,6 +208,7 @@ class PublisherProbeTests(unittest.TestCase):
 
         started = time.monotonic()
         result = probe_source(self.url, resolver=resolver, deadline=started + 0.2)
+        blocked.set()
         self.assertFalse(result.success)
         self.assertLess(time.monotonic() - started, 1.0)
 
@@ -261,6 +262,30 @@ class PublisherProbeTests(unittest.TestCase):
         self.assertEqual(len(results), 12)
         self.assertFalse(any(result.success for result in results))
         self.assertLess(time.monotonic() - started, 1.0)
+
+    def test_repeated_blocking_dns_uses_a_fixed_bounded_worker_pool(self):
+        from source_publisher.probe import probe_source
+
+        release = threading.Event()
+
+        def resolver(_host, _port):
+            release.wait(10)
+            return ("93.184.216.34",)
+
+        baseline = sum(
+            thread.name.startswith("publisher-dns") for thread in threading.enumerate()
+        )
+        for _ in range(20):
+            probe_source(
+                self.url,
+                resolver=resolver,
+                deadline=time.monotonic() + 0.01,
+            )
+        dns_threads = sum(
+            thread.name.startswith("publisher-dns") for thread in threading.enumerate()
+        )
+        release.set()
+        self.assertLessEqual(dns_threads - baseline, 4)
 
     def test_probe_pool_never_exceeds_four_workers(self):
         from source_publisher.probe import ProbeResult, probe_candidates

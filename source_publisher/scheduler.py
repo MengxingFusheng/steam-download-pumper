@@ -184,22 +184,23 @@ def run_scheduler(
         try:
             service.run(now, cancel_event=stop_event)
         except Exception:
-            failures += 1
-            failed_at = clock()
-            due = failed_at + timedelta(
-                seconds=retry_delay(failures, config.retry_seconds)
-            )
-            _write_state(state_path, {
-                "last_attempt_at": failed_at.isoformat(timespec="seconds"),
-                "last_error": "publication failed",
-                "consecutive_failures": failures,
-                "next_retry_at": due.isoformat(timespec="seconds"),
-            })
-            _log_event(
-                "publication_failed",
-                consecutive_failures=failures,
-                next_retry_at=due.isoformat(timespec="seconds"),
-            )
+            if not stop_event.is_set():
+                failures += 1
+                failed_at = clock()
+                due = failed_at + timedelta(
+                    seconds=retry_delay(failures, config.retry_seconds)
+                )
+                _write_state(state_path, {
+                    "last_attempt_at": failed_at.isoformat(timespec="seconds"),
+                    "last_error": "publication failed",
+                    "consecutive_failures": failures,
+                    "next_retry_at": due.isoformat(timespec="seconds"),
+                })
+                _log_event(
+                    "publication_failed",
+                    consecutive_failures=failures,
+                    next_retry_at=due.isoformat(timespec="seconds"),
+                )
         else:
             failures = 0
             last_success = clock()

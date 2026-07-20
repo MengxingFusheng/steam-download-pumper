@@ -16,22 +16,25 @@ class _FakeOSS:
         self.events = []
         self.objects = {}
         self.fail_read = fail_read
+        self.io_options = []
 
-    def upload(self, path, object_key, *, overwrite=True):
+    def upload(self, path, object_key, *, overwrite=True, **kwargs):
+        self.io_options.append(kwargs)
         relative = object_key.removeprefix("pumper/v1/")
         self.events.append(("upload", object_key, overwrite))
         if not overwrite and relative in self.objects:
             raise RuntimeError("immutable object already exists")
         self.objects[relative] = Path(path).read_bytes()
 
-    def read_public(self, relative_key):
+    def read_public(self, relative_key, **kwargs):
+        self.io_options.append(kwargs)
         self.events.append(("read", relative_key))
         if relative_key == self.fail_read:
             raise RuntimeError("public read failed")
         return self.objects[relative_key]
 
 
-def _envelope(payload, _path, key_id, _tool):
+def _envelope(payload, _path, key_id, _tool, **_kwargs):
     return json.dumps({
         "key_id": key_id,
         "algorithm": "Ed25519",
@@ -40,7 +43,7 @@ def _envelope(payload, _path, key_id, _tool):
     }, separators=(",", ":")).encode()
 
 
-def _verify(envelope, _path, _key_id, _tool):
+def _verify(envelope, _path, _key_id, _tool, **_kwargs):
     return base64.b64decode(json.loads(envelope)["payload"])
 
 
@@ -207,6 +210,79 @@ class PublisherServiceTests(unittest.TestCase):
             with patch("source_publisher.service.os.fsync", side_effect=record):
                 atomic_write(path, b'{}')
             self.assertEqual(len(calls), 2)
+
+    def test_remote_recovery_never_rolls_back_local_revision(self):
+        from source_publisher.config import PublisherSecrets
+        from source_publisher.probe import ProbeResult
+        from source_publisher.service import PublicationService
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = self._config(root)
+            now = datetime(2026, 7, 20, 3, 17, tzinfo=ZoneInfo("Asia/Shanghai"))
+            probes = lambda urls, **_kwargs: [
+                ProbeResult(url, now, 100.0, 4_194_304, True, "") for url in urls
+            ]
+            oss = _FakeOSS()
+            service = PublicationService(
+                config,
+                PublisherSecrets("private", "id", "secret"),
+                oss_client=oss,
+                probe_fn=probes,
+                sign_fn=_envelope,
+                verify_fn=_verify,
+            )
+            remote = service.run(now)
+            local_revision = remote.revision + 100
+            state_path = config.state_dir / "state.json"
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            state["last_revision"] = local_revision
+            state_path.write_text(json.dumps(state), encoding="utf-8")
+
+            result = service.run(now)
+            self.assertGreater(result.revision, local_revision)
+
+    def test_publication_propagates_one_deadline_and_cancel_token_to_all_io(self):
+        import threading
+        import time
+
+        from source_publisher.config import PublisherSecrets
+        from source_publisher.probe import ProbeResult
+        from source_publisher.service import PublicationService
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = self._config(root)
+            now = datetime(2026, 7, 20, 3, 17, tzinfo=ZoneInfo("Asia/Shanghai"))
+            cancel = threading.Event()
+            deadline = time.monotonic() + 10
+            observed = []
+
+            def probes(urls, **kwargs):
+                observed.append(kwargs)
+                return [ProbeResult(url, now, 100.0, 4_194_304, True, "") for url in urls]
+
+            def sign(payload, path, key_id, tool, **kwargs):
+                observed.append(kwargs)
+                return _envelope(payload, path, key_id, tool)
+
+            def verify(envelope, path, key_id, tool, **kwargs):
+                observed.append(kwargs)
+                return _verify(envelope, path, key_id, tool)
+
+            oss = _FakeOSS()
+            PublicationService(
+                config,
+                PublisherSecrets("private", "id", "secret"),
+                oss_client=oss,
+                probe_fn=probes,
+                sign_fn=sign,
+                verify_fn=verify,
+            ).run(now, cancel_event=cancel, deadline=deadline)
+            for options in observed + oss.io_options:
+                self.assertIs(options["cancel_event"], cancel)
+                self.assertLessEqual(options["deadline"], deadline)
+
 
 
 if __name__ == "__main__":

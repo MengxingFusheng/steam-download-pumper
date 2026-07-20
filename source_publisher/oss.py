@@ -4,13 +4,14 @@ import http.client
 import os
 import re
 import subprocess
+import threading
 from pathlib import Path
 from typing import Callable
 from urllib.parse import urlsplit
 
 from .candidates import resolve_public_ipv4
 from .config import PublisherConfig, PublisherSecrets
-from .manifest import MAX_MANIFEST_BYTES
+from .manifest import MAX_MANIFEST_BYTES, _run_cancellable
 from .probe import PinnedResponse, Resolver, pinned_request
 
 
@@ -49,7 +50,15 @@ class OSSClient:
             "OSS_ENDPOINT": self.config.endpoint,
         }
 
-    def upload(self, source: Path, object_key: str, *, overwrite: bool = True) -> None:
+    def upload(
+        self,
+        source: Path,
+        object_key: str,
+        *,
+        overwrite: bool = True,
+        deadline: float | None = None,
+        cancel_event: threading.Event | None = None,
+    ) -> None:
         if not object_key.startswith("pumper/v1/") or ".." in object_key:
             raise OSSFailure("OSS object key is invalid")
         command = [
@@ -60,25 +69,36 @@ class OSSClient:
         ]
         if overwrite:
             command.append("--force")
+        else:
+            command.extend(("--forbid-overwrite", "true"))
         try:
-            completed = subprocess.run(
+            returncode, _output = _run_cancellable(
                 command,
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                env=self._environment(),
+                input_data=None,
+                environment=self._environment(),
                 timeout=120,
-                check=False,
+                deadline=deadline,
+                cancel_event=cancel_event,
             )
-        except (OSError, subprocess.TimeoutExpired) as exc:
+        except (OSError, TimeoutError, InterruptedError, subprocess.SubprocessError) as exc:
             raise OSSFailure("OSS upload failed") from exc
-        if completed.returncode != 0:
+        if returncode != 0:
             raise OSSFailure("OSS upload failed")
 
-    def read_public(self, relative_key: str) -> bytes:
+    def read_public(
+        self,
+        relative_key: str,
+        *,
+        deadline: float | None = None,
+        cancel_event: threading.Event | None = None,
+    ) -> bytes:
         if relative_key != "latest.json" and RELEASE_KEY_RE.fullmatch(relative_key) is None:
             raise OSSFailure("public object key is invalid")
-        return self.read_url(f"{self.config.public_base_url}/{relative_key}")
+        return self.read_url(
+            f"{self.config.public_base_url}/{relative_key}",
+            deadline=deadline,
+            cancel_event=cancel_event,
+        )
 
     @staticmethod
     def _origin(parsed) -> tuple[str, str, int]:  # type: ignore[no-untyped-def]
@@ -106,7 +126,13 @@ class OSSClient:
         ):
             raise OSSFailure("public verification path is invalid")
 
-    def read_url(self, url: str) -> bytes:
+    def read_url(
+        self,
+        url: str,
+        *,
+        deadline: float | None = None,
+        cancel_event: threading.Event | None = None,
+    ) -> bytes:
         self._validate_public_url(url)
         try:
             response = self.request_fn(
@@ -118,6 +144,8 @@ class OSSClient:
                 max_bytes=MAX_MANIFEST_BYTES + 1,
                 timeout=20,
                 resolver=self.resolver,
+                deadline=deadline,
+                cancel_event=cancel_event,
             )
         except (OSError, ValueError, http.client.HTTPException) as exc:
             raise OSSFailure("public verification failed") from exc

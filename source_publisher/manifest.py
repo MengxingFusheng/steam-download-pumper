@@ -5,6 +5,9 @@ import json
 import math
 import os
 import subprocess
+import tempfile
+import threading
+import time
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Iterable
@@ -69,6 +72,60 @@ def _child_environment() -> dict[str, str]:
     return {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "LANG": "C.UTF-8"}
 
 
+def _terminate_process(process: subprocess.Popen[bytes]) -> None:
+    process.terminate()
+    try:
+        process.wait(timeout=0.5)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait(timeout=0.5)
+
+
+def _run_cancellable(
+    command: list[str],
+    *,
+    input_data: bytes | None,
+    environment: dict[str, str],
+    timeout: float,
+    deadline: float | None = None,
+    cancel_event: threading.Event | None = None,
+) -> tuple[int, bytes]:
+    cancellation = cancel_event or threading.Event()
+    timeout_deadline = time.monotonic() + timeout
+    absolute_deadline = (
+        min(deadline, timeout_deadline) if deadline is not None else timeout_deadline
+    )
+    if cancellation.is_set():
+        raise InterruptedError("subprocess interrupted")
+    if time.monotonic() >= absolute_deadline:
+        raise TimeoutError("subprocess deadline exceeded")
+    with tempfile.TemporaryFile() as input_file, tempfile.TemporaryFile() as output_file:
+        if input_data is not None:
+            input_file.write(input_data)
+            input_file.seek(0)
+            child_input = input_file
+        else:
+            child_input = subprocess.DEVNULL
+        process = subprocess.Popen(
+            command,
+            stdin=child_input,
+            stdout=output_file,
+            stderr=subprocess.DEVNULL,
+            env=environment,
+        )
+        while process.poll() is None:
+            if cancellation.is_set():
+                _terminate_process(process)
+                raise InterruptedError("subprocess interrupted")
+            remaining = absolute_deadline - time.monotonic()
+            if remaining <= 0:
+                _terminate_process(process)
+                raise TimeoutError("subprocess deadline exceeded")
+            time.sleep(min(0.05, remaining))
+        output_file.seek(0)
+        return process.returncode, output_file.read(MAX_MANIFEST_BYTES + 1)
+
+
 def _parse_envelope(envelope: bytes, expected_key_id: str) -> None:
     if not envelope or len(envelope) > MAX_MANIFEST_BYTES:
         raise ManifestError("manifest envelope is empty or too large")
@@ -89,7 +146,13 @@ def _parse_envelope(envelope: bytes, expected_key_id: str) -> None:
 
 
 def sign_payload(
-    payload: bytes, private_key_path: Path, key_id: str, manifestctl_path: str
+    payload: bytes,
+    private_key_path: Path,
+    key_id: str,
+    manifestctl_path: str,
+    *,
+    deadline: float | None = None,
+    cancel_event: threading.Event | None = None,
 ) -> bytes:
     command = [
         manifestctl_path,
@@ -100,26 +163,31 @@ def sign_payload(
         key_id,
     ]
     try:
-        completed = subprocess.run(
+        returncode, output = _run_cancellable(
             command,
-            input=payload,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            env=_child_environment(),
+            input_data=payload,
+            environment=_child_environment(),
             timeout=10,
-            check=False,
+            deadline=deadline,
+            cancel_event=cancel_event,
         )
-    except (OSError, subprocess.TimeoutExpired) as exc:
+    except (OSError, TimeoutError, InterruptedError, subprocess.SubprocessError) as exc:
         raise ManifestError("manifest signing failed") from exc
-    envelope = completed.stdout.strip()
-    if completed.returncode != 0:
+    envelope = output.strip()
+    if returncode != 0:
         raise ManifestError("manifest signing failed")
     _parse_envelope(envelope, key_id)
     return envelope
 
 
 def verify_envelope(
-    envelope: bytes, public_key_base64: str, key_id: str, manifestctl_path: str
+    envelope: bytes,
+    public_key_base64: str,
+    key_id: str,
+    manifestctl_path: str,
+    *,
+    deadline: float | None = None,
+    cancel_event: threading.Event | None = None,
 ) -> bytes:
     command = [
         manifestctl_path,
@@ -133,24 +201,29 @@ def verify_envelope(
     ]
     _parse_envelope(envelope, key_id)
     try:
-        completed = subprocess.run(
+        returncode, output = _run_cancellable(
             command,
-            input=envelope,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            env=_child_environment(),
+            input_data=envelope,
+            environment=_child_environment(),
             timeout=10,
-            check=False,
+            deadline=deadline,
+            cancel_event=cancel_event,
         )
-    except (OSError, subprocess.TimeoutExpired) as exc:
+    except (OSError, TimeoutError, InterruptedError, subprocess.SubprocessError) as exc:
         raise ManifestError("manifest verification failed") from exc
-    if completed.returncode != 0 or len(completed.stdout) > MAX_MANIFEST_BYTES:
+    if returncode != 0 or len(output) > MAX_MANIFEST_BYTES:
         raise ManifestError("manifest verification failed")
-    return completed.stdout
+    return output
 
 
 def verify_envelope_with_private_key(
-    envelope: bytes, private_key_path: Path, key_id: str, manifestctl_path: str
+    envelope: bytes,
+    private_key_path: Path,
+    key_id: str,
+    manifestctl_path: str,
+    *,
+    deadline: float | None = None,
+    cancel_event: threading.Event | None = None,
 ) -> bytes:
     command = [
         manifestctl_path,
@@ -164,17 +237,16 @@ def verify_envelope_with_private_key(
     ]
     _parse_envelope(envelope, key_id)
     try:
-        completed = subprocess.run(
+        returncode, output = _run_cancellable(
             command,
-            input=envelope,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            env=_child_environment(),
+            input_data=envelope,
+            environment=_child_environment(),
             timeout=10,
-            check=False,
+            deadline=deadline,
+            cancel_event=cancel_event,
         )
-    except (OSError, subprocess.TimeoutExpired) as exc:
+    except (OSError, TimeoutError, InterruptedError, subprocess.SubprocessError) as exc:
         raise ManifestError("manifest verification failed") from exc
-    if completed.returncode != 0 or len(completed.stdout) > MAX_MANIFEST_BYTES:
+    if returncode != 0 or len(output) > MAX_MANIFEST_BYTES:
         raise ManifestError("manifest verification failed")
-    return completed.stdout
+    return output

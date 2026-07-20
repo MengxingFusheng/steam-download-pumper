@@ -185,12 +185,21 @@ class PublisherSchedulerTests(unittest.TestCase):
 
             class FailingService:
                 def run(self, _now, **_kwargs):
-                    stop.set()
                     raise RuntimeError("SENSITIVE FAILURE DETAIL")
+
+            def stop_after_failure(_event, _seconds):
+                stop.set()
+                return True
 
             stderr = io.StringIO()
             with contextlib.redirect_stderr(stderr):
-                run_scheduler(config, FailingService(), stop, now_fn=lambda: failed_at)
+                run_scheduler(
+                    config,
+                    FailingService(),
+                    stop,
+                    now_fn=lambda: failed_at,
+                    sleep_fn=stop_after_failure,
+                )
             state_path = root / "state.json"
             state = json.loads(state_path.read_text(encoding="utf-8"))
             self.assertEqual(state["last_error"], "publication failed")
@@ -219,6 +228,37 @@ class PublisherSchedulerTests(unittest.TestCase):
                 sleep_fn=stop_sleep,
             )
             self.assertEqual(calls, [])
+
+    def test_normal_cancellation_does_not_record_failure_or_backoff(self):
+        from source_publisher.service import PublicationInterrupted
+        from source_publisher.scheduler import run_scheduler
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            now = datetime(2026, 7, 20, 4, 0, tzinfo=SHANGHAI)
+            config = self._config(root, now)
+            root.mkdir(parents=True, exist_ok=True)
+            state_path = root / "state.json"
+            original = {
+                "last_success_at": (now - timedelta(hours=1)).isoformat(),
+                "last_revision": 20260720030000,
+                "last_source_count": 3,
+                "last_error": "",
+                "consecutive_failures": 0,
+                "next_retry_at": "",
+            }
+            state_path.write_text(json.dumps(original), encoding="utf-8")
+            stop = threading.Event()
+
+            class CancelledService:
+                def run(self, _now, **_kwargs):
+                    stop.set()
+                    raise PublicationInterrupted("publication interrupted")
+
+            run_scheduler(config, CancelledService(), stop, now_fn=lambda: now)
+            self.assertEqual(
+                json.loads(state_path.read_text(encoding="utf-8")), original
+            )
 
     def test_scheduler_clears_persisted_failure_after_retry_success(self):
         from source_publisher.scheduler import run_scheduler
