@@ -12,25 +12,50 @@ SHANGHAI = ZoneInfo("Asia/Shanghai")
 
 
 class PublisherSchedulerTests(unittest.TestCase):
-    def test_due_is_immediate_after_missed_run_and_tomorrow_after_success(self):
-        from source_publisher.scheduler import next_due
-
-        now = datetime(2026, 7, 20, 4, 0, tzinfo=SHANGHAI)
-        self.assertEqual(next_due(now, wall_time(3, 17), None), now)
-        success = datetime(2026, 7, 20, 3, 18, tzinfo=SHANGHAI)
-        self.assertEqual(
-            next_due(now, wall_time(3, 17), success),
-            datetime(2026, 7, 21, 3, 17, tzinfo=SHANGHAI),
-        )
-        before = datetime(2026, 12, 31, 2, 0, tzinfo=SHANGHAI)
-        self.assertEqual(next_due(before, wall_time(3, 17), None).date(), before.date())
-
-    def test_previous_day_success_is_overdue_even_before_today_publish_time(self):
+    def test_before_publish_time_waits_when_yesterdays_run_succeeded(self):
         from source_publisher.scheduler import next_due
 
         now = datetime(2026, 7, 20, 2, 0, tzinfo=SHANGHAI)
         yesterday = datetime(2026, 7, 19, 3, 18, tzinfo=SHANGHAI)
+        self.assertEqual(
+            next_due(now, wall_time(3, 17), yesterday),
+            datetime(2026, 7, 20, 3, 17, tzinfo=SHANGHAI),
+        )
+
+    def test_after_publish_time_runs_immediately_unless_today_succeeded(self):
+        from source_publisher.scheduler import next_due
+
+        now = datetime(2026, 7, 20, 4, 0, tzinfo=SHANGHAI)
+        yesterday = datetime(2026, 7, 19, 3, 18, tzinfo=SHANGHAI)
         self.assertEqual(next_due(now, wall_time(3, 17), yesterday), now)
+        today = datetime(2026, 7, 20, 3, 18, tzinfo=SHANGHAI)
+        self.assertEqual(
+            next_due(now, wall_time(3, 17), today),
+            datetime(2026, 7, 21, 3, 17, tzinfo=SHANGHAI),
+        )
+
+    def test_never_succeeded_waits_before_publish_time_and_runs_after(self):
+        from source_publisher.scheduler import next_due
+
+        before = datetime(2026, 7, 20, 2, 0, tzinfo=SHANGHAI)
+        after = datetime(2026, 7, 20, 4, 0, tzinfo=SHANGHAI)
+        self.assertEqual(
+            next_due(before, wall_time(3, 17), None),
+            datetime(2026, 7, 20, 3, 17, tzinfo=SHANGHAI),
+        )
+        self.assertEqual(next_due(after, wall_time(3, 17), None), after)
+
+    def test_recent_due_comparison_handles_year_boundary(self):
+        from source_publisher.scheduler import next_due
+
+        now = datetime(2027, 1, 1, 2, 0, tzinfo=SHANGHAI)
+        covered = datetime(2026, 12, 31, 3, 18, tzinfo=SHANGHAI)
+        stale = datetime(2026, 12, 30, 3, 18, tzinfo=SHANGHAI)
+        self.assertEqual(
+            next_due(now, wall_time(3, 17), covered),
+            datetime(2027, 1, 1, 3, 17, tzinfo=SHANGHAI),
+        )
+        self.assertEqual(next_due(now, wall_time(3, 17), stale), now)
 
     def test_retry_schedule_is_capped(self):
         from source_publisher.scheduler import retry_delay

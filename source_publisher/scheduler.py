@@ -21,17 +21,21 @@ def next_due(now: datetime, publish_time: time, last_success: datetime | None) -
     if now.tzinfo is None:
         raise ValueError("scheduler clock must be timezone-aware")
     today_due = datetime.combine(now.date(), publish_time, tzinfo=now.tzinfo)
-    local_success_date = (
-        last_success.astimezone(now.tzinfo).date() if last_success is not None else None
-    )
-    succeeded_today = local_success_date == now.date()
-    if succeeded_today:
-        return datetime.combine(now.date() + timedelta(days=1), publish_time, tzinfo=now.tzinfo)
-    if local_success_date is not None and local_success_date < now.date():
+    if now < today_due:
+        most_recent_due = datetime.combine(
+            now.date() - timedelta(days=1), publish_time, tzinfo=now.tzinfo
+        )
+        next_scheduled = today_due
+    else:
+        most_recent_due = today_due
+        next_scheduled = datetime.combine(
+            now.date() + timedelta(days=1), publish_time, tzinfo=now.tzinfo
+        )
+    if last_success is None:
+        return next_scheduled if now < today_due else now
+    if last_success.astimezone(now.tzinfo) < most_recent_due:
         return now
-    if now >= today_due:
-        return now
-    return today_due
+    return next_scheduled
 
 
 def retry_delay(failure_count: int, delays: tuple[int, int, int]) -> int:
