@@ -338,6 +338,30 @@ class RemoteSourceManagerTests(unittest.TestCase):
         self.assertEqual(target.read_bytes(), b"{}")
         self.assertEqual(len(fsynced), 2)
 
+    def test_atomic_write_fsyncs_directory_only_after_replace(self):
+        from steam_pumper.remote_sources import RemoteSourceManager
+
+        target = self.data_dir / "ordered" / "state.json"
+        events = []
+        real_replace = __import__("os").replace
+        real_fsync = __import__("os").fsync
+
+        def record_replace(source, destination):
+            events.append("replace")
+            return real_replace(source, destination)
+
+        def record_fsync(descriptor):
+            events.append("fsync")
+            return real_fsync(descriptor)
+
+        with (
+            patch("steam_pumper.remote_sources.os.replace", side_effect=record_replace),
+            patch("steam_pumper.remote_sources.os.fsync", side_effect=record_fsync),
+        ):
+            RemoteSourceManager._atomic_write(target, b"{}")
+
+        self.assertEqual(events, ["fsync", "replace", "fsync"])
+
     def test_lkg_load_does_not_require_dns_but_refresh_data_plane_will_validate(self):
         envelope = signed_envelope(manifest_payload())
         manager = self.manager([envelope])

@@ -267,6 +267,36 @@ class ControllerTests(unittest.TestCase):
         self.assertEqual(second.call_count, 2)
         self.assertEqual(controller.effective_source_pool, remote.initial)
 
+    def test_source_file_write_failure_remains_pending_and_retries(self):
+        remote = FakeRemoteSourceManager(["https://old.test/file"])
+        refresher = FakeRemoteSourceRefresher()
+        refresher.result = (
+            True,
+            ["https://new.test/file"],
+            SourceListSnapshot(status="ok", revision=20260721031700, source_count=1),
+        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            controller = PumperController(
+                "multi_ip",
+                Path(tmpdir) / "config.json",
+                env={"SOURCES_RUNTIME_DIR": tmpdir},
+                remote_source_manager=remote,
+                remote_source_refresher=refresher,
+            )
+            engine = controller.line_runtimes["line-1"].engine
+            with (
+                patch.object(engine, "stage_sources", side_effect=[OSError("disk full"), True]) as stage,
+                patch.object(engine, "source_generation_confirmed", return_value=False),
+            ):
+                controller.tick(monotonic_now=100, wall_time=datetime(2026, 7, 21, 4, 0))
+                first_status = controller.source_list_status()
+                controller.tick(monotonic_now=105, wall_time=datetime(2026, 7, 21, 4, 0, 5))
+
+        self.assertEqual(first_status["apply_state"], "pending")
+        self.assertIn("disk full", first_status["apply_error"])
+        self.assertEqual(stage.call_count, 2)
+        self.assertEqual(controller.effective_source_pool, remote.initial)
+
     def test_remote_pool_keeps_web_source_pool_as_fallback_only(self):
         remote = FakeRemoteSourceManager(["https://remote.test/file"])
         with tempfile.TemporaryDirectory() as tmpdir:

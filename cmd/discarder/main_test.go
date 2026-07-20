@@ -395,7 +395,10 @@ func TestRemovedSourceLateResultCannotPolluteReaddedURL(t *testing.T) {
 	if oldEpoch == newEpoch {
 		t.Fatalf("readded URL retained epoch %d", oldEpoch)
 	}
-	health.failedCurrent(url, oldEpoch, time.Now(), "late timeout", false)
+	_, recorded := health.failedCurrent(url, oldEpoch, time.Now(), "late timeout", false)
+	if recorded {
+		t.Fatal("late failure from removed generation was reportable")
+	}
 	if got := health.snapshot(url, time.Now()).ConsecutiveFailures; got != 0 {
 		t.Fatalf("late failure polluted readded URL: %d", got)
 	}

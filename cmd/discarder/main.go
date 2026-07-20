@@ -253,13 +253,19 @@ func (health *sourceHealth) failed(url string, now time.Time, lastError string, 
 	return health.failedLocked(url, now, lastError, wasProbe)
 }
 
-func (health *sourceHealth) failedCurrent(url string, epoch uint64, now time.Time, lastError string, wasProbe bool) sourceSnapshot {
+func (health *sourceHealth) failedCurrent(
+	url string,
+	epoch uint64,
+	now time.Time,
+	lastError string,
+	wasProbe bool,
+) (sourceSnapshot, bool) {
 	health.mu.Lock()
 	defer health.mu.Unlock()
 	if health.activeEpoch == nil || epoch == 0 || health.activeEpoch[url] != epoch {
-		return sourceSnapshot{State: "healthy"}
+		return sourceSnapshot{State: "healthy"}, false
 	}
-	return health.failedLocked(url, now, lastError, wasProbe)
+	return health.failedLocked(url, now, lastError, wasProbe), true
 }
 
 func (health *sourceHealth) failedLocked(url string, now time.Time, lastError string, wasProbe bool) sourceSnapshot {
@@ -707,7 +713,12 @@ func runWorker(
 				}
 				return nil
 			}
-			snapshot := health.failedCurrent(url, sourceEpoch, time.Now(), err.Error(), probe)
+			snapshot, recorded := health.failedCurrent(
+				url, sourceEpoch, time.Now(), err.Error(), probe,
+			)
+			if !recorded {
+				continue
+			}
 			sink.emit(sourceStatusEvent(opts, url, snapshot, false))
 			fmt.Fprintf(os.Stderr, "worker=%s url=%s error=%v state=%s retry_in=%s\n",
 				workerID, url, err, snapshot.State, snapshot.RetryIn)
