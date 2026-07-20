@@ -93,8 +93,8 @@ docker compose -f docker-compose.publisher.yml --env-file .env.publisher ps
 手动检测和发布：
 
 ```bash
-docker compose -f docker-compose.publisher.yml --env-file .env.publisher run --rm publisher validate-only
-docker compose -f docker-compose.publisher.yml --env-file .env.publisher run --rm publisher publish-once
+docker compose -f docker-compose.publisher.yml --env-file .env.publisher run --rm source-publisher validate-only
+docker compose -f docker-compose.publisher.yml --env-file .env.publisher run --rm source-publisher publish-once
 ```
 
 完整的 OSS 策略、secret 挂载、健康检查和故障恢复见 `docs/publisher-docker.md`。

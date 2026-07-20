@@ -35,3 +35,48 @@ The multi-IP V2 data plane rejects private, loopback, link-local, multicast, res
 
 `POST /api/source-list/refresh` requests an immediate refresh through the same size, TLS, signature, schema, and rollback checks used by the scheduler.
 
+## Downloader Deployment
+
+Run one multi-IP container on each Ubuntu download server. Determine the physical
+LAN interface first; this is commonly `ens18`, `ens160`, or `eth0`:
+
+```bash
+ip -4 route show default
+curl -fsSLO https://raw.githubusercontent.com/MengxingFusheng/steam-download-pumper/main/install-multi-ip.sh
+chmod +x install-multi-ip.sh
+```
+
+Use the publisher's public key and the exact public OSS `latest.json` URL. The
+following example creates four LAN source IPs and never exceeds 12 connections per
+line:
+
+```bash
+REMOTE_SOURCE_LIST_ENABLED=true \
+SOURCE_LIST_URL=https://<bucket>.oss-cn-beijing.aliyuncs.com/pumper/v1/latest.json \
+SOURCE_LIST_PUBLIC_KEY='<base64-ed25519-public-key>' \
+SOURCE_LIST_KEY_ID=pumper-source-2026-01 \
+LINE_COUNT=4 \
+LAN_IPS=192.168.1.233,192.168.1.234,192.168.1.235,192.168.1.236 \
+TARGET_MBPS=1600 \
+CONNECTIONS_PER_LINE=8 \
+MAX_CONNECTIONS_PER_LINE=12 \
+LAN_PARENT=ens18 \
+LAN_SUBNET=192.168.1.0/24 \
+LAN_GATEWAY=192.168.1.1 \
+bash install-multi-ip.sh
+```
+
+Open `http://192.168.1.233/` from another LAN device. With Docker macvlan, the
+Ubuntu host itself normally cannot reach the container directly unless a separate
+host-side macvlan interface is configured.
+
+Verify that the remote list is active:
+
+```bash
+curl -fsS http://192.168.1.233/api/source-list
+docker compose --env-file .env -f docker-compose.multi-ip.yml logs --tail 100 multi-ip-pumper
+```
+
+Expected API fields are `status=healthy`, `origin=remote`, the current `revision`,
+and `source_count` greater than or equal to three. A fetch or signature failure
+leaves the last-known-good pool active and exposes the reason through `last_error`.
