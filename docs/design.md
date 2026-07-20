@@ -1,6 +1,6 @@
 # Architecture
 
-The repository produces exactly two images from one shared runtime.
+The repository produces two downloader images plus one independent source-list publisher image.
 
 ## Topologies
 
@@ -27,6 +27,14 @@ One `PumperController` serves both topologies. It owns:
 - aggregate daily traffic targets;
 - one shared API and browser console.
 
+The multi-IP V2 entrypoint may additionally own a `RemoteSourceManager`. It fetches a signed OSS envelope on startup and once per day, verifies it with the image's `manifestctl`, persists last-known-good state under `/data`, and updates the running helper through a source file plus `SIGHUP`. Remote settings remain environment-only and do not enter the writable Web configuration. The iKuai entrypoint does not enable this manager.
+
+## Source Publisher
+
+`pumper-source-publisher` is a separate support image, not a download topology. It has no inbound listener and no dependency on the downloader controller. A single scheduler process runs at 03:17 Asia/Shanghai, validates a mounted candidate list, signs a schema-versioned manifest, uploads an immutable release, verifies that release through the public OSS endpoint, and only then replaces `latest.json`.
+
+The publisher reads its Ed25519 private key and least-privilege OSS RAM credentials from mounted secret files. Download images receive only the public key. Publication failures leave the previous `latest.json` untouched; downloader failures leave the current or last-known-good source pool active.
+
 When helper metrics are not yet available, the aggregate display falls back to the `eth0` RX counter. Per-line values remain unavailable rather than being estimated.
 
 ## Configuration
@@ -35,6 +43,6 @@ Environment values provide first-boot defaults. Persisted `/data/config.json` va
 
 Configuration persistence uses a same-directory temporary file, file synchronization, atomic replacement, and directory synchronization.
 
-## Release Alignment
+## Release Boundaries
 
-Both Dockerfiles copy the same Python package and build the same Go helper. CI runs the shared Python/Go suite and builds both images from one revision. The release script publishes matching `latest`, `ikuai3`, and commit tags only after both images pass their smoke checks.
+The legacy aligned release script still publishes the two original downloader targets together. Multi-IP OSS V2 and the publisher have independent release scripts and canary tags (`oss-v2` and `publisher-v1`) so neither rollout changes a mutable `latest` tag before acceptance. CI runs the full Python/Go suite and builds all three Dockerfiles.

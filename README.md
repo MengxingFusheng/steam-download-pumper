@@ -2,14 +2,15 @@
 
 面向爱快多 WAN 环境的公共 HTTP/HTTPS 下载流量工具。下载正文直接写入内存中的 `io.Discard`，不生成下载文件，不持续擦写硬盘，并优先使用 IPv4。
 
-项目只维护两个同步版本：
+项目保留两个下载器版本，并增加一个不承担下载流量的源清单发布器：
 
 | 版本 | Docker Hub | 网络模型 |
 |---|---|---|
 | 爱快单线路 | `traveler1314/ikuai-line-pumper:latest` | 一个容器、一个 IP、一条 WAN |
-| 多 IP | `traveler1314/multi-ip-pumper:latest` | 一个容器，每条 WAN 对应一个源 IP |
+| 多 IP V2 | `traveler1314/multi-ip-pumper:oss-v2` | 一个容器，每条 WAN 对应一个源 IP，支持 OSS 签名源清单 |
+| 源清单发布器 | `traveler1314/pumper-source-publisher:publisher-v1` | 无入站端口，每日验证并发布清单 |
 
-GHCR 镜像分别为 `ghcr.io/mengxingfusheng/ikuai-line-pumper:latest` 和 `ghcr.io/mengxingfusheng/multi-ip-pumper:latest`。每次发布时，两个镜像使用相同的 Git 提交标签；共享下载引擎、调度、监控、API 和控制台的改进会同时进入两个版本。
+GHCR 对应镜像位于 `ghcr.io/mengxingfusheng/`。OSS 远程清单仅用于标准 Docker 的多 IP V2，不作为爱快 Docker 插件的兼容功能。
 
 ## 爱快单线路版
 
@@ -63,6 +64,40 @@ bash install-multi-ip.sh
 ```
 
 安装器会将首个 `LAN_IPS` 地址写为 Compose 的 `CONTAINER_IP`，其余地址由容器启动后添加到 `eth0`。`LAN_IPS` 数量必须等于 `LINE_COUNT`，地址必须是唯一 IPv4。
+
+### OSS 远程源清单
+
+多 IP V2 可在启动时和每日自动拉取阿里云 OSS 中的 Ed25519 签名清单：
+
+```text
+REMOTE_SOURCE_LIST_ENABLED=true
+SOURCE_LIST_URL=https://<bucket>.oss-cn-beijing.aliyuncs.com/pumper/v1/latest.json
+SOURCE_LIST_PUBLIC_KEY=<base64-ed25519-public-key>
+SOURCE_LIST_KEY_ID=pumper-source-2026-01
+SOURCE_LIST_REFRESH_TIME=04:00
+SOURCE_LIST_REFRESH_JITTER_SECONDS=1800
+```
+
+这些安全参数只从容器环境读取，不能通过 Web 控制台修改。新清单通过 `SIGHUP` 热加载，不重启容器或 Go 下载进程。OSS 访问、验签或清单校验失败时，容器继续使用 `/data` 中最后可用清单，再退回本地 `SOURCE_POOL`。
+
+## 源清单发布器
+
+发布器每天 `03:17 Asia/Shanghai` 对受控候选源进行 IPv4、重定向、可达性和有界速率检测，然后签名并上传到 OSS。容器无 Web、无入站端口，只需一个受限 RAM 账号和 Ed25519 私钥。
+
+```bash
+cp .env.publisher.example .env.publisher
+bash install-publisher.sh
+docker compose -f docker-compose.publisher.yml --env-file .env.publisher ps
+```
+
+手动检测和发布：
+
+```bash
+docker compose -f docker-compose.publisher.yml --env-file .env.publisher run --rm publisher validate-only
+docker compose -f docker-compose.publisher.yml --env-file .env.publisher run --rm publisher publish-once
+```
+
+完整的 OSS 策略、secret 挂载、健康检查和故障恢复见 `docs/publisher-docker.md`。
 
 ## 运行控制
 
