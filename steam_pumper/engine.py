@@ -81,6 +81,8 @@ def build_engine_command(
 class EngineProcess:
     """Own one long-lived Go helper without allocating a Python reader thread."""
 
+    MAX_OUTPUT_LINE_BYTES = 65_536
+
     def __init__(
         self,
         cfg: CommonConfig,
@@ -90,6 +92,7 @@ class EngineProcess:
         *,
         sources_file: str | Path | None = None,
         reject_private_destinations: bool = False,
+        source_generation: str = "",
     ) -> None:
         self.cfg = cfg
         self.line = line
@@ -101,6 +104,7 @@ class EngineProcess:
             line_id=line.line_id,
             bind_ip=line.bind_ip,
             connections=cfg.connections_per_line,
+            confirmed_source_generation=source_generation,
         )
         self.process: subprocess.Popen[bytes] | None = None
         self.stop_requested = True
@@ -110,6 +114,7 @@ class EngineProcess:
         self._byte_offset = 0
         self._process_bytes = 0
         self._pending_sources: list[str] = []
+        self._source_epochs: dict[str, int] = {}
 
     def start(self) -> None:
         if self.process and self.process.poll() is None:
@@ -120,7 +125,11 @@ class EngineProcess:
         try:
             if self.sources_file is not None:
                 self._write_sources_file(
-                    generation=self.state.pending_source_generation or None,
+                    generation=(
+                        self.state.pending_source_generation
+                        or self.state.confirmed_source_generation
+                        or None
+                    ),
                 )
             self.process = subprocess.Popen(
                 build_engine_command(
@@ -210,6 +219,7 @@ class EngineProcess:
         self.state.source_states = {
             url: source_state for url, source_state in self.state.source_states.items() if url in active
         }
+        self._source_epochs = {}
         self.state.confirmed_source_generation = generation
         self.state.pending_source_generation = ""
         self.state.source_reload_error = ""
@@ -314,11 +324,14 @@ class EngineProcess:
             return
         if not chunk:
             return
-        self._output_buffer = (self._output_buffer + chunk.decode("utf-8", errors="replace"))[-65_536:]
-        lines = self._output_buffer.split("\n")
-        self._output_buffer = lines.pop()
-        for line in lines:
-            self._consume_line(line)
+        buffered = self._output_buffer + chunk.decode("utf-8", errors="replace")
+        while "\n" in buffered:
+            line, buffered = buffered.split("\n", 1)
+            if len(line) <= self.MAX_OUTPUT_LINE_BYTES:
+                self._consume_line(line)
+            else:
+                self.state.last_error = line[-500:]
+        self._output_buffer = buffered[-self.MAX_OUTPUT_LINE_BYTES :]
 
     def _consume_line(self, line: str) -> None:
         line = line.strip()
@@ -360,6 +373,19 @@ class EngineProcess:
         url = event["url"]
         if url not in self.sources:
             return
+        generation = event.get("generation")
+        current_generation = self.state.confirmed_source_generation
+        if current_generation and generation != current_generation:
+            return
+        if generation not in {None, ""} and not isinstance(generation, str):
+            return
+        source_epoch = event.get("source_epoch")
+        if not isinstance(source_epoch, int) or isinstance(source_epoch, bool) or source_epoch <= 0:
+            return
+        known_epoch = self._source_epochs.get(url, 0)
+        if source_epoch < known_epoch:
+            return
+        self._source_epochs[url] = source_epoch
         if event.get("recovered") is True:
             self.state.source_failures[url] = 0
             self.state.source_states[url] = SourceRuntimeState()

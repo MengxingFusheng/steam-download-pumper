@@ -36,6 +36,7 @@ type options struct {
 	sourceSet                 *sourceSet
 	statusWriter              io.Writer
 	controlSignals            <-chan os.Signal
+	workerRunner              func(context.Context, int, uint64) error
 }
 
 const maxConnectionLimit = 12
@@ -54,6 +55,7 @@ type statusEvent struct {
 	Error               string `json:"error,omitempty"`
 	Recovered           bool   `json:"recovered,omitempty"`
 	Generation          string `json:"generation,omitempty"`
+	SourceEpoch         uint64 `json:"source_epoch,omitempty"`
 }
 
 type countingWriter struct {
@@ -81,6 +83,11 @@ type sourceSet struct {
 	value atomic.Value
 }
 
+type sourceSetSnapshot struct {
+	Generation string
+	URLs       []string
+}
+
 type lookupIPFunc func(context.Context, string, string) ([]net.IP, error)
 
 func newSourceSet(urls []string) (*sourceSet, error) {
@@ -95,7 +102,22 @@ func (set *sourceSet) replace(urls []string) error {
 	if err := validateSourceURLs(urls); err != nil {
 		return err
 	}
-	set.value.Store(append([]string(nil), urls...))
+	generation := ""
+	if loaded := set.value.Load(); loaded != nil {
+		generation = loaded.(sourceSetSnapshot).Generation
+	}
+	set.value.Store(sourceSetSnapshot{Generation: generation, URLs: append([]string(nil), urls...)})
+	return nil
+}
+
+func (set *sourceSet) replaceConfig(config sourceFileConfig) error {
+	if err := validateSourceURLs(config.Sources); err != nil {
+		return err
+	}
+	set.value.Store(sourceSetSnapshot{
+		Generation: config.Generation,
+		URLs:       append([]string(nil), config.Sources...),
+	})
 	return nil
 }
 
@@ -104,7 +126,15 @@ func (set *sourceSet) snapshot() []string {
 	if loaded == nil {
 		return nil
 	}
-	return append([]string(nil), loaded.([]string)...)
+	return append([]string(nil), loaded.(sourceSetSnapshot).URLs...)
+}
+
+func (set *sourceSet) generation() string {
+	loaded := set.value.Load()
+	if loaded == nil {
+		return ""
+	}
+	return loaded.(sourceSetSnapshot).Generation
 }
 
 func validateSourceURLs(urls []string) error {
@@ -191,6 +221,14 @@ func replaceSources(set *sourceSet, health *sourceHealth, urls []string) error {
 		return err
 	}
 	health.retain(urls)
+	return nil
+}
+
+func replaceSourceConfig(set *sourceSet, health *sourceHealth, config sourceFileConfig) error {
+	if err := set.replaceConfig(config); err != nil {
+		return err
+	}
+	health.retain(config.Sources)
 	return nil
 }
 
@@ -507,18 +545,23 @@ func run(ctx context.Context, opts options) error {
 		return err
 	}
 	initialSources := opts.urls
+	initialConfig := sourceFileConfig{Sources: initialSources}
 	if opts.sourcesFile != "" {
 		config, err := loadSourceConfig(opts.sourcesFile)
 		if err != nil {
 			return fmt.Errorf("load sources file: %w", err)
 		}
 		initialSources = config.Sources
+		initialConfig = config
 	}
 	set, err := newSourceSet(initialSources)
 	if err != nil {
 		return err
 	}
 	opts.sourceSet = set
+	if err := set.replaceConfig(initialConfig); err != nil {
+		return err
+	}
 	writer := opts.statusWriter
 	if writer == nil {
 		writer = os.Stdout
@@ -529,27 +572,52 @@ func run(ctx context.Context, opts options) error {
 	var currentSource atomic.Value
 	currentSource.Store("")
 	type workerResult struct {
-		id  int
-		err error
+		id    int
+		token uint64
+		err   error
+	}
+	type workerInstance struct {
+		token    uint64
+		cancel   context.CancelFunc
+		stopping bool
 	}
 	results := make(chan workerResult, opts.maxConnections+1)
-	workers := make(map[int]context.CancelFunc, opts.maxConnections)
+	workers := make(map[int]workerInstance, opts.maxConnections)
+	targetConnections := opts.connections
+	var nextWorkerToken uint64
 	health := newSourceHealth()
 	health.retain(initialSources)
 	startWorker := func(id int) {
 		workerCtx, cancel := context.WithCancel(ctx)
-		workers[id] = cancel
+		nextWorkerToken++
+		token := nextWorkerToken
+		workers[id] = workerInstance{token: token, cancel: cancel}
 		activeConnections.Add(1)
 		go func() {
+			runner := opts.workerRunner
+			if runner == nil {
+				runner = func(runCtx context.Context, connectionID int, _ uint64) error {
+					return runWorker(runCtx, opts, connectionID, health, &totalBytes, &currentSource, sink)
+				}
+			}
 			results <- workerResult{
-				id:  id,
-				err: runWorker(workerCtx, opts, id, health, &totalBytes, &currentSource, sink),
+				id:    id,
+				token: token,
+				err:   runner(workerCtx, id, token),
 			}
 		}()
 	}
-	for id := 1; id <= opts.connections; id++ {
-		startWorker(id)
+	reconcileWorkers := func() {
+		for len(workers) < targetConnections {
+			for id := 1; id <= opts.maxConnections; id++ {
+				if _, exists := workers[id]; !exists {
+					startWorker(id)
+					break
+				}
+			}
+		}
 	}
+	reconcileWorkers()
 	controlSignals := opts.controlSignals
 	var ownedSignals chan os.Signal
 	if controlSignals == nil {
@@ -568,8 +636,8 @@ func run(ctx context.Context, opts options) error {
 	for {
 		select {
 		case <-ctx.Done():
-			for _, cancel := range workers {
-				cancel()
+			for _, worker := range workers {
+				worker.cancel()
 			}
 			return nil
 		case controlSignal := <-controlSignals:
@@ -582,39 +650,39 @@ func run(ctx context.Context, opts options) error {
 					config, err = loadSourceConfig(opts.sourcesFile)
 				}
 				if err == nil {
-					err = replaceSources(set, health, config.Sources)
+					err = replaceSourceConfig(set, health, config)
 				}
 				if err != nil {
 					fmt.Fprintf(os.Stderr, "source-list reload error=%v\n", err)
 					sink.emit(statusEvent{Type: "source-list", LineID: opts.lineID, Error: err.Error()})
 				} else {
-					for _, cancel := range workers {
-						cancel()
+					for id, worker := range workers {
+						worker.stopping = true
+						workers[id] = worker
+						worker.cancel()
 					}
 					fmt.Fprintf(os.Stderr, "source-list reloaded count=%d\n", len(config.Sources))
 					sink.emit(statusEvent{
 						Type: "source-list", LineID: opts.lineID, State: "reloaded", Generation: config.Generation,
 					})
 				}
-			} else if controlSignal == syscall.SIGUSR1 && len(workers) < opts.maxConnections {
-				for id := 1; id <= opts.maxConnections; id++ {
-					if _, exists := workers[id]; !exists {
-						startWorker(id)
-						break
-					}
-				}
-			} else if controlSignal == syscall.SIGUSR2 && len(workers) > 1 {
+			} else if controlSignal == syscall.SIGUSR1 && targetConnections < opts.maxConnections {
+				targetConnections++
+				reconcileWorkers()
+			} else if controlSignal == syscall.SIGUSR2 && targetConnections > 1 {
+				targetConnections--
 				for id := opts.maxConnections; id >= 1; id-- {
-					if cancel, exists := workers[id]; exists {
-						delete(workers, id)
-						activeConnections.Add(-1)
-						cancel()
+					if worker, exists := workers[id]; exists && !worker.stopping {
+						worker.stopping = true
+						workers[id] = worker
+						worker.cancel()
 						break
 					}
 				}
 			}
 		case result := <-results:
-			if _, active := workers[result.id]; !active {
+			worker, active := workers[result.id]
+			if !active || worker.token != result.token {
 				continue
 			}
 			delete(workers, result.id)
@@ -625,7 +693,7 @@ func run(ctx context.Context, opts options) error {
 			if result.err != nil {
 				fmt.Fprintf(os.Stderr, "connection=%d stopped: %v\n", result.id, result.err)
 			}
-			startWorker(result.id)
+			reconcileWorkers()
 		case <-statusUpdates:
 			source, _ := currentSource.Load().(string)
 			sink.emit(statusEvent{
@@ -672,10 +740,12 @@ func runWorker(
 		url := ""
 		probe := false
 		var sourceEpoch uint64
+		sourceGeneration := ""
 		var nextRetry time.Duration
 		sources := opts.urls
 		if opts.sourceSet != nil {
 			sources = opts.sourceSet.snapshot()
+			sourceGeneration = opts.sourceSet.generation()
 		}
 		for checked := 0; checked < len(sources); checked++ {
 			candidate := sources[urlIndex%len(sources)]
@@ -704,7 +774,9 @@ func runWorker(
 		workerID := fmt.Sprintf("%s-%d", opts.workerID, connectionID)
 		currentSource.Store(url)
 		if probe {
-			sink.emit(sourceStatusEvent(opts, url, health.snapshot(url, time.Now()), false))
+			sink.emit(sourceStatusEvent(
+				opts, url, health.snapshot(url, time.Now()), false, sourceGeneration, sourceEpoch,
+			))
 		}
 		if _, err := downloadOnceTracked(ctx, client, url, workerID, totalBytes); err != nil {
 			if ctx.Err() != nil {
@@ -719,13 +791,13 @@ func runWorker(
 			if !recorded {
 				continue
 			}
-			sink.emit(sourceStatusEvent(opts, url, snapshot, false))
+			sink.emit(sourceStatusEvent(opts, url, snapshot, false, sourceGeneration, sourceEpoch))
 			fmt.Fprintf(os.Stderr, "worker=%s url=%s error=%v state=%s retry_in=%s\n",
 				workerID, url, err, snapshot.State, snapshot.RetryIn)
 			continue
 		}
 		if recovered, snapshot := health.succeededCurrent(url, sourceEpoch); recovered {
-			sink.emit(sourceStatusEvent(opts, url, snapshot, true))
+			sink.emit(sourceStatusEvent(opts, url, snapshot, true, sourceGeneration, sourceEpoch))
 			fmt.Fprintf(os.Stderr, "worker=%s url=%s recovered=true\n", workerID, url)
 		}
 		if opts.restartJitterSeconds > 0 {
@@ -737,7 +809,14 @@ func runWorker(
 	}
 }
 
-func sourceStatusEvent(opts options, url string, snapshot sourceSnapshot, recovered bool) statusEvent {
+func sourceStatusEvent(
+	opts options,
+	url string,
+	snapshot sourceSnapshot,
+	recovered bool,
+	generation string,
+	sourceEpoch uint64,
+) statusEvent {
 	event := statusEvent{
 		Type:                "source",
 		LineID:              opts.lineID,
@@ -747,6 +826,8 @@ func sourceStatusEvent(opts options, url string, snapshot sourceSnapshot, recove
 		ConsecutiveFailures: snapshot.ConsecutiveFailures,
 		Error:               snapshot.LastError,
 		Recovered:           recovered,
+		Generation:          generation,
+		SourceEpoch:         sourceEpoch,
 	}
 	if !snapshot.RetryAfter.IsZero() {
 		event.RetryAfter = snapshot.RetryAfter.UTC().Format(time.RFC3339)

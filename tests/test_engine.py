@@ -77,7 +77,7 @@ class EngineTests(unittest.TestCase):
         )
         engine._consume_line(
             '{"type":"source","line_id":"line-1","url":"http://bad.test/file",'
-            '"error":"timeout"}'
+            '"source_epoch":1,"error":"timeout"}'
         )
 
         self.assertEqual(engine.state.total_bytes, 1_048_576)
@@ -86,6 +86,62 @@ class EngineTests(unittest.TestCase):
         self.assertEqual(engine.state.current_source, "http://a.test/file")
         self.assertEqual(engine.state.source_failures["http://bad.test/file"], 1)
         self.assertIn("timeout", engine.state.last_error)
+
+    def test_streaming_output_keeps_complete_ack_before_oversized_partial_line(self):
+        from steam_pumper.engine import EngineProcess
+
+        engine = EngineProcess(
+            IkuaiLineConfig(),
+            LogicalLine("line-1", 400),
+            ["https://new.test/file"],
+            lambda _message: None,
+            source_generation="rev-old",
+        )
+        engine.state.pending_source_generation = "rev-new"
+        engine._pending_sources = ["https://new.test/file"]
+        ack = (
+            b'{"type":"source-list","line_id":"line-1","state":"reloaded",'
+            b'"generation":"rev-new"}\n'
+        )
+        stdout = Mock()
+        stdout.read.side_effect = [ack + (b"x" * 100_000), BlockingIOError()]
+        process = Mock(stdout=stdout)
+        engine.process = process
+
+        engine._drain_output()
+
+        self.assertTrue(engine.source_generation_confirmed("rev-new"))
+        self.assertLessEqual(len(engine._output_buffer), engine.MAX_OUTPUT_LINE_BYTES)
+
+    def test_python_rejects_stale_source_generation_and_epoch(self):
+        from steam_pumper.engine import EngineProcess
+
+        url = "https://source.test/file"
+        engine = EngineProcess(
+            IkuaiLineConfig(),
+            LogicalLine("line-1", 400),
+            [url],
+            lambda _message: None,
+            source_generation="rev-new",
+        )
+        engine._consume_line(
+            '{"type":"source","line_id":"line-1","url":"https://source.test/file",'
+            '"generation":"rev-new","source_epoch":9,"state":"degraded",'
+            '"consecutive_failures":1,"error":"current"}'
+        )
+        engine._consume_line(
+            '{"type":"source","line_id":"line-1","url":"https://source.test/file",'
+            '"generation":"rev-old","source_epoch":3,"state":"quarantined",'
+            '"consecutive_failures":9,"error":"queued old generation"}'
+        )
+        engine._consume_line(
+            '{"type":"source","line_id":"line-1","url":"https://source.test/file",'
+            '"generation":"rev-new","source_epoch":8,"state":"quarantined",'
+            '"consecutive_failures":8,"error":"queued old epoch"}'
+        )
+
+        self.assertEqual(engine.state.source_failures[url], 1)
+        self.assertEqual(engine.state.source_states[url].last_error, "current")
 
     def test_engine_retains_structured_source_quarantine_and_recovery(self):
         from steam_pumper.engine import EngineProcess
@@ -98,7 +154,7 @@ class EngineTests(unittest.TestCase):
         )
         engine._consume_line(
             '{"type":"source","line_id":"line-1","url":"http://bad.test/file",'
-            '"state":"quarantined","consecutive_failures":3,'
+            '"source_epoch":1,"state":"quarantined","consecutive_failures":3,'
             '"retry_after":"2026-07-20T08:10:00Z","retry_in_seconds":600,'
             '"error":"connection refused"}'
         )
@@ -112,7 +168,7 @@ class EngineTests(unittest.TestCase):
 
         engine._consume_line(
             '{"type":"source","line_id":"line-1","url":"http://bad.test/file",'
-            '"state":"healthy","recovered":true}'
+            '"source_epoch":1,"state":"healthy","recovered":true}'
         )
 
         recovered = engine.state.source_states["http://bad.test/file"]

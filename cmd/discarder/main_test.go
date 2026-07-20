@@ -39,6 +39,124 @@ func TestValidateOptionsRejectsUnlimitedRequestTimeout(t *testing.T) {
 	}
 }
 
+func TestWorkerSlotIsNotReusedUntilCancelledInstanceExits(t *testing.T) {
+	ctx, stop := context.WithCancel(context.Background())
+	defer stop()
+	signals := make(chan os.Signal, 4)
+	release := make(chan struct{})
+	started := make(chan uint64, 8)
+	var live atomic.Int32
+	var maximum atomic.Int32
+	runner := func(workerCtx context.Context, _ int, token uint64) error {
+		current := live.Add(1)
+		for current > maximum.Load() && !maximum.CompareAndSwap(maximum.Load(), current) {
+		}
+		started <- token
+		<-workerCtx.Done()
+		<-release
+		live.Add(-1)
+		return nil
+	}
+	done := make(chan error, 1)
+	go func() {
+		done <- run(ctx, options{
+			workerID: "slots", lineID: "line-1", connections: 2, maxConnections: 2,
+			readTimeoutSeconds: 1, urls: []string{"https://source.example/file"},
+			controlSignals: signals, workerRunner: runner,
+		})
+	}()
+	for index := 0; index < 2; index++ {
+		select {
+		case <-started:
+		case <-time.After(time.Second):
+			t.Fatal("initial worker did not start")
+		}
+	}
+	signals <- syscall.SIGUSR2
+	signals <- syscall.SIGUSR1
+	time.Sleep(100 * time.Millisecond)
+	if got := live.Load(); got != 2 {
+		t.Fatalf("live workers during cancelled slot overlap = %d, want 2", got)
+	}
+	release <- struct{}{}
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("cancelled worker slot was not restarted after exit")
+	}
+	if got := maximum.Load(); got > 2 {
+		t.Fatalf("maximum live workers = %d, configured max 2", got)
+	}
+	stop()
+	close(release)
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("run did not stop")
+	}
+}
+
+func TestRapidShrinkSignalsCancelDistinctWorkerInstances(t *testing.T) {
+	ctx, stop := context.WithCancel(context.Background())
+	defer stop()
+	signals := make(chan os.Signal, 4)
+	started := make(chan int, 4)
+	cancelled := make(chan int, 4)
+	release := make(chan struct{})
+	runner := func(workerCtx context.Context, id int, _ uint64) error {
+		started <- id
+		<-workerCtx.Done()
+		cancelled <- id
+		<-release
+		return nil
+	}
+	done := make(chan error, 1)
+	go func() {
+		done <- run(ctx, options{
+			workerID: "shrink", lineID: "line-1", connections: 3, maxConnections: 3,
+			readTimeoutSeconds: 1, urls: []string{"https://source.example/file"},
+			controlSignals: signals, workerRunner: runner,
+		})
+	}()
+	for range 3 {
+		select {
+		case <-started:
+		case <-time.After(time.Second):
+			t.Fatal("initial worker did not start")
+		}
+	}
+	signals <- syscall.SIGUSR2
+	signals <- syscall.SIGUSR2
+	var first int
+	select {
+	case first = <-cancelled:
+	case <-time.After(time.Second):
+		t.Fatal("first shrink did not cancel a worker")
+	}
+	var second int
+	select {
+	case second = <-cancelled:
+	case <-time.After(time.Second):
+		t.Fatal("second shrink did not cancel another worker")
+	}
+	if first == second {
+		t.Fatalf("rapid shrink cancelled worker %d twice", first)
+	}
+	close(release)
+	stop()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("run did not stop")
+	}
+}
+
 func TestCountingWriterReportsBytesBeforeRequestCompletes(t *testing.T) {
 	var total atomic.Int64
 	writer := countingWriter{total: &total}
@@ -401,6 +519,20 @@ func TestRemovedSourceLateResultCannotPolluteReaddedURL(t *testing.T) {
 	}
 	if got := health.snapshot(url, time.Now()).ConsecutiveFailures; got != 0 {
 		t.Fatalf("late failure polluted readded URL: %d", got)
+	}
+}
+
+func TestSourceStatusEventCarriesGenerationAndEpoch(t *testing.T) {
+	event := sourceStatusEvent(
+		options{lineID: "line-1"},
+		"https://source.example/file",
+		sourceSnapshot{State: "degraded", ConsecutiveFailures: 1},
+		false,
+		"20260721031700",
+		7,
+	)
+	if event.Generation != "20260721031700" || event.SourceEpoch != 7 {
+		t.Fatalf("source event identity = generation %q epoch %d", event.Generation, event.SourceEpoch)
 	}
 }
 

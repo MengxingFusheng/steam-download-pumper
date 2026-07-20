@@ -116,6 +116,11 @@ class PumperController:
                         else None
                     ),
                     reject_private_destinations=self.topology_name == "multi_ip",
+                    source_generation=(
+                        str(self.active_source_revision)
+                        if self.active_source_revision
+                        else ""
+                    ),
                 ),
                 desired_connections=self.cfg.connections_per_line,
             )

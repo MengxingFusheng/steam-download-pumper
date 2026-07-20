@@ -6,7 +6,7 @@ import time
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from unittest.mock import ANY, patch
+from unittest.mock import patch
 
 
 PUBLIC_KEY = base64.b64encode(bytes(range(32))).decode("ascii")
@@ -306,20 +306,17 @@ class RemoteSourceManagerTests(unittest.TestCase):
         )
         self.assertEqual(base64.b64decode(verifier_record["stdin"]), envelope)
 
-    def test_manifest_verifier_has_explicit_fetch_timeout(self):
+    def test_manifest_verifier_uses_a_cancellable_child_process(self):
         envelope = signed_envelope(manifest_payload())
         manager = self.manager([envelope])
 
-        with patch("steam_pumper.remote_sources.subprocess.run", wraps=__import__("subprocess").run) as run:
+        with patch("steam_pumper.remote_sources.subprocess.Popen", wraps=__import__("subprocess").Popen) as popen:
             manager.refresh(NOW)
 
-        run.assert_called_once_with(
-            ANY,
-            input=envelope,
-            capture_output=True,
-            check=False,
-            timeout=15,
-        )
+        self.assertEqual(popen.call_count, 1)
+        self.assertEqual(popen.call_args.kwargs["stdin"], __import__("subprocess").PIPE)
+        self.assertEqual(popen.call_args.kwargs["stdout"], __import__("subprocess").PIPE)
+        self.assertEqual(popen.call_args.kwargs["stderr"], __import__("subprocess").PIPE)
 
     def test_atomic_write_fsyncs_parent_directory_after_replace(self):
         from steam_pumper.remote_sources import RemoteSourceManager
@@ -602,6 +599,90 @@ class RemoteSourceManagerTests(unittest.TestCase):
 
 
 class RemoteSourceRefreshWorkerTests(unittest.TestCase):
+    def test_shutdown_closes_blocked_http_and_waits_for_worker_exit(self):
+        from dataclasses import replace
+
+        from steam_pumper.remote_sources import RemoteSourceManager, RemoteSourceRefreshWorker
+
+        entered = threading.Event()
+        released = threading.Event()
+
+        class BlockingResponse(FakeResponse):
+            def read(self, _size=-1):
+                entered.set()
+                released.wait(timeout=10)
+                raise OSError("response closed")
+
+            def close(self):
+                released.set()
+
+        response = BlockingResponse(b"")
+        manager = RemoteSourceManager(
+            replace(self._settings(), fetch_timeout_seconds=1),
+            data_dir=tempfile.mkdtemp(),
+            verifier_path="/does/not/matter",
+            urlopen=lambda _request, timeout: response,
+        )
+        worker = RemoteSourceRefreshWorker(manager)
+        worker.request(NOW)
+        self.assertTrue(entered.wait(timeout=1))
+
+        started = time.monotonic()
+        worker.shutdown()
+
+        self.assertLess(time.monotonic() - started, 1)
+        self.assertFalse(worker.is_alive())
+
+    def test_shutdown_terminates_manifest_verifier_and_waits_for_worker_exit(self):
+        from dataclasses import replace
+
+        from steam_pumper.remote_sources import RemoteSourceManager, RemoteSourceRefreshWorker
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            marker = root / "verifier-started"
+            verifier = root / "manifestctl"
+            verifier.write_text(
+                "#!/usr/bin/env python3\n"
+                "import pathlib,time\n"
+                f"pathlib.Path({str(marker)!r}).write_text('started')\n"
+                "time.sleep(30)\n",
+                encoding="utf-8",
+            )
+            verifier.chmod(0o755)
+            manager = RemoteSourceManager(
+                replace(self._settings(), fetch_timeout_seconds=3),
+                data_dir=root,
+                verifier_path=verifier,
+                urlopen=lambda _request, timeout: FakeResponse(signed_envelope(manifest_payload())),
+            )
+            worker = RemoteSourceRefreshWorker(manager)
+            worker.request(NOW)
+            deadline = time.monotonic() + 1
+            while not marker.exists() and time.monotonic() < deadline:
+                time.sleep(0.01)
+            self.assertTrue(marker.exists())
+
+            started = time.monotonic()
+            worker.shutdown()
+
+            self.assertLess(time.monotonic() - started, 1)
+            self.assertFalse(worker.is_alive())
+
+    @staticmethod
+    def _settings():
+        from steam_pumper.remote_sources import RemoteSourceSettings
+
+        return RemoteSourceSettings.from_env(
+            {
+                "REMOTE_SOURCE_LIST_ENABLED": "true",
+                "SOURCE_LIST_URL": "https://bucket.example.test/latest.json",
+                "SOURCE_LIST_PUBLIC_KEY": PUBLIC_KEY,
+                "SOURCE_LIST_KEY_ID": "test-key",
+                "SOURCE_LIST_REFRESH_JITTER_SECONDS": "0",
+            }
+        )
+
     def test_request_is_non_blocking_and_coalesces_while_refresh_is_running(self):
         from steam_pumper.remote_sources import RemoteSourceRefreshWorker, SourceListSnapshot
 
@@ -609,7 +690,7 @@ class RemoteSourceRefreshWorkerTests(unittest.TestCase):
         release = threading.Event()
 
         class SlowManager:
-            def refresh(self, now=None):
+            def refresh(self, now=None, *, cancel_event=None):
                 entered.set()
                 release.wait(timeout=2)
                 return True, ["https://mirror.example/file"], SourceListSnapshot(

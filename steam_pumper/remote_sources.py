@@ -10,6 +10,7 @@ import socket
 import subprocess
 import tempfile
 import threading
+import time
 import urllib.error
 import urllib.request
 from collections.abc import Callable, Mapping
@@ -362,6 +363,9 @@ class RemoteSourceManager:
         self.snapshot = SourceListSnapshot(enabled=settings.enabled)
         self.failure_count = 0
         self.startup_refresh_pending = settings.enabled
+        self._active_lock = threading.Lock()
+        self._active_response: Any | None = None
+        self._active_verifier: subprocess.Popen[bytes] | None = None
 
     def load_last_known_good(
         self,
@@ -460,7 +464,10 @@ class RemoteSourceManager:
     def refresh(
         self,
         now: datetime | None = None,
+        *,
+        cancel_event: threading.Event | None = None,
     ) -> tuple[bool, list[str], SourceListSnapshot]:
+        cancellation = cancel_event or threading.Event()
         current = _aware_now(now)
         if not self.settings.enabled:
             self.snapshot = SourceListSnapshot(enabled=False, status="disabled")
@@ -473,13 +480,14 @@ class RemoteSourceManager:
         previous_snapshot = self.snapshot
         previous_failure_count = self.failure_count
         try:
-            envelope, etag, not_modified = self._fetch_envelope()
+            self._ensure_not_cancelled(cancellation)
+            envelope, etag, not_modified = self._fetch_envelope(cancellation)
             if not_modified:
                 if previous_manifest is None:
                     raise ValueError("server returned 304 without a last-known-good source list")
                 manifest = previous_manifest
             else:
-                payload = self._verify_envelope(envelope)
+                payload = self._verify_envelope(envelope, cancellation)
                 manifest = parse_manifest_payload(
                     payload,
                     min_sources=self.settings.min_sources,
@@ -522,6 +530,13 @@ class RemoteSourceManager:
             self.failure_count = 0
             self.snapshot = candidate_snapshot
             return changed, list(self.current_urls), self.snapshot
+        except InterruptedError:
+            self.manifest = previous_manifest
+            self.envelope_bytes = previous_envelope
+            self.current_urls = previous_urls
+            self.snapshot = previous_snapshot
+            self.failure_count = previous_failure_count
+            raise
         except (OSError, ValueError, urllib.error.URLError, subprocess.SubprocessError) as exc:
             self.manifest = previous_manifest
             self.envelope_bytes = previous_envelope
@@ -544,7 +559,31 @@ class RemoteSourceManager:
                 pass
             return False, list(self.current_urls), self.snapshot
 
-    def _fetch_envelope(self) -> tuple[bytes, str, bool]:
+    @staticmethod
+    def _ensure_not_cancelled(cancel_event: threading.Event) -> None:
+        if cancel_event.is_set():
+            raise InterruptedError("source list refresh cancelled")
+
+    def cancel_active_refresh(self) -> None:
+        with self._active_lock:
+            response = self._active_response
+            verifier = self._active_verifier
+        if response is not None:
+            try:
+                response.close()
+            except Exception:
+                pass
+        if verifier is not None and verifier.poll() is None:
+            verifier.terminate()
+            try:
+                verifier.wait(timeout=0.25)
+            except subprocess.TimeoutExpired:
+                verifier.kill()
+
+    def _fetch_envelope(
+        self,
+        cancel_event: threading.Event,
+    ) -> tuple[bytes, str, bool]:
         headers = {
             "Accept": "application/json",
             "User-Agent": "multi-ip-pumper/2",
@@ -554,12 +593,16 @@ class RemoteSourceManager:
         request = urllib.request.Request(self.settings.url, headers=headers, method="GET")
         try:
             with self.urlopen(request, timeout=self.settings.fetch_timeout_seconds) as response:
+                with self._active_lock:
+                    self._active_response = response
+                self._ensure_not_cancelled(cancel_event)
                 if getattr(response, "status", 200) == 304:
                     return b"", self.snapshot.etag, True
                 content_length = response.headers.get("Content-Length")
                 if content_length is not None and int(content_length) > self.settings.max_bytes:
                     raise ValueError("source list envelope is too large")
                 body = response.read(self.settings.max_bytes + 1)
+                self._ensure_not_cancelled(cancel_event)
                 if len(body) > self.settings.max_bytes:
                     raise ValueError("source list envelope is too large")
                 return body, response.headers.get("ETag", ""), False
@@ -567,7 +610,17 @@ class RemoteSourceManager:
             if exc.code == 304:
                 return b"", self.snapshot.etag, True
             raise
-    def _verify_envelope(self, envelope: bytes) -> bytes:
+        finally:
+            with self._active_lock:
+                self._active_response = None
+
+    def _verify_envelope(
+        self,
+        envelope: bytes,
+        cancel_event: threading.Event | None = None,
+    ) -> bytes:
+        cancellation = cancel_event or threading.Event()
+        self._ensure_not_cancelled(cancellation)
         if len(envelope) > self.settings.max_bytes:
             raise ValueError("source list envelope is too large")
         document = _load_json(envelope, "source list envelope")
@@ -591,7 +644,7 @@ class RemoteSourceManager:
             raise ValueError("source list envelope signature must be 64 bytes")
         if len(expected_payload) > self.settings.max_bytes:
             raise ValueError("source list payload is too large")
-        completed = subprocess.run(
+        process = subprocess.Popen(
             [
                 str(self.verifier_path),
                 "verify",
@@ -602,19 +655,49 @@ class RemoteSourceManager:
                 "--max-bytes",
                 str(self.settings.max_bytes),
             ],
-            input=envelope,
-            capture_output=True,
-            check=False,
-            timeout=self.settings.fetch_timeout_seconds,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
         )
-        if completed.returncode != 0:
-            error = completed.stderr.decode("utf-8", errors="replace").strip()
+        with self._active_lock:
+            self._active_verifier = process
+        deadline = time.monotonic() + self.settings.fetch_timeout_seconds
+        input_data: bytes | None = envelope
+        try:
+            while True:
+                self._ensure_not_cancelled(cancellation)
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise subprocess.TimeoutExpired(process.args, self.settings.fetch_timeout_seconds)
+                try:
+                    stdout, stderr = process.communicate(
+                        input=input_data,
+                        timeout=min(0.1, remaining),
+                    )
+                    break
+                except subprocess.TimeoutExpired:
+                    input_data = None
+                    continue
+        except (InterruptedError, subprocess.TimeoutExpired):
+            if process.poll() is None:
+                process.terminate()
+                try:
+                    process.wait(timeout=0.25)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+            raise
+        finally:
+            with self._active_lock:
+                if self._active_verifier is process:
+                    self._active_verifier = None
+        if process.returncode != 0:
+            error = stderr.decode("utf-8", errors="replace").strip()
             raise ValueError(f"manifest signature verification failed: {error or 'verifier rejected input'}")
-        if len(completed.stdout) > self.settings.max_bytes:
+        if len(stdout) > self.settings.max_bytes:
             raise ValueError("verified source list payload is too large")
-        if completed.stdout != expected_payload:
+        if stdout != expected_payload:
             raise ValueError("manifest verifier returned a different payload")
-        return completed.stdout
+        return stdout
 
     def _next_daily_refresh(self, now: datetime) -> datetime:
         hour, minute = (int(part) for part in self.settings.refresh_time.split(":"))
@@ -720,6 +803,7 @@ class RemoteSourceRefreshWorker:
         self._requested_at: datetime | None = None
         self._result: tuple[bool, list[str], SourceListSnapshot] | Exception | None = None
         self._stopped = False
+        self._cancel_event = threading.Event()
         self._thread = threading.Thread(
             target=self._run,
             name="source-list-refresh",
@@ -761,12 +845,21 @@ class RemoteSourceRefreshWorker:
     def shutdown(self) -> None:
         with self._condition:
             self._stopped = True
+            self._cancel_event.set()
             self._condition.notify_all()
+        cancel_active = getattr(self.manager, "cancel_active_refresh", None)
+        if callable(cancel_active):
+            cancel_active()
         settings = getattr(self.manager, "settings", None)
         timeout = getattr(settings, "fetch_timeout_seconds", 15)
         if not isinstance(timeout, (int, float)):
             timeout = 15
         self._thread.join(timeout=timeout + 1)
+        if self._thread.is_alive():
+            raise RuntimeError("source list refresh worker did not stop")
+
+    def is_alive(self) -> bool:
+        return self._thread.is_alive()
 
     def _run(self) -> None:
         while True:
@@ -780,10 +873,13 @@ class RemoteSourceRefreshWorker:
                 self._state = "running"
             try:
                 result: tuple[bool, list[str], SourceListSnapshot] | Exception = (
-                    self.manager.refresh(requested_at)
+                    self.manager.refresh(requested_at, cancel_event=self._cancel_event)
                 )
             except Exception as exc:
                 result = exc
             with self._condition:
+                if self._stopped:
+                    self._state = "stopped"
+                    return
                 self._result = result
                 self._state = "idle"
