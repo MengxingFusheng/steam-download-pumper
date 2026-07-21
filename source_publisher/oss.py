@@ -63,14 +63,19 @@ class OSSClient:
             raise OSSFailure("OSS object key is invalid")
         command = [
             self.config.ossutil_path,
-            "cp",
-            str(source),
-            f"oss://{self.config.bucket}/{object_key}",
+            "api",
+            "put-object",
+            "--bucket",
+            self.config.bucket,
+            "--key",
+            object_key,
+            "--body",
+            f"file://{source}",
+            "--content-type",
+            "application/json",
         ]
-        if overwrite:
-            command.append("--force")
-        else:
-            command.extend(("--forbid-overwrite", "true"))
+        if not overwrite:
+            command.append("--forbid-overwrite")
         try:
             returncode, _output = _run_cancellable(
                 command,

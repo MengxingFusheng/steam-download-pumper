@@ -76,6 +76,11 @@ unset OSS_AK OSS_SK
 chmod 600 publisher-secrets/oss_access_key_id publisher-secrets/oss_access_key_secret
 ```
 
+`install-publisher.sh` changes the three runtime secret files to UID/GID
+`10001:10001` after pulling the image. This is required because local Docker
+Compose secret mounts preserve host ownership while the publisher runs as UID
+`10001`.
+
 Download the deployment files, edit the non-secret bucket settings and candidate
 URLs, then run the installer:
 

@@ -41,8 +41,11 @@ class PublisherOSSTests(unittest.TestCase):
             self.assertEqual(recorded["env"]["OSS_ACCESS_KEY_ID"], "AK-ID-VALUE")
             self.assertEqual(recorded["env"]["OSS_ACCESS_KEY_SECRET"], "AK-SECRET-VALUE")
             self.assertEqual(recorded["env"]["OSS_REGION"], "cn-beijing")
-            self.assertIn("cp", recorded["argv"])
-            self.assertIn("--force", recorded["argv"])
+            self.assertEqual(recorded["argv"][:2], ["api", "put-object"])
+            self.assertIn("--bucket", recorded["argv"])
+            self.assertIn("--key", recorded["argv"])
+            self.assertIn("--body", recorded["argv"])
+            self.assertNotIn("--forbid-overwrite", recorded["argv"])
             self.assertNotIn("--acl", recorded["argv"])
             self.assertEqual(dict(os.environ), before)
 
@@ -72,9 +75,9 @@ class PublisherOSSTests(unittest.TestCase):
                 overwrite=False,
             )
             argv = json.loads(capture.read_text(encoding="utf-8"))
-            self.assertNotIn("--force", argv)
+            self.assertEqual(argv[:2], ["api", "put-object"])
             self.assertIn("--forbid-overwrite", argv)
-            self.assertEqual(argv[argv.index("--forbid-overwrite") + 1], "true")
+            self.assertNotIn("true", argv)
 
     def test_upload_subprocess_is_terminated_on_cancellation(self):
         from source_publisher.config import PublisherConfig, PublisherSecrets

@@ -83,6 +83,15 @@ done
 compose=(docker compose --env-file "$ENV_PATH" -f "$COMPOSE_PATH")
 "${compose[@]}" config >/dev/null
 "${compose[@]}" pull
+publisher_image="${dotenv[PUBLISHER_IMAGE]:-traveler1314/pumper-source-publisher:publisher-v1}"
+docker run --rm --user 0:0 \
+  -v "${SECRET_DIR}:/secrets" \
+  --entrypoint chown \
+  "$publisher_image" \
+  10001:10001 \
+  /secrets/source_signing_private_key \
+  /secrets/oss_access_key_id \
+  /secrets/oss_access_key_secret
 "${compose[@]}" run --rm --no-deps source-publisher validate-only
 "${compose[@]}" up -d
 printf 'publisher scheduled for %s %s; current status:\n' "${dotenv[PUBLISH_TIME]:-03:17}" "${dotenv[PUBLISH_TIMEZONE]:-Asia/Shanghai}"

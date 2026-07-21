@@ -44,6 +44,8 @@ class PublisherDeployTests(unittest.TestCase):
         self.assertIn("config", installer)
         self.assertIn("validate-only", installer)
         self.assertIn("up -d", installer)
+        self.assertIn("--entrypoint chown", installer)
+        self.assertIn("10001:10001", installer)
         self.assertRegex(installer, r"(?:stat|find).*(?:600|%a)")
         self.assertNotRegex(installer, r"(?i)(cat|printf|echo).*ACCESS_KEY_SECRET")
 
