@@ -28,6 +28,16 @@ def default_source_pool() -> list[str]:
     ]
 
 
+def default_speedtest_source_pool() -> list[str]:
+    """Validated Speedtest fallbacks used when the signed source list is unavailable."""
+    return [
+        "http://speedtest1.online.sh.cn:8080/speedtest/random4000x4000.jpg",
+        "http://spt1.seed.net.tw:8080/speedtest/random4000x4000.jpg",
+        "http://fetzl1.seed.net.tw:8080/speedtest/random4000x4000.jpg",
+        "http://fetsz1.seed.net.tw:8080/speedtest/random4000x4000.jpg",
+    ]
+
+
 @dataclass
 class CommonConfig(ABC):
     target_mbps: int = 400
@@ -137,6 +147,75 @@ class MultiIPConfig(CommonConfig):
         return self
 
 
+@dataclass
+class FleetConfig(CommonConfig):
+    """Configuration for the many-account, demand-started downloader."""
+
+    target_mbps: int = 4_000
+    connections_per_line: int = 4
+    max_connections_per_line: int = MAX_CONNECTIONS_PER_LINE
+    source_pool: list[str] = field(default_factory=default_speedtest_source_pool)
+    rolling_days: int = 15
+    target_ratio: float = 2.0
+    per_line_mbps: int = 200
+    rotation_minutes: int = 30
+    snmp_poll_seconds: int = 60
+    engine_status_seconds: int = 5
+    scheduler_tick_seconds: int = 60
+    upload_ceiling_mbps: int = 50
+    download_ceiling_mbps: int = 500
+    snmp_direction_swap: bool = False
+    line_stall_seconds: int = 90
+    line_slow_window_seconds: int = 180
+    line_minimum_mbps: int = 50
+    line_failure_cooldown_minutes: int = 30
+    topology: str = field(init=False, default="fleet")
+
+    def validate(self) -> FleetConfig:
+        self.validate_common()
+        _require_int("rolling_days", self.rolling_days)
+        _require_finite_number("target_ratio", self.target_ratio)
+        _require_int("per_line_mbps", self.per_line_mbps)
+        _require_int("rotation_minutes", self.rotation_minutes)
+        _require_int("snmp_poll_seconds", self.snmp_poll_seconds)
+        _require_int("engine_status_seconds", self.engine_status_seconds)
+        _require_int("scheduler_tick_seconds", self.scheduler_tick_seconds)
+        _require_int("upload_ceiling_mbps", self.upload_ceiling_mbps)
+        _require_int("download_ceiling_mbps", self.download_ceiling_mbps)
+        _require_bool("snmp_direction_swap", self.snmp_direction_swap)
+        _require_int("line_stall_seconds", self.line_stall_seconds)
+        _require_int("line_slow_window_seconds", self.line_slow_window_seconds)
+        _require_int("line_minimum_mbps", self.line_minimum_mbps)
+        _require_int("line_failure_cooldown_minutes", self.line_failure_cooldown_minutes)
+        if not 1 <= self.rolling_days <= 31:
+            raise ValueError("rolling_days must be between 1 and 31")
+        if not 1.0 <= self.target_ratio <= 10.0:
+            raise ValueError("target_ratio must be between 1 and 10")
+        if not 1 <= self.per_line_mbps <= 1_000:
+            raise ValueError("per_line_mbps must be between 1 and 1000")
+        if not 1 <= self.rotation_minutes <= 240:
+            raise ValueError("rotation_minutes must be between 1 and 240")
+        if not 15 <= self.snmp_poll_seconds <= 900:
+            raise ValueError("snmp_poll_seconds must be between 15 and 900")
+        if not 1 <= self.engine_status_seconds <= 60:
+            raise ValueError("engine_status_seconds must be between 1 and 60")
+        if not 15 <= self.scheduler_tick_seconds <= 900:
+            raise ValueError("scheduler_tick_seconds must be between 15 and 900")
+        if not 1 <= self.upload_ceiling_mbps <= 1_000:
+            raise ValueError("upload_ceiling_mbps must be between 1 and 1000")
+        if not 1 <= self.download_ceiling_mbps <= 10_000:
+            raise ValueError("download_ceiling_mbps must be between 1 and 10000")
+        if not 30 <= self.line_stall_seconds <= 900:
+            raise ValueError("line_stall_seconds must be between 30 and 900")
+        if not self.line_stall_seconds <= self.line_slow_window_seconds <= 1_800:
+            raise ValueError("line_slow_window_seconds must be between line_stall_seconds and 1800")
+        if not 1 <= self.line_minimum_mbps <= self.per_line_mbps:
+            raise ValueError("line_minimum_mbps must be between 1 and per_line_mbps")
+        if not 1 <= self.line_failure_cooldown_minutes <= 1_440:
+            raise ValueError("line_failure_cooldown_minutes must be between 1 and 1440")
+        return self
+
+
 def validate_source_pool(values: list[str]) -> list[str]:
     if not isinstance(values, list):
         raise ValueError("source_pool must be a list of HTTP/HTTPS URLs")
@@ -233,11 +312,28 @@ TOPOLOGY_ENV_MAP = {
         "LINE_COUNT": ("line_count", int),
         "LAN_IPS": ("lan_ips", _parse_csv),
     },
+    "fleet": {
+        "ROLLING_DAYS": ("rolling_days", int),
+        "TARGET_RATIO": ("target_ratio", float),
+        "PER_LINE_MBPS": ("per_line_mbps", int),
+        "ROTATION_MINUTES": ("rotation_minutes", int),
+        "SNMP_POLL_SECONDS": ("snmp_poll_seconds", int),
+        "ENGINE_STATUS_SECONDS": ("engine_status_seconds", int),
+        "SCHEDULER_TICK_SECONDS": ("scheduler_tick_seconds", int),
+    "UPLOAD_CEILING_MBPS": ("upload_ceiling_mbps", int),
+    "DOWNLOAD_CEILING_MBPS": ("download_ceiling_mbps", int),
+        "SNMP_DIRECTION_SWAP": ("snmp_direction_swap", _parse_bool),
+        "LINE_STALL_SECONDS": ("line_stall_seconds", int),
+        "LINE_SLOW_WINDOW_SECONDS": ("line_slow_window_seconds", int),
+        "LINE_MINIMUM_MBPS": ("line_minimum_mbps", int),
+        "LINE_FAILURE_COOLDOWN_MINUTES": ("line_failure_cooldown_minutes", int),
+    },
 }
 
 CONFIG_TYPES: dict[str, type[CommonConfig]] = {
     "ikuai_line": IkuaiLineConfig,
     "multi_ip": MultiIPConfig,
+    "fleet": FleetConfig,
 }
 
 REMOVED_ENV = {"EGRESS_MODE", "LAN_IP"}

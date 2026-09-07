@@ -27,6 +27,7 @@ class PublisherConfigTests(unittest.TestCase):
         self.assertEqual(cfg.probe_concurrency, 4)
         self.assertEqual(cfg.probe_bytes, 8 * 1024 * 1024)
         self.assertEqual(cfg.probe_timeout_seconds, 20)
+        self.assertEqual(cfg.min_probe_mbps, 100)
 
     def test_required_public_configuration_is_validated(self):
         from source_publisher.config import PublisherConfig
@@ -45,6 +46,7 @@ class PublisherConfigTests(unittest.TestCase):
             "PROBE_CONCURRENCY": "9",
             "PROBE_BYTES": str(1024),
             "PROBE_TIMEOUT_SECONDS": "26",
+            "MIN_PROBE_MBPS": "10001",
         }
         for name, value in invalid.items():
             with self.subTest(name=name), self.assertRaises(ValueError):

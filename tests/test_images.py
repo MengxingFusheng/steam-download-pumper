@@ -11,20 +11,23 @@ def read(name: str) -> str:
 
 
 class ImageTests(unittest.TestCase):
-    def test_repository_has_exactly_three_dockerfiles(self):
+    def test_repository_has_the_supported_dockerfiles(self):
         self.assertEqual(
             sorted(path.name for path in ROOT.glob("Dockerfile*")),
-            ["Dockerfile.ikuai-line", "Dockerfile.multi-ip", "Dockerfile.publisher"],
+            ["Dockerfile.fleet", "Dockerfile.ikuai-line", "Dockerfile.multi-ip", "Dockerfile.publisher"],
         )
 
     def test_supported_images_have_explicit_entrypoints_and_dependencies(self):
         ikuai = read("Dockerfile.ikuai-line")
         multi = read("Dockerfile.multi-ip")
+        fleet = read("Dockerfile.fleet")
 
         self.assertIn('CMD ["python3", "-m", "steam_pumper.ikuai_main"]', ikuai)
         self.assertIn('CMD ["python3", "-m", "steam_pumper.multi_ip_main"]', multi)
+        self.assertIn('CMD ["python3", "-m", "steam_pumper.fleet_main"]', fleet)
         self.assertNotIn("iproute2", ikuai)
         self.assertIn("iproute2", multi)
+        self.assertIn("snmp", fleet)
         for content in (ikuai, multi):
             self.assertIn("MAX_CONNECTIONS_PER_LINE=12", content)
             self.assertNotIn("steamcmd", content.lower())
@@ -50,6 +53,30 @@ class ImageTests(unittest.TestCase):
         self.assertNotIn("EGRESS_MODE", compose)
         self.assertNotIn("steam-download-pumper", compose)
 
+    def test_fleet_compose_is_resource_limited_and_safe_for_a_pcdn_host(self):
+        compose = read("docker-compose.fleet.yml")
+
+        for expected in (
+            "init: true", "cpu_shares: 128", "cpus: ${FLEET_CPUS:-8.0}",
+            "mem_limit: ${FLEET_MEMORY:-2g}", "pids_limit: ${FLEET_PIDS_LIMIT:-128}",
+            "cap_drop:", "- ALL", "NET_ADMIN", "no-new-privileges:true",
+            "ionice", '"-c3"', '"-n"', '"19"', "FLEET_AUTOSTART: ${FLEET_AUTOSTART:-false}",
+            "FLEET_ACCOUNTS_CSV: ${FLEET_ACCOUNTS_CSV:-}", "${FLEET_DATA_DIR:-./fleet-data}:/data", "noexec,nosuid,nodev",
+        ):
+            with self.subTest(expected=expected):
+                self.assertIn(expected, compose)
+        for forbidden in ("privileged:", "network_mode: host", "/var/run/docker.sock"):
+            self.assertNotIn(forbidden, compose)
+        fleet_service = compose.split("  fleet-pumper:", 1)[1].split("\n  fleet-web-proxy:", 1)[0]
+        self.assertNotRegex(fleet_service, r"(?m)^    ports:")
+
+    def test_fleet_environment_example_has_safe_pcdn_defaults(self):
+        env = read(".env.fleet.example")
+
+        for expected in ("FLEET_AUTOSTART=false", "FLEET_CPUS=8.0", "FLEET_MEMORY=2g", "FLEET_PIDS_LIMIT=128", "FLEET_DATA_DIR=./fleet-data"):
+            with self.subTest(expected=expected):
+                self.assertIn(expected, env)
+
     def test_multi_ip_installer_has_valid_syntax_and_no_mode_prompt(self):
         script = read("install-multi-ip.sh")
         result = subprocess.run(
@@ -71,6 +98,8 @@ class ImageTests(unittest.TestCase):
         self.assertIn("dist", dockerignore)
         self.assertIn("data/*", dockerignore)
         self.assertIn("publisher-secrets", dockerignore)
+        self.assertIn("fleet-secrets", dockerignore)
+        self.assertIn("fleet-config/accounts.csv", dockerignore)
         self.assertIn("source_signing_private_key", dockerignore)
 
 

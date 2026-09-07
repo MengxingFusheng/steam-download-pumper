@@ -9,8 +9,49 @@
 | 爱快单线路 | `traveler1314/ikuai-line-pumper:latest` | 一个容器、一个 IP、一条 WAN |
 | 多 IP V2 | `traveler1314/multi-ip-pumper:oss-v2` | 一个容器，每条 WAN 对应一个源 IP，支持 OSS 签名源清单 |
 | 源清单发布器 | `traveler1314/pumper-source-publisher:publisher-v1` | 无入站端口，每日验证并发布清单 |
+| Fleet | `traveler1314/fleet-pumper:latest` | 100+ 源 IP、SNMP 上传账本、按需启动下载线路 |
 
 GHCR 对应镜像位于 `ghcr.io/mengxingfusheng/`。OSS 远程清单仅用于标准 Docker 的多 IP V2，不作为爱快 Docker 插件的兼容功能。
+
+## Fleet：100+ PPPoE 账号滚动调度
+
+Fleet 用于“每个 PPPoE 账号都需要持续拉下载”的场景，部署在 **PCDN 服务器本机** 的 Docker 中。它不接管、不重启或修改现有 PCDN 进程；容器使用独立的 macvlan 二层接口和 LAN 源 IP，因此不会向 PCDN 宿主机添加 IP、路由或防火墙规则。每个账号仍由你在 iKuai 中静态分流到对应 PPPoE，程序只按时段启动 10–20 条下载线路，不会常驻启动全部账号。
+
+账号清单格式见 `fleet-config/accounts.csv.example`：
+
+```csv
+account_id,bind_ip,snmp_interface,enabled
+pppoe-001,192.168.2.11,pppoe-wan001,true
+```
+
+创建仅自己可读的 `fleet-secrets/ikuai_snmp_community`，再复制 `.env.fleet.example` 为 `.env.fleet`，设置 `SNMP_HOST`、LAN 网段和容器首个地址后，即可先在 PCDN 服务器启动空账号实例：
+
+```bash
+docker compose --env-file .env.fleet -f docker-compose.fleet.yml up -d
+```
+
+天津部署的 167 账号完整映射见 `fleet-config/accounts.167.csv`，使用
+`192.168.2.11–192.168.2.177/24`，iKuai/Fleet 网关为 `192.168.2.1`。CSV
+导入是整表替换，不能只上传新增账号。账号下载连续 90 秒无进度，或连续
+180 秒平均低于 50 Mbps 时，会立即停止该线路、冷却 30 分钟并从其他账号
+补位；健康线路仍遵守 30 分钟最短连续运行时间。
+
+默认 `FLEET_AUTOSTART=false`：容器只进行低频 SNMP 采样和账本预热，**不会产生下载流量**。完成单账号方向校准、源 IP→PPPoE 分流和 iKuai 的每账号 200 Mbps / 总下载 4 Gbps 硬限速验证后，再通过控制台“启动”或将 `FLEET_AUTOSTART=true` 后重建容器。
+
+账号映射可在部署后由同一 LAN 的管理设备通过 `http://CONTAINER_IP/` 上传 CSV；接口会整批校验，任一行有误不会修改当前账本或已运行线路。也可将 CSV 挂载到容器内并设置 `FLEET_ACCOUNTS_CSV` 作为首次启动的预置清单。
+
+为尽量不影响原业务，Fleet 容器默认限制为 8 CPU、2 GiB 内存、128 个进程，设置低 CPU 权重，并以 `nice 19` 与 `ionice idle` 运行；根文件系统只读、临时目录为小型 tmpfs、Docker 日志上限 10 MiB，且没有 `host` 网络、特权模式或端口映射。`FLEET_DATA_DIR` 应放在与 PCDN 缓存低竞争的本地文件系统；它只写入小型 SQLite 账本，不写下载文件。
+
+> macvlan 容器默认不能从宿主机直接访问。控制台请从同一 LAN 的其他管理设备访问 `http://CONTAINER_IP/`；或仅在需要本机管理时，按 Docker/macvlan 文档额外建立宿主机 shim 接口。该 shim 不属于默认部署，避免改变 PCDN 宿主机网络。
+
+Fleet 的 HTTP API：
+
+- `GET /api/fleet/summary`：滚动总量、倍率、预热和 SNMP 状态；
+- `GET /api/fleet/accounts`：逐账号状态；
+- `GET /api/fleet/report.csv`：滚动 15 天对账导出；
+- `POST /api/fleet/accounts/import`：以 `Content-Type: text/csv` 原子替换账号清单。
+
+下载源使用签名的 Speedtest-only 清单。候选 URL 由 `source-list/candidates.json` 维护，发布器每日两次 Range 探测，只有中位速度不低于 `MIN_PROBE_MBPS=100` 的健康源才会发布。候选至少应准备 3 个经授权的 Speedtest 下载 URL。
 
 ## 爱快单线路版
 

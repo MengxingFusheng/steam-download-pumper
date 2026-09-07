@@ -1,0 +1,126 @@
+services:
+  fleet-pumper:
+    image: ${FLEET_IMAGE:-traveler1314/fleet-pumper:latest}
+    container_name: fleet-pumper
+    restart: unless-stopped
+    init: true
+    # Keep the auxiliary downloader below the existing PCDN service when the
+    # host is under CPU, memory, process or disk-I/O pressure.
+    cpu_shares: 128
+    cpus: ${FLEET_CPUS:-8.0}
+    mem_limit: ${FLEET_MEMORY:-2g}
+    pids_limit: ${FLEET_PIDS_LIMIT:-128}
+    stop_grace_period: 30s
+    networks:
+      pumper_lan:
+        ipv4_address: ${CONTAINER_IP:-192.168.2.11}
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_ADMIN
+    security_opt:
+      - no-new-privileges:true
+    dns:
+      - 223.5.5.5
+      - 119.29.29.29
+    # No host network and no published ports: this macvlan endpoint is isolated
+    # from the PCDN process and its management page is LAN-only.
+    command: ["ionice", "-c3", "nice", "-n", "19", "python3", "-m", "steam_pumper.fleet_main"]
+    sysctls:
+      net.ipv6.conf.all.disable_ipv6: "1"
+      net.ipv6.conf.default.disable_ipv6: "1"
+      net.ipv6.conf.lo.disable_ipv6: "1"
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,noexec,nosuid,nodev,mode=1777
+      - /run:size=16m,noexec,nosuid,nodev,mode=755
+    volumes:
+      - ${FLEET_DATA_DIR:-./fleet-data}:/data
+    secrets:
+      - source: ikuai_snmp_community
+        target: /run/secrets/ikuai_snmp_community
+    environment:
+      TZ: Asia/Shanghai
+      CONFIG_PATH: /data/config.json
+      # Optional bootstrap inventory.  Leave empty to deploy first and import
+      # account mappings atomically through POST /api/fleet/accounts/import.
+      FLEET_ACCOUNTS_CSV: ${FLEET_ACCOUNTS_CSV:-}
+      # Safe deployment default.  SNMP/accounting starts, download traffic
+      # starts only after POST /api/start or an explicit true value here.
+      FLEET_AUTOSTART: ${FLEET_AUTOSTART:-false}
+      SNMP_HOST: ${SNMP_HOST}
+      SNMP_PORT: ${SNMP_PORT:-161}
+      LINE_STALL_SECONDS: ${LINE_STALL_SECONDS:-90}
+      LINE_SLOW_WINDOW_SECONDS: ${LINE_SLOW_WINDOW_SECONDS:-180}
+      LINE_MINIMUM_MBPS: ${LINE_MINIMUM_MBPS:-50}
+      LINE_FAILURE_COOLDOWN_MINUTES: ${LINE_FAILURE_COOLDOWN_MINUTES:-30}
+      DOWNLOAD_CEILING_MBPS: ${DOWNLOAD_CEILING_MBPS:-500}
+      SNMP_COMMUNITY_FILE: /run/secrets/ikuai_snmp_community
+      LAN_INTERFACE: eth0
+      LAN_PREFIX: ${LAN_PREFIX:-24}
+      REMOTE_SOURCE_LIST_ENABLED: ${REMOTE_SOURCE_LIST_ENABLED:-false}
+      SOURCE_LIST_URL: ${SOURCE_LIST_URL:-}
+      SOURCE_LIST_PUBLIC_KEY: ${SOURCE_LIST_PUBLIC_KEY:-}
+      SOURCE_LIST_KEY_ID: ${SOURCE_LIST_KEY_ID:-}
+      SOURCE_LIST_REFRESH_TIME: ${SOURCE_LIST_REFRESH_TIME:-04:00}
+      SOURCE_LIST_REFRESH_JITTER_SECONDS: ${SOURCE_LIST_REFRESH_JITTER_SECONDS:-1800}
+    logging:
+      driver: json-file
+      options:
+        max-size: 5m
+        max-file: "2"
+
+  fleet-web-proxy:
+    image: ${FLEET_IMAGE:-traveler1314/fleet-pumper:latest}
+    container_name: fleet-web-proxy
+    restart: unless-stopped
+    init: true
+    cpus: 0.25
+    mem_limit: 64m
+    pids_limit: 32
+    ports:
+      - "${FLEET_WEB_BIND:-192.168.1.15}:${FLEET_WEB_PORT:-60080}:8443"
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    tmpfs:
+      - /tmp:size=4m,noexec,nosuid,nodev,mode=1777
+    volumes:
+      - ./deploy/fleet_web_proxy.py:/app/fleet_web_proxy.py:ro
+    secrets:
+      - source: fleet_web_tls_cert
+        target: /run/secrets/fleet_web_tls_cert
+      - source: fleet_web_tls_key
+        target: /run/secrets/fleet_web_tls_key
+    environment:
+      UPSTREAM_HOST: ${CONTAINER_IP:-192.168.2.11}
+      UPSTREAM_PORT: 80
+      LISTEN_PORT: 8443
+      WEB_AUTH_USERNAME: ${FLEET_WEB_USERNAME:-fleet-admin}
+      WEB_AUTH_ENABLED: ${FLEET_WEB_AUTH_ENABLED:-false}
+    command: ["python3", "/app/fleet_web_proxy.py"]
+    logging:
+      driver: json-file
+      options:
+        max-size: 1m
+        max-file: "2"
+
+networks:
+  pumper_lan:
+    driver: macvlan
+    driver_opts:
+      parent: ${LAN_PARENT:-ens18}
+    ipam:
+      config:
+        - subnet: ${LAN_SUBNET:-192.168.2.0/24}
+          gateway: ${LAN_GATEWAY:-192.168.2.1}
+
+secrets:
+  ikuai_snmp_community:
+    file: ./fleet-secrets/ikuai_snmp_community
+  fleet_web_tls_cert:
+    file: ./fleet-secrets/fleet_web_tls.crt
+  fleet_web_tls_key:
+    file: ./fleet-secrets/fleet_web_tls.key

@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	cryptorand "crypto/rand"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -778,7 +779,7 @@ func runWorker(
 				opts, url, health.snapshot(url, time.Now()), false, sourceGeneration, sourceEpoch,
 			))
 		}
-		if _, err := downloadOnceTracked(ctx, client, url, workerID, totalBytes); err != nil {
+		if _, err := downloadOnceTracked(ctx, client, expandRequestURL(url), workerID, totalBytes); err != nil {
 			if ctx.Err() != nil {
 				if probe {
 					health.releaseProbeCurrent(url, sourceEpoch)
@@ -1011,6 +1012,28 @@ func downloadOnce(ctx context.Context, client *http.Client, url string, workerID
 	return downloadOnceTracked(ctx, client, url, workerID, nil)
 }
 
+// expandRequestURL makes a unique request for Speedtest XHR download sources.
+// Modern servers require a UUID guid and use nocache to prevent intermediary
+// caches from serving an old response. Other source URLs are left untouched.
+func expandRequestURL(rawURL string) string {
+	if !strings.Contains(rawURL, "{{guid}}") && !strings.Contains(rawURL, "{{nonce}}") {
+		return rawURL
+	}
+	guid := newRequestGUID()
+	return strings.NewReplacer("{{guid}}", guid, "{{nonce}}", guid).Replace(rawURL)
+}
+
+func newRequestGUID() string {
+	var value [16]byte
+	if _, err := cryptorand.Read(value[:]); err != nil {
+		return fmt.Sprintf("%08x-%04x-%04x-%04x-%012x", time.Now().UnixNano(), rand.Uint32(), rand.Uint32(), rand.Uint32(), rand.Uint64())
+	}
+	value[6] = (value[6] & 0x0f) | 0x40
+	value[8] = (value[8] & 0x3f) | 0x80
+	return fmt.Sprintf("%08x-%04x-%04x-%04x-%012x",
+		value[0:4], value[4:6], value[6:8], value[8:10], value[10:16])
+}
+
 func downloadOnceTracked(
 	ctx context.Context,
 	client *http.Client,
@@ -1022,7 +1045,7 @@ func downloadOnceTracked(
 	if err != nil {
 		return 0, err
 	}
-	request.Header.Set("User-Agent", "broadband-pumper/"+workerID)
+	request.Header.Set("User-Agent", requestUserAgent(url, workerID))
 	response, err := client.Do(request)
 	if err != nil {
 		return 0, err
@@ -1037,6 +1060,17 @@ func downloadOnceTracked(
 		destination = countingWriter{total: totalBytes}
 	}
 	return io.CopyBuffer(destination, response.Body, buffer)
+}
+
+func requestUserAgent(rawURL string, workerID string) string {
+	parsed, err := url.Parse(rawURL)
+	if err == nil && parsed.Path == "/download" {
+		query := parsed.Query()
+		if query.Get("guid") != "" && query.Get("nocache") != "" {
+			return "fleet-speedtest-authorized/1.0"
+		}
+	}
+	return "broadband-pumper/" + workerID
 }
 
 func sleepWithContext(ctx context.Context, duration time.Duration) error {

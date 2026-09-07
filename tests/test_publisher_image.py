@@ -28,9 +28,9 @@ class PublisherImageTests(unittest.TestCase):
         self.assertIn("f6c95ba0c2d2ef30290af686ce4d706c701f4734ce8090bee4288a77e3f1d764", dockerfile)
         self.assertIn("sha256sum -c", dockerfile)
 
-    def test_repository_has_exactly_three_dockerfiles(self):
+    def test_repository_has_the_supported_dockerfiles(self):
         self.assertEqual(sorted(path.name for path in ROOT.glob("Dockerfile*")), [
-            "Dockerfile.ikuai-line", "Dockerfile.multi-ip", "Dockerfile.publisher"
+            "Dockerfile.fleet", "Dockerfile.ikuai-line", "Dockerfile.multi-ip", "Dockerfile.publisher"
         ])
 
 

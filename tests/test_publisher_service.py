@@ -145,6 +145,25 @@ class PublisherServiceTests(unittest.TestCase):
             with self.assertRaises(InsufficientSources):
                 service.run(now)
 
+    def test_low_speed_sources_are_not_published(self):
+        from source_publisher.config import PublisherSecrets
+        from source_publisher.probe import ProbeResult
+        from source_publisher.service import InsufficientSources, PublicationService
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = self._config(root)
+            now = datetime.now(ZoneInfo("Asia/Shanghai"))
+            probes = lambda urls, **kwargs: [
+                ProbeResult(url, now, 99.9, 4_194_304, True, "") for url in urls
+            ]
+            service = PublicationService(
+                config, PublisherSecrets("private", "id", "secret"),
+                oss_client=_FakeOSS(), probe_fn=probes, sign_fn=_envelope, verify_fn=_verify,
+            )
+            with self.assertRaises(InsufficientSources):
+                service.run(now)
+
     def test_restart_recovers_remote_commit_without_republishing(self):
         from source_publisher.config import PublisherSecrets
         from source_publisher.probe import ProbeResult

@@ -16,7 +16,7 @@ class PublisherDeployTests(unittest.TestCase):
             "read_only: true", "cap_drop:", "- ALL", "no-new-privileges:true",
             "pids_limit: 64", "mem_limit: 192m", "cpus: 0.50",
             "/tmp:size=64m,noexec,nosuid,nodev", "source_publisher_state:/state",
-            "./publisher-config/candidates.json:/config/candidates.json:ro",
+            "./source-list/candidates.json:/config/candidates.json:ro",
         ]
         for value in required:
             with self.subTest(value=value):

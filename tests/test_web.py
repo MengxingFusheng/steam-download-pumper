@@ -86,6 +86,33 @@ class WebTests(unittest.TestCase):
 
         self.assertEqual(result.returncode, 0, result.stderr)
 
+    def test_fleet_console_has_accessible_rolling_ratio_chart(self):
+        html = render_html("fleet")
+
+        for expected in (
+            "滚动 15 天上传与下载倍率",
+            'id="rollingRatio"',
+            'id="rollingUpload"',
+            'id="rollingDownload"',
+            'id="ratioTargetMarker"',
+            'role="img"',
+            "function updateFleetRatio",
+            "updateFleetRatio(metrics,status.config||{})",
+        ):
+            self.assertIn(expected, html)
+        self.assertNotIn("{{FLEET_RATIO_SECTION}}", html)
+
+    def test_ratio_chart_is_only_rendered_for_fleet(self):
+        self.assertNotIn('id="fleetRatioSection"', render_html("multi_ip"))
+        self.assertNotIn('id="fleetRatioSection"', render_html("ikuai_line"))
+
+    def test_fleet_source_section_describes_local_or_remote_download_sources(self):
+        html = render_html("fleet")
+
+        self.assertIn("下载源清单", html)
+        self.assertIn('id="sourceListRefresh"', html)
+        self.assertIn("sourceList.enabled===false?'none'", html)
+
     def test_ikuai_console_has_no_ip_or_line_count_fields(self):
         html = render_html("ikuai_line")
 
@@ -243,6 +270,67 @@ class WebTests(unittest.TestCase):
 
         self.assertEqual(raised.exception.code, 400)
         self.assertEqual(payload, {"error": "bad config"})
+
+    def test_fleet_account_and_report_endpoints(self):
+        class FleetController(DummyController):
+            def accounts_snapshot(self):
+                return [{"account_id": "a1", "active": True, "ratio": 2.0}]
+
+            def summary(self):
+                return {"active_accounts": 1, "snmp_status": "online"}
+
+            def report_csv(self):
+                return "account_id,ratio\na1,2.0\n"
+
+            def import_accounts_csv(self, value):
+                self.imported = value
+                return {"ok": True, "accounts": 1}
+
+        controller = FleetController()
+        Handler.controller = controller
+        Handler.topology_name = "fleet"
+        server = HTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        base = f"http://127.0.0.1:{server.server_port}"
+        try:
+            accounts = self._get_json(f"{base}/api/fleet/accounts")
+            summary = self._get_json(f"{base}/api/fleet/summary")
+            report = urllib.request.urlopen(f"{base}/api/fleet/report.csv", timeout=2).read().decode()
+            request = urllib.request.Request(
+                f"{base}/api/fleet/accounts/import", data=b"account_id,bind_ip,snmp_interface\\na1,192.168.1.10,pppoe-a1\\n",
+                headers={"content-type": "text/csv"}, method="POST",
+            )
+            imported = json.loads(urllib.request.urlopen(request, timeout=2).read().decode())
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2)
+
+        self.assertEqual(accounts[0]["account_id"], "a1")
+        self.assertEqual(summary["snmp_status"], "online")
+        self.assertIn("account_id,ratio", report)
+        self.assertEqual(imported["accounts"], 1)
+
+    def test_fleet_console_offers_atomic_csv_account_import(self):
+        html = render_html("fleet")
+
+        for expected in (
+            'id="fleetAccountsForm"', 'id="fleetAccountsFile"',
+            "上传账号 CSV", "/api/fleet/accounts/import", "text/csv",
+        ):
+            with self.subTest(expected=expected):
+                self.assertIn(expected, html)
+
+    def test_fleet_console_shows_actual_schedule_not_common_time_window(self):
+        html = render_html("fleet")
+
+        for expected in ("Fleet 固定调度", "01:00–07:00", "按 15 天欠量动态补足", 'name="per_line_mbps"'):
+            with self.subTest(expected=expected):
+                self.assertIn(expected, html)
+        self.assertNotIn('name="target_mbps"', html)
+        self.assertNotIn('name="start_time"', html)
+        self.assertNotIn('name="end_time"', html)
 
     @staticmethod
     def _get_json(url):

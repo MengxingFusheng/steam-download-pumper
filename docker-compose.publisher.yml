@@ -14,7 +14,7 @@ services:
     tmpfs:
       - /tmp:size=64m,noexec,nosuid,nodev,mode=1777
     volumes:
-      - ./publisher-config/candidates.json:/config/candidates.json:ro
+      - ./source-list/candidates.json:/config/candidates.json:ro
       - source_publisher_state:/state
     secrets:
       - source: source_signing_private_key
@@ -36,6 +36,7 @@ services:
       MAX_HEALTHY_SOURCES: ${MAX_HEALTHY_SOURCES:-100}
       PROBE_CONCURRENCY: ${PROBE_CONCURRENCY:-4}
       PROBE_TIMEOUT_SECONDS: ${PROBE_TIMEOUT_SECONDS:-20}
+      MIN_PROBE_MBPS: ${MIN_PROBE_MBPS:-100}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
     logging:
       driver: json-file

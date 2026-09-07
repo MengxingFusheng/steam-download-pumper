@@ -161,7 +161,10 @@ class PublicationService:
             deadline=probe_deadline,
         )
         _ensure_active(cancellation, absolute_deadline)
-        healthy = [result for result in results if result.success]
+        healthy = [
+            result for result in results
+            if result.success and result.probe_mbps >= self.config.min_probe_mbps
+        ]
         if len(healthy) < self.config.min_healthy_sources:
             raise InsufficientSources("fewer than the required healthy sources")
         if recovered is not None:

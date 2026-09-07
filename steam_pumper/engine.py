@@ -67,7 +67,7 @@ def build_engine_command(
         "--restart-jitter-seconds",
         str(cfg.worker_restart_jitter_seconds),
         "--status-interval-seconds",
-        "1",
+        str(getattr(cfg, "engine_status_seconds", 1)),
     ]
     if line.bind_ip:
         command.extend(["--bind-ip", line.bind_ip])

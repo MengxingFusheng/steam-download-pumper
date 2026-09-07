@@ -13,6 +13,7 @@ from steam_pumper.config import (
     IkuaiLineConfig,
     MultiIPConfig,
     default_source_pool,
+    default_speedtest_source_pool,
     load_config,
     save_config,
     validate_source_pool,
@@ -20,6 +21,19 @@ from steam_pumper.config import (
 
 
 class ConfigTests(unittest.TestCase):
+    def test_fleet_line_health_thresholds_are_validated(self):
+        from steam_pumper.config import FleetConfig
+
+        cfg = FleetConfig()
+        self.assertEqual(
+            (cfg.line_stall_seconds, cfg.line_slow_window_seconds, cfg.line_minimum_mbps, cfg.line_failure_cooldown_minutes),
+            (90, 180, 50, 30),
+        )
+        with self.assertRaises(ValueError):
+            FleetConfig(line_slow_window_seconds=60).validate()
+        with self.assertRaises(ValueError):
+            FleetConfig(line_minimum_mbps=201).validate()
+
     def test_supported_configs_share_names_and_expected_defaults(self):
         shared_names = {
             "target_mbps",
@@ -117,6 +131,17 @@ class ConfigTests(unittest.TestCase):
         )
         self.assertEqual(len(sources), len(set(sources)))
         self.assertFalse(any("jsinfo.net" in source for source in sources))
+
+    def test_fleet_speedtest_fallbacks_are_distinct_validated_sources(self):
+        self.assertEqual(
+            default_speedtest_source_pool(),
+            [
+                "http://speedtest1.online.sh.cn:8080/speedtest/random4000x4000.jpg",
+                "http://spt1.seed.net.tw:8080/speedtest/random4000x4000.jpg",
+                "http://fetzl1.seed.net.tw:8080/speedtest/random4000x4000.jpg",
+                "http://fetsz1.seed.net.tw:8080/speedtest/random4000x4000.jpg",
+            ],
+        )
 
     def test_source_pool_deduplicates_urls_without_reordering(self):
         sources = validate_source_pool(

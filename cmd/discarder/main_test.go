@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -193,6 +194,30 @@ func TestDownloadOnceDiscardsBodyAndReturnsByteCount(t *testing.T) {
 
 	if got != 6 {
 		t.Fatalf("downloadOnce bytes = %d, want 6", got)
+	}
+}
+
+func TestExpandRequestURLReplacesSpeedtestTokensWithOneUUID(t *testing.T) {
+	expanded := expandRequestURL("http://speed.example/download?guid={{guid}}&nocache={{nonce}}")
+	parsed, err := url.Parse(expanded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	query := parsed.Query()
+	if query.Get("guid") == "" || query.Get("guid") != query.Get("nocache") {
+		t.Fatalf("tokens were not replaced consistently: %q", expanded)
+	}
+	if strings.Contains(expanded, "{{") {
+		t.Fatalf("template token remained in %q", expanded)
+	}
+}
+
+func TestRequestUserAgentUsesAuthorizedIdentifierOnlyForSpeedtestXHR(t *testing.T) {
+	if got := requestUserAgent("http://speed.example/download?guid=x&nocache=y", "worker"); got != "fleet-speedtest-authorized/1.0" {
+		t.Fatalf("Speedtest XHR user agent = %q", got)
+	}
+	if got := requestUserAgent("http://speed.example/file", "worker"); got != "broadband-pumper/worker" {
+		t.Fatalf("generic user agent = %q", got)
 	}
 }
 

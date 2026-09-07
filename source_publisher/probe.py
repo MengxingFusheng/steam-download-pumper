@@ -9,6 +9,7 @@ import ssl
 import statistics
 import threading
 import time
+import uuid
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -344,6 +345,14 @@ def _probe_once(
     raise ValueError("probe redirect limit exceeded")
 
 
+def _expand_speedtest_template(url: str) -> str:
+    """Expand the per-request values required by Speedtest XHR download URLs."""
+    if "{{guid}}" not in url and "{{nonce}}" not in url:
+        return url
+    value = str(uuid.uuid4())
+    return url.replace("{{guid}}", value).replace("{{nonce}}", value)
+
+
 def probe_source(
     url: str,
     *,
@@ -366,7 +375,7 @@ def probe_source(
             if remaining <= 0:
                 raise TimeoutError("probe deadline exceeded")
             read, mbps = _probe_once(
-                url,
+                _expand_speedtest_template(url),
                 min(timeout, remaining),
                 resolver,
                 cancellation,

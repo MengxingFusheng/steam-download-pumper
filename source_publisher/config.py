@@ -67,6 +67,7 @@ class PublisherConfig:
     probe_concurrency: int
     probe_bytes: int
     probe_timeout_seconds: int
+    min_probe_mbps: int
     candidates_path: Path
     state_dir: Path
     secret_dir: Path
@@ -117,6 +118,7 @@ class PublisherConfig:
         concurrency = _integer(values, "PROBE_CONCURRENCY", 4)
         probe_bytes = _integer(values, "PROBE_BYTES", FIXED_PROBE_BYTES)
         timeout = _integer(values, "PROBE_TIMEOUT_SECONDS", 20)
+        min_probe_mbps = _integer(values, "MIN_PROBE_MBPS", 100)
         if minimum < 3:
             raise ValueError("MIN_HEALTHY_SOURCES must be at least 3")
         if maximum < minimum or maximum > 100:
@@ -127,6 +129,8 @@ class PublisherConfig:
             raise ValueError("PROBE_BYTES is fixed at 8388608")
         if not 1 <= timeout <= 25:
             raise ValueError("PROBE_TIMEOUT_SECONDS must be between 1 and 25")
+        if not 0 <= min_probe_mbps <= 10_000:
+            raise ValueError("MIN_PROBE_MBPS must be between 0 and 10000")
 
         return cls(
             bucket=bucket,
@@ -142,6 +146,7 @@ class PublisherConfig:
             probe_concurrency=concurrency,
             probe_bytes=probe_bytes,
             probe_timeout_seconds=timeout,
+            min_probe_mbps=min_probe_mbps,
             candidates_path=Path(values.get("CANDIDATES_PATH", "/config/candidates.json")),
             state_dir=Path(values.get("STATE_DIR", "/state")),
             secret_dir=SECRET_DIR,

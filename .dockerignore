@@ -8,6 +8,8 @@ dist/
 tests/
 docs/
 publisher-secrets/
+fleet-secrets/
+fleet-config/accounts.csv
 **/source_signing_private_key
 **/oss_access_key_id
 **/oss_access_key_secret
