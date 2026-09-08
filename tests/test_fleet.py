@@ -210,7 +210,13 @@ class FleetScheduleTests(unittest.TestCase):
         from steam_pumper.fleet import FleetController, parse_accounts_csv
 
         zone = ZoneInfo("Asia/Shanghai")
-        now = datetime.now(zone)
+        now = datetime(2026, 9, 8, 12, 0, tzinfo=zone)
+
+        class FixedDateTime(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return now if tz is None else now.astimezone(tz)
+
         with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {"APPLY_LAN_IPS": "0"}, clear=False):
             controller = FleetController(Path(directory) / "config.json", FleetConfig().validate(), snmp_reader=None)
             controller.store.import_accounts(parse_accounts_csv("account_id,bind_ip,snmp_interface\na1,192.168.2.11,pppoe-a1\n"))
@@ -219,7 +225,8 @@ class FleetScheduleTests(unittest.TestCase):
                 controller.store._add_traffic("a1", minute, measured_upload=100, measured_download=150, download=125)
             controller.rate_samples.extend([(1.0, 0), (2.0, 25_000_000)])
 
-            metrics = controller.metrics()
+            with patch("steam_pumper.fleet.datetime", FixedDateTime):
+                metrics = controller.metrics()
 
             self.assertEqual(metrics["today_bytes"], 150)
             self.assertEqual(metrics["today_upload_bytes"], 100)
@@ -347,9 +354,12 @@ class FleetScheduleTests(unittest.TestCase):
             self.assertEqual(controller._desired_count(datetime(2026, 8, 1, 0, 30, tzinfo=zone), account), 10)
             self.assertEqual(controller._desired_count(datetime(2026, 8, 1, 2, 0, tzinfo=zone), account), 20)
             self.assertEqual(controller._desired_count(datetime(2026, 8, 1, 12, 0, tzinfo=zone), account), 10)
+            self.assertEqual(controller._desired_count(datetime(2026, 8, 1, 17, 59, 59, tzinfo=zone), account), 10)
+            self.assertEqual(controller._desired_count(datetime(2026, 8, 1, 18, 0, tzinfo=zone), account), 0)
+            self.assertEqual(controller._desired_count(datetime(2026, 8, 1, 23, 59, 59, tzinfo=zone), account), 0)
             controller.shutdown()
 
-    def test_evening_slots_use_recent_actual_upload_rate(self):
+    def test_evening_window_never_downloads_even_when_accounts_have_debt(self):
         from steam_pumper.config import FleetConfig
         from steam_pumper.fleet import FleetController, parse_accounts_csv
 
@@ -358,14 +368,7 @@ class FleetScheduleTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {"APPLY_LAN_IPS": "0"}, clear=False):
             controller = FleetController(Path(directory) / "config.json", FleetConfig().validate(), snmp_reader=None)
             controller.store.import_accounts(parse_accounts_csv("account_id,bind_ip,snmp_interface\na1,192.168.2.11,pppoe-a1\n"))
-            totals = {"a1": {"upload": 0, "download": 0}}
-            with patch.object(controller.store, "rolling", return_value=totals), patch.object(
-                controller.store, "recent_upload_rates", return_value={"a1": 50_000_000 / 8},
-            ):
-                self.assertEqual(controller._desired_count(now, controller.store.accounts()), 1)
-            with patch.object(controller.store, "rolling", return_value=totals), patch.object(
-                controller.store, "recent_upload_rates", return_value={"a1": 0.0},
-            ):
+            with patch.object(controller.store, "rolling", side_effect=AssertionError("evening must not calculate debt")):
                 self.assertEqual(controller._desired_count(now, controller.store.accounts()), 0)
             controller.shutdown()
 

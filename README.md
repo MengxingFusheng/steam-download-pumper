@@ -36,6 +36,10 @@ docker compose --env-file .env.fleet -f docker-compose.fleet.yml up -d
 180 秒平均低于 50 Mbps 时，会立即停止该线路、冷却 30 分钟并从其他账号
 补位；健康线路仍遵守 30 分钟最短连续运行时间。
 
+Fleet 固定按 `00:00–01:00` 2 Gbps、`01:00–07:00` 4 Gbps、
+`07:00–18:00` 2 Gbps 调度。`18:00–24:00` 为 PCDN 上传专用时段，
+不启动任何 Fleet 下载进程，但 SNMP 采样和滚动账本仍持续运行。
+
 默认 `FLEET_AUTOSTART=false`：容器只进行低频 SNMP 采样和账本预热，**不会产生下载流量**。完成单账号方向校准、源 IP→PPPoE 分流和 iKuai 的每账号 200 Mbps / 总下载 4 Gbps 硬限速验证后，再通过控制台“启动”或将 `FLEET_AUTOSTART=true` 后重建容器。
 
 账号映射可在部署后由同一 LAN 的管理设备通过 `http://CONTAINER_IP/` 上传 CSV；接口会整批校验，任一行有误不会修改当前账本或已运行线路。也可将 CSV 挂载到容器内并设置 `FLEET_ACCOUNTS_CSV` 作为首次启动的预置清单。

@@ -57,9 +57,9 @@ def _fleet_schedule_section(topology_name: str) -> str:
       <tr><td>00:00–01:00</td><td>2 Gbps</td><td>10</td></tr>
       <tr><td>01:00–07:00</td><td>4 Gbps</td><td>20</td></tr>
       <tr><td>07:00–18:00</td><td>2 Gbps</td><td>10</td></tr>
-      <tr><td>18:00–24:00</td><td>按 15 天欠量动态补足，0–2 Gbps</td><td>0–10</td></tr>
+      <tr><td>18:00–24:00</td><td>停止下载，仅保留 SNMP 采集与账本</td><td>0</td></tr>
     </tbody></table></div>
-    <p>iKuai 的 4 Gbps 是总下载硬上限；此表才是 Fleet 实际调度依据。</p>
+    <p>iKuai 的 4 Gbps 是总下载硬上限；此表才是 Fleet 实际调度依据。18:00 到达时会停止全部 Fleet 下载线路。</p>
   </section>
     """
 

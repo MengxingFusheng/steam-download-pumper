@@ -325,12 +325,13 @@ class WebTests(unittest.TestCase):
     def test_fleet_console_shows_actual_schedule_not_common_time_window(self):
         html = render_html("fleet")
 
-        for expected in ("Fleet 固定调度", "01:00–07:00", "按 15 天欠量动态补足", 'name="per_line_mbps"'):
+        for expected in ("Fleet 固定调度", "01:00–07:00", "停止下载，仅保留 SNMP 采集与账本", 'name="per_line_mbps"'):
             with self.subTest(expected=expected):
                 self.assertIn(expected, html)
         self.assertNotIn('name="target_mbps"', html)
         self.assertNotIn('name="start_time"', html)
         self.assertNotIn('name="end_time"', html)
+        self.assertNotIn("按 15 天欠量动态补足", html)
 
     @staticmethod
     def _get_json(url):

@@ -1036,21 +1036,8 @@ class FleetController:
             return 20
         if 7 <= current.hour < 18:
             return 10
-        end = now.replace(hour=23, minute=59, second=59, microsecond=0)
-        remaining = max(1.0, (end - now).total_seconds())
-        totals = self.store.rolling(end)
-        recent_upload_rates = self.store.recent_upload_rates(now)
-        debt = sum(
-            max(
-                0,
-                int((values["upload"] + recent_upload_rates.get(account.account_id, 0.0) * remaining) * self.cfg.target_ratio)
-                - values["download"],
-            )
-            for account in accounts
-            for values in [totals[account.account_id]]
-        )
-        required_mbps = debt * 8 / remaining / 1_000_000
-        return min(10, math.ceil(required_mbps / self.cfg.per_line_mbps))
+        # Reserve the complete PCDN upload window for the original workload.
+        return 0
 
     def _start(self, account: FleetAccount, now: datetime) -> None:
         line = LogicalLine(account.account_id, self.cfg.per_line_mbps, account.bind_ip)
