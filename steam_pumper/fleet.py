@@ -736,6 +736,14 @@ class FleetStore:
     def _set_meta(self, key: str, value: str) -> None:
         self.db.execute("INSERT INTO meta(key,value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, value))
 
+    def load_manual_enabled(self, default: bool) -> bool:
+        value = self._meta("manual_enabled")
+        return default if value is None else value == "1"
+
+    def save_manual_enabled(self, enabled: bool) -> None:
+        with self.db:
+            self._set_meta("manual_enabled", "1" if enabled else "0")
+
 
 @dataclass
 class ActiveLine:
@@ -762,11 +770,10 @@ class FleetController:
         self.data_dir = self.config_path.parent
         self.store = FleetStore(self.data_dir / "fleet.sqlite3", self.cfg)
         self.lock = threading.RLock()
-        # A fleet container normally lives beside the PCDN workload.  Keep
-        # accounting active after boot, but require an explicit operator action
-        # before it creates download traffic.  This switch is intentionally an
-        # environment-only deployment control, not a mutable Web setting.
-        self.manual_enabled = _environment_flag("FLEET_AUTOSTART", False)
+        # The environment controls the safe first-boot default. Once an
+        # operator starts or stops the fleet, preserve that choice across an
+        # unexpected container restart in the SQLite data volume.
+        self.manual_enabled = self.store.load_manual_enabled(_environment_flag("FLEET_AUTOSTART", False))
         self.active: dict[str, ActiveLine] = {}
         self.logs: list[str] = []
         self.last_snmp_at = 0.0
@@ -868,8 +875,15 @@ class FleetController:
             except Exception as exc:
                 self.snmp_results.put((None, None, datetime.now(SHANGHAI), exc))
 
-        self.snmp_thread = threading.Thread(target=collect, name="fleet-snmp", daemon=True)
-        self.snmp_thread.start()
+        try:
+            thread = threading.Thread(target=collect, name="fleet-snmp", daemon=True)
+            thread.start()
+        except (RuntimeError, OSError):
+            self.snmp_thread = None
+            self.snmp_status = "degraded"
+            self.log("SNMP worker could not start; collection will retry without stopping the service")
+            return
+        self.snmp_thread = thread
 
     def _consume_snmp_result(self, now: datetime) -> bool:
         changed = False
@@ -1060,13 +1074,14 @@ class FleetController:
             self._stop(account_id)
 
     def start_downloads(self) -> None:
-        self.manual_enabled = True
+        self.set_manual_enabled(True)
 
     def stop_downloads(self) -> None:
-        self._stop_all()
+        self.set_manual_enabled(False)
 
     def set_manual_enabled(self, enabled: bool) -> None:
         self.manual_enabled = enabled
+        self.store.save_manual_enabled(enabled)
         if not enabled:
             self._stop_all()
 

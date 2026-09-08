@@ -58,7 +58,7 @@ class ImageTests(unittest.TestCase):
 
         for expected in (
             "init: true", "cpu_shares: 128", "cpus: ${FLEET_CPUS:-8.0}",
-            "mem_limit: ${FLEET_MEMORY:-2g}", "pids_limit: ${FLEET_PIDS_LIMIT:-128}",
+            "mem_limit: ${FLEET_MEMORY:-2g}", "pids_limit: ${FLEET_PIDS_LIMIT:-512}",
             "cap_drop:", "- ALL", "NET_ADMIN", "no-new-privileges:true",
             "ionice", '"-c3"', '"-n"', '"19"', "FLEET_AUTOSTART: ${FLEET_AUTOSTART:-false}",
             "FLEET_ACCOUNTS_CSV: ${FLEET_ACCOUNTS_CSV:-}", "${FLEET_DATA_DIR:-./fleet-data}:/data", "noexec,nosuid,nodev",
@@ -73,7 +73,7 @@ class ImageTests(unittest.TestCase):
     def test_fleet_environment_example_has_safe_pcdn_defaults(self):
         env = read(".env.fleet.example")
 
-        for expected in ("FLEET_AUTOSTART=false", "FLEET_CPUS=8.0", "FLEET_MEMORY=2g", "FLEET_PIDS_LIMIT=128", "FLEET_DATA_DIR=./fleet-data"):
+        for expected in ("FLEET_AUTOSTART=false", "FLEET_CPUS=8.0", "FLEET_MEMORY=2g", "FLEET_PIDS_LIMIT=512", "FLEET_DATA_DIR=./fleet-data"):
             with self.subTest(expected=expected):
                 self.assertIn(expected, env)
 

@@ -40,7 +40,7 @@ docker compose --env-file .env.fleet -f docker-compose.fleet.yml up -d
 
 账号映射可在部署后由同一 LAN 的管理设备通过 `http://CONTAINER_IP/` 上传 CSV；接口会整批校验，任一行有误不会修改当前账本或已运行线路。也可将 CSV 挂载到容器内并设置 `FLEET_ACCOUNTS_CSV` 作为首次启动的预置清单。
 
-为尽量不影响原业务，Fleet 容器默认限制为 8 CPU、2 GiB 内存、128 个进程，设置低 CPU 权重，并以 `nice 19` 与 `ionice idle` 运行；根文件系统只读、临时目录为小型 tmpfs、Docker 日志上限 10 MiB，且没有 `host` 网络、特权模式或端口映射。`FLEET_DATA_DIR` 应放在与 PCDN 缓存低竞争的本地文件系统；它只写入小型 SQLite 账本，不写下载文件。
+为尽量不影响原业务，Fleet 容器默认限制为 8 CPU、2 GiB 内存、512 个 PID（为 20 条 Go 下载进程及 SNMP 采集线程保留余量），设置低 CPU 权重，并以 `nice 19` 与 `ionice idle` 运行；根文件系统只读、临时目录为小型 tmpfs、Docker 日志上限 10 MiB，且没有 `host` 网络、特权模式或端口映射。`FLEET_DATA_DIR` 应放在与 PCDN 缓存低竞争的本地文件系统；它只写入小型 SQLite 账本，不写下载文件。
 
 > macvlan 容器默认不能从宿主机直接访问。控制台请从同一 LAN 的其他管理设备访问 `http://CONTAINER_IP/`；或仅在需要本机管理时，按 Docker/macvlan 文档额外建立宿主机 shim 接口。该 shim 不属于默认部署，避免改变 PCDN 宿主机网络。
 

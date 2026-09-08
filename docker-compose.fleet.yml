@@ -9,7 +9,7 @@ services:
     cpu_shares: 128
     cpus: ${FLEET_CPUS:-8.0}
     mem_limit: ${FLEET_MEMORY:-2g}
-    pids_limit: ${FLEET_PIDS_LIMIT:-128}
+    pids_limit: ${FLEET_PIDS_LIMIT:-512}
     stop_grace_period: 30s
     networks:
       pumper_lan:

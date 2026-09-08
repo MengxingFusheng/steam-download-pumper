@@ -296,6 +296,45 @@ class FleetScheduleTests(unittest.TestCase):
             self.assertTrue(controller.manual_enabled)
             controller.shutdown()
 
+    def test_manual_enabled_state_survives_an_unexpected_container_restart(self):
+        from steam_pumper.config import FleetConfig
+        from steam_pumper.fleet import FleetController
+
+        with tempfile.TemporaryDirectory() as directory, patch.dict(
+            os.environ,
+            {"APPLY_LAN_IPS": "0", "FLEET_AUTOSTART": "false"},
+            clear=False,
+        ):
+            config_path = Path(directory) / "config.json"
+            controller = FleetController(config_path, FleetConfig().validate(), snmp_reader=None)
+            controller.set_manual_enabled(True)
+            controller.shutdown()
+
+            restarted = FleetController(config_path, FleetConfig().validate(), snmp_reader=None)
+            self.assertTrue(restarted.manual_enabled)
+            restarted.set_manual_enabled(False)
+            restarted.shutdown()
+
+            os.environ["FLEET_AUTOSTART"] = "true"
+            stopped = FleetController(config_path, FleetConfig().validate(), snmp_reader=None)
+            self.assertFalse(stopped.manual_enabled)
+            stopped.shutdown()
+
+    def test_snmp_thread_exhaustion_degrades_without_crashing_controller(self):
+        from steam_pumper.config import FleetConfig
+        from steam_pumper.fleet import FleetController
+
+        reader = SimpleNamespace(read=lambda: [])
+        with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {"APPLY_LAN_IPS": "0"}, clear=False):
+            controller = FleetController(Path(directory) / "config.json", FleetConfig().validate(), snmp_reader=reader)
+            with patch("steam_pumper.fleet.threading.Thread") as thread_class:
+                thread_class.return_value.start.side_effect = RuntimeError("can't start new thread")
+                controller._start_snmp_poll()
+            self.assertEqual(controller.snmp_status, "degraded")
+            self.assertIsNone(controller.snmp_thread)
+            self.assertIn("collection will retry", controller.logs[-1])
+            controller.shutdown()
+
     def test_schedule_uses_ten_twenty_ten_base_slots(self):
         from steam_pumper.config import FleetConfig
         from steam_pumper.fleet import FleetController, parse_accounts_csv
