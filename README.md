@@ -30,8 +30,8 @@ pppoe-001,192.168.2.11,pppoe-wan001,true
 docker compose --env-file .env.fleet -f docker-compose.fleet.yml up -d
 ```
 
-天津部署的 167 账号完整映射见 `fleet-config/accounts.167.csv`，使用
-`192.168.2.11–192.168.2.177/24`，iKuai/Fleet 网关为 `192.168.2.1`。CSV
+天津当前部署的 139 账号完整映射见 `fleet-config/accounts.139.csv`，使用
+`192.168.2.11–192.168.2.149/24`，iKuai/Fleet 网关为 `192.168.2.1`。CSV
 导入是整表替换，不能只上传新增账号。账号下载连续 90 秒无进度，或连续
 180 秒平均低于 50 Mbps 时，会立即停止该线路、冷却 30 分钟并从其他账号
 补位；健康线路仍遵守 30 分钟最短连续运行时间。

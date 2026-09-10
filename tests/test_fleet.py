@@ -27,16 +27,16 @@ class FleetCsvTests(unittest.TestCase):
                 "a1,192.168.1.11,pppoe-a2\n"
             )
 
-    def test_167_account_inventory_uses_the_complete_new_subnet_range(self):
+    def test_139_account_inventory_uses_the_complete_current_subnet_range(self):
         from steam_pumper.fleet import parse_accounts_csv
 
-        path = Path(__file__).resolve().parents[1] / "fleet-config" / "accounts.167.csv"
+        path = Path(__file__).resolve().parents[1] / "fleet-config" / "accounts.139.csv"
         accounts = parse_accounts_csv(path.read_text(encoding="utf-8"))
-        self.assertEqual(len(accounts), 167)
+        self.assertEqual(len(accounts), 139)
         self.assertEqual(accounts[0].bind_ip, "192.168.2.11")
-        self.assertEqual(accounts[-1].bind_ip, "192.168.2.177")
-        self.assertEqual(len({item.account_id for item in accounts}), 167)
-        self.assertEqual(len({item.snmp_interface for item in accounts}), 167)
+        self.assertEqual(accounts[-1].bind_ip, "192.168.2.149")
+        self.assertEqual(len({item.account_id for item in accounts}), 139)
+        self.assertEqual(len({item.snmp_interface for item in accounts}), 139)
 
 
 class FleetLedgerTests(unittest.TestCase):
