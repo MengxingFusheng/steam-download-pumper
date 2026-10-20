@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Iterable
 from zoneinfo import ZoneInfo
 
-from .probe import ProbeResult
+from .probe import ProbeResult, rank_result
 
 
 MAX_MANIFEST_BYTES = 512 * 1024
@@ -36,6 +36,7 @@ def build_payload(
     *,
     max_sources: int = 100,
     previous_revision: int = 0,
+    preserve_order: bool = False,
 ) -> tuple[bytes, int]:
     generated = generated_at.astimezone(SHANGHAI)
     revision = int(generated.strftime("%Y%m%d%H%M%S"))
@@ -46,7 +47,8 @@ def build_payload(
         for result in results
         if result.success and math.isfinite(result.probe_mbps) and result.probe_mbps >= 0
     ]
-    healthy.sort(key=lambda result: (-result.probe_mbps, result.url))
+    if not preserve_order:
+        healthy.sort(key=rank_result)
     sources = [
         {
             "url": result.url,

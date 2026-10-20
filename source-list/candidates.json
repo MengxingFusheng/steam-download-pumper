@@ -1,9 +1,133 @@
 {
   "schema": 1,
   "sources": [
-    {"url": "http://speedtest1.online.sh.cn:8080/speedtest/random4000x4000.jpg", "enabled": true},
-    {"url": "http://spt1.seed.net.tw:8080/speedtest/random4000x4000.jpg", "enabled": true},
-    {"url": "http://fetzl1.seed.net.tw:8080/speedtest/random4000x4000.jpg", "enabled": true},
-    {"url": "http://fetsz1.seed.net.tw:8080/speedtest/random4000x4000.jpg", "enabled": true}
+    {
+      "url": "http://speedtest1.online.sh.cn:8080/speedtest/random4000x4000.jpg",
+      "enabled": true
+    },
+    {
+      "url": "http://spt1.seed.net.tw:8080/speedtest/random4000x4000.jpg",
+      "enabled": true
+    },
+    {
+      "url": "http://fetzl1.seed.net.tw:8080/speedtest/random4000x4000.jpg",
+      "enabled": true
+    },
+    {
+      "url": "http://fetsz1.seed.net.tw:8080/speedtest/random4000x4000.jpg",
+      "enabled": true
+    },
+    {
+      "url": "https://mirror.iscas.ac.cn/ubuntu-releases/24.04.4/ubuntu-24.04.4-live-server-amd64.iso",
+      "enabled": true
+    },
+    {
+      "url": "https://mirrors.huaweicloud.com/ubuntu-releases/24.04/ubuntu-24.04.4-live-server-amd64.iso",
+      "enabled": true
+    },
+    {
+      "url": "https://librespeed.a573.net/backend/garbage.php?ckSize=64",
+      "enabled": true
+    },
+    {
+      "url": "https://la.speedtest.clouvider.net/backend/garbage.php?ckSize=64",
+      "enabled": true
+    },
+    {
+      "url": "https://laxspeed.sharktech.net/backend/garbage.php?ckSize=64",
+      "enabled": true
+    },
+    {
+      "url": "https://ams.speedtest.clouvider.net/backend/garbage.php?ckSize=64",
+      "enabled": true
+    },
+    {
+      "url": "https://amsspeed.sharktech.net/backend/garbage.php?ckSize=64",
+      "enabled": true
+    },
+    {
+      "url": "https://argalasti.skoultsos.eu/backend/garbage.php?ckSize=64",
+      "enabled": true
+    },
+    {
+      "url": "https://atl.speedtest.clouvider.net/backend/garbage.php?ckSize=64",
+      "enabled": true
+    },
+    {
+      "url": "https://speedtest1.sox.rs/librespeed/backend/garbage.php?ckSize=64",
+      "enabled": true
+    },
+    {
+      "url": "https://chispeed.sharktech.net/backend/garbage.php?ckSize=64",
+      "enabled": true
+    },
+    {
+      "url": "https://denspeed.sharktech.net/backend/garbage.php?ckSize=64",
+      "enabled": true
+    },
+    {
+      "url": "https://fra.speedtest.clouvider.net/backend/garbage.php?ckSize=64",
+      "enabled": true
+    },
+    {
+      "url": "https://speed.fs-it.systems/backend/garbage.php?ckSize=64",
+      "enabled": true
+    },
+    {
+      "url": "https://mispeed.rackgenius.com/backend/garbage.php?ckSize=64",
+      "enabled": true
+    },
+    {
+      "url": "https://www.librespeed.fi/backend/garbage.php?ckSize=64",
+      "enabled": true
+    },
+    {
+      "url": "https://lasspeed.sharktech.net/backend/garbage.php?ckSize=64",
+      "enabled": true
+    },
+    {
+      "url": "https://lon.speedtest.clouvider.net/backend/garbage.php?ckSize=64",
+      "enabled": true
+    },
+    {
+      "url": "https://nyc.speedtest.clouvider.net/backend/garbage.php?ckSize=64",
+      "enabled": true
+    },
+    {
+      "url": "https://speed1.e-caps.net/backend/garbage.php?ckSize=64",
+      "enabled": true
+    },
+    {
+      "url": "https://speedtest.kamilszczepanski.com/garbage.php?ckSize=64",
+      "enabled": true
+    },
+    {
+      "url": "https://speedtest.cesnet.cz/backend/garbage.php?ckSize=64",
+      "enabled": true
+    },
+    {
+      "url": "https://librespeed.turris.cz/backend/garbage.php?ckSize=64",
+      "enabled": true
+    },
+    {
+      "url": "https://st-be-rm2.infra.garr.it/garbage.php?ckSize=64",
+      "enabled": true
+    }
+  ],
+  "directories": [
+    {
+      "kind": "mirror",
+      "url": "https://mirror.iscas.ac.cn/ubuntu-releases/24.04/",
+      "enabled": true,
+      "pattern": "ubuntu-[0-9.]+-live-server-amd64\\.iso",
+      "purpose": "Public Ubuntu release mirror; existing downloader source, refreshed within this release directory"
+    },
+    {
+      "kind": "mirror",
+      "url": "https://mirrors.huaweicloud.com/ubuntu-releases/24.04/",
+      "enabled": true,
+      "pattern": "ubuntu-[0-9.]+-live-server-amd64\\.iso",
+      "purpose": "Public Ubuntu release mirror; existing downloader source, refreshed within this release directory"
+    }
   ]
 }

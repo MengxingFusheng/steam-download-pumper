@@ -13,3 +13,15 @@ fleet-config/accounts.csv
 **/source_signing_private_key
 **/oss_access_key_id
 **/oss_access_key_secret
+.env.*
+dashboard-secrets/
+dashboard-data/
+dashboard/tests/
+certbot/
+
+collector/*.o
+collector/fleet-egress
+collector/collector.test
+collector/secrets
+collector/data
+collector/config.json

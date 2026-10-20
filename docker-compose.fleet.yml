@@ -42,6 +42,9 @@ services:
     environment:
       TZ: Asia/Shanghai
       CONFIG_PATH: /data/config.json
+      # Resolve through each account's bound IP, bypassing Docker's shared DNS
+      # forwarding path when the primary PPPoE account is disconnected.
+      DISCARDER_DNS_SERVERS: ${DISCARDER_DNS_SERVERS:-223.5.5.5,119.29.29.29}
       # Optional bootstrap inventory.  Leave empty to deploy first and import
       # account mappings atomically through POST /api/fleet/accounts/import.
       FLEET_ACCOUNTS_CSV: ${FLEET_ACCOUNTS_CSV:-}
@@ -52,9 +55,15 @@ services:
       SNMP_PORT: ${SNMP_PORT:-161}
       LINE_STALL_SECONDS: ${LINE_STALL_SECONDS:-90}
       LINE_SLOW_WINDOW_SECONDS: ${LINE_SLOW_WINDOW_SECONDS:-180}
-      LINE_MINIMUM_MBPS: ${LINE_MINIMUM_MBPS:-50}
       LINE_FAILURE_COOLDOWN_MINUTES: ${LINE_FAILURE_COOLDOWN_MINUTES:-30}
       DOWNLOAD_CEILING_MBPS: ${DOWNLOAD_CEILING_MBPS:-500}
+      FLEET_STANDARD_DOWNLOAD_MBPS: ${FLEET_STANDARD_DOWNLOAD_MBPS:-200}
+      DAILY_MODE_ENABLED: "true"
+      ROUTER_SNMP_INTERFACE: ${ROUTER_SNMP_INTERFACE:-wan1}
+      ROUTER_LIMIT_MBPS: ${ROUTER_LIMIT_MBPS:-5000}
+      ROUTER_RESERVE_MBPS: ${ROUTER_RESERVE_MBPS:-200}
+      LATE_DOWNLOAD_LIMIT_MBPS: ${LATE_DOWNLOAD_LIMIT_MBPS:-2000}
+      WAN_STALE_SECONDS: ${WAN_STALE_SECONDS:-120}
       SNMP_COMMUNITY_FILE: /run/secrets/ikuai_snmp_community
       LAN_INTERFACE: eth0
       LAN_PREFIX: ${LAN_PREFIX:-24}

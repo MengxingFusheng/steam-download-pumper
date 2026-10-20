@@ -1,9 +1,11 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	cryptorand "crypto/rand"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -43,24 +45,30 @@ type options struct {
 const maxConnectionLimit = 12
 
 type statusEvent struct {
-	Type                string `json:"type"`
-	LineID              string `json:"line_id"`
-	BindIP              string `json:"bind_ip,omitempty"`
-	Bytes               int64  `json:"bytes"`
-	Connections         int32  `json:"connections"`
-	URL                 string `json:"url,omitempty"`
-	State               string `json:"state,omitempty"`
-	ConsecutiveFailures int    `json:"consecutive_failures,omitempty"`
-	RetryAfter          string `json:"retry_after,omitempty"`
-	RetryInSeconds      int64  `json:"retry_in_seconds,omitempty"`
-	Error               string `json:"error,omitempty"`
-	Recovered           bool   `json:"recovered,omitempty"`
-	Generation          string `json:"generation,omitempty"`
-	SourceEpoch         uint64 `json:"source_epoch,omitempty"`
+	Type                string             `json:"type"`
+	LineID              string             `json:"line_id"`
+	BindIP              string             `json:"bind_ip,omitempty"`
+	Bytes               int64              `json:"bytes"`
+	Connections         int32              `json:"connections"`
+	URL                 string             `json:"url,omitempty"`
+	State               string             `json:"state,omitempty"`
+	ConsecutiveFailures int                `json:"consecutive_failures,omitempty"`
+	RetryAfter          string             `json:"retry_after,omitempty"`
+	RetryInSeconds      int64              `json:"retry_in_seconds,omitempty"`
+	Error               string             `json:"error,omitempty"`
+	Recovered           bool               `json:"recovered,omitempty"`
+	Generation          string             `json:"generation,omitempty"`
+	SourceEpoch         uint64             `json:"source_epoch,omitempty"`
+	WindowBytes         int64              `json:"window_bytes,omitempty"`
+	ActiveSeconds       float64            `json:"active_seconds,omitempty"`
+	SampleSeconds       float64            `json:"sample_seconds,omitempty"`
+	UnitConnectionMbps  float64            `json:"unit_connection_mbps,omitempty"`
+	Health              *sourceHealthState `json:"health,omitempty"`
 }
 
 type countingWriter struct {
-	total *atomic.Int64
+	total   *atomic.Int64
+	request *atomic.Int64
 }
 
 type statusSink struct {
@@ -74,10 +82,18 @@ type idleTimeoutConn struct {
 }
 
 type sourceHealth struct {
-	mu          sync.Mutex
-	states      map[string]*sourceState
-	activeEpoch map[string]uint64
-	nextEpoch   uint64
+	mu                     sync.Mutex
+	states                 map[string]*sourceState
+	activeEpoch            map[string]uint64
+	nextEpoch              uint64
+	performance            map[string]*sourcePerformance
+	lastEvaluation         time.Time
+	lastMetrics            time.Time
+	lastExplore            time.Time
+	explorationURL         string
+	explorationUntil       time.Time
+	explorationReservation int
+	explorationIndex       int
 }
 
 type sourceSet struct {
@@ -85,8 +101,9 @@ type sourceSet struct {
 }
 
 type sourceSetSnapshot struct {
-	Generation string
-	URLs       []string
+	Generation   string
+	URLs         []string
+	FallbackURLs []string
 }
 
 type lookupIPFunc func(context.Context, string, string) ([]net.IP, error)
@@ -112,12 +129,13 @@ func (set *sourceSet) replace(urls []string) error {
 }
 
 func (set *sourceSet) replaceConfig(config sourceFileConfig) error {
-	if err := validateSourceURLs(config.Sources); err != nil {
+	if err := validateSourceConfig(config); err != nil {
 		return err
 	}
 	set.value.Store(sourceSetSnapshot{
-		Generation: config.Generation,
-		URLs:       append([]string(nil), config.Sources...),
+		Generation:   config.Generation,
+		URLs:         append([]string(nil), config.Sources...),
+		FallbackURLs: append([]string(nil), config.FallbackSources...),
 	})
 	return nil
 }
@@ -127,7 +145,8 @@ func (set *sourceSet) snapshot() []string {
 	if loaded == nil {
 		return nil
 	}
-	return append([]string(nil), loaded.(sourceSetSnapshot).URLs...)
+	snapshot := loaded.(sourceSetSnapshot)
+	return combinedSources(snapshot.URLs, snapshot.FallbackURLs)
 }
 
 func (set *sourceSet) generation() string {
@@ -163,8 +182,10 @@ func validateSourceURLs(urls []string) error {
 }
 
 type sourceFileConfig struct {
-	Generation string   `json:"generation"`
-	Sources    []string `json:"sources"`
+	Generation      string                       `json:"generation"`
+	Sources         []string                     `json:"sources"`
+	FallbackSources []string                     `json:"fallback_sources,omitempty"`
+	Health          map[string]sourceHealthState `json:"health,omitempty"`
 }
 
 func loadSourceConfig(path string) (sourceFileConfig, error) {
@@ -206,7 +227,7 @@ func loadSourceConfig(path string) (sourceFileConfig, error) {
 			return sourceFileConfig{}, fmt.Errorf("source generation must contain 1-128 characters")
 		}
 	}
-	if err := validateSourceURLs(config.Sources); err != nil {
+	if err := validateSourceConfig(config); err != nil {
 		return sourceFileConfig{}, err
 	}
 	return config, nil
@@ -229,7 +250,7 @@ func replaceSourceConfig(set *sourceSet, health *sourceHealth, config sourceFile
 	if err := set.replaceConfig(config); err != nil {
 		return err
 	}
-	health.retain(config.Sources)
+	health.retain(combinedSources(config.Sources, config.FallbackSources))
 	return nil
 }
 
@@ -247,10 +268,15 @@ type sourceSnapshot struct {
 	RetryAfter          time.Time
 	RetryIn             time.Duration
 	LastError           string
+	WindowBytes         int64
+	ActiveSeconds       float64
+	SampleSeconds       float64
+	UnitConnectionMbps  float64
+	Health              *sourceHealthState
 }
 
 func newSourceHealth() *sourceHealth {
-	return &sourceHealth{states: make(map[string]*sourceState)}
+	return &sourceHealth{states: make(map[string]*sourceState), performance: make(map[string]*sourcePerformance)}
 }
 
 func (health *sourceHealth) claim(url string, now time.Time) (bool, time.Duration, bool) {
@@ -261,6 +287,10 @@ func (health *sourceHealth) claim(url string, now time.Time) (bool, time.Duratio
 func (health *sourceHealth) claimCurrent(url string, now time.Time) (bool, time.Duration, bool, uint64) {
 	health.mu.Lock()
 	defer health.mu.Unlock()
+	return health.claimLocked(url, now)
+}
+
+func (health *sourceHealth) claimLocked(url string, now time.Time) (bool, time.Duration, bool, uint64) {
 	epoch := uint64(0)
 	if health.activeEpoch != nil {
 		var active bool
@@ -302,9 +332,11 @@ func (health *sourceHealth) failedCurrent(
 	health.mu.Lock()
 	defer health.mu.Unlock()
 	if health.activeEpoch == nil || epoch == 0 || health.activeEpoch[url] != epoch {
-		return sourceSnapshot{State: "healthy"}, false
+		return sourceSnapshot{State: "unknown"}, false
 	}
-	return health.failedLocked(url, now, lastError, wasProbe), true
+	health.performanceForLocked(url).failedRequests++
+	health.failedLocked(url, now, lastError, wasProbe)
+	return health.snapshotLocked(url, now), true
 }
 
 func (health *sourceHealth) failedLocked(url string, now time.Time, lastError string, wasProbe bool) sourceSnapshot {
@@ -346,7 +378,8 @@ func (health *sourceHealth) succeededCurrent(url string, epoch uint64) (bool, so
 	}
 	_, hadFailures := health.states[url]
 	delete(health.states, url)
-	return hadFailures, sourceSnapshot{State: "healthy"}
+	health.performanceForLocked(url).successfulRequests++
+	return hadFailures, health.snapshotLocked(url, time.Now())
 }
 
 func (health *sourceHealth) releaseProbe(url string) {
@@ -377,7 +410,7 @@ func (health *sourceHealth) epoch(url string) uint64 {
 func (health *sourceHealth) snapshot(url string, now time.Time) sourceSnapshot {
 	health.mu.Lock()
 	defer health.mu.Unlock()
-	return snapshotFor(health.states[url], now)
+	return health.snapshotLocked(url, now)
 }
 
 func (health *sourceHealth) retain(urls []string) {
@@ -394,6 +427,7 @@ func (health *sourceHealth) retain(urls []string) {
 		if _, exists := keep[sourceURL]; !exists {
 			delete(health.activeEpoch, sourceURL)
 			delete(health.states, sourceURL)
+			delete(health.performance, sourceURL)
 		}
 	}
 	for sourceURL := range keep {
@@ -454,7 +488,12 @@ func (conn *idleTimeoutConn) Read(buffer []byte) (int, error) {
 }
 
 func (writer countingWriter) Write(buffer []byte) (int, error) {
-	writer.total.Add(int64(len(buffer)))
+	if writer.total != nil {
+		writer.total.Add(int64(len(buffer)))
+	}
+	if writer.request != nil {
+		writer.request.Add(int64(len(buffer)))
+	}
 	return len(buffer), nil
 }
 
@@ -587,7 +626,9 @@ func run(ctx context.Context, opts options) error {
 	targetConnections := opts.connections
 	var nextWorkerToken uint64
 	health := newSourceHealth()
-	health.retain(initialSources)
+	health.retain(combinedSources(initialSources, initialConfig.FallbackSources))
+	health.restore(initialConfig.Health, time.Now())
+	sink.emit(statusEvent{Type: "source-list", LineID: opts.lineID, State: "loaded", Generation: initialConfig.Generation})
 	startWorker := func(id int) {
 		workerCtx, cancel := context.WithCancel(ctx)
 		nextWorkerToken++
@@ -634,6 +675,30 @@ func run(ctx context.Context, opts options) error {
 		statusUpdates = statusTicker.C
 		defer statusTicker.Stop()
 	}
+	// Wait for cancelled readers before the final counter snapshot. The last
+	// reporting interval otherwise disappears when Fleet rotates a line.
+	defer func() {
+		for _, worker := range workers {
+			worker.cancel()
+		}
+		timer := time.NewTimer(2 * time.Second)
+		defer timer.Stop()
+	waitForReaders:
+		for len(workers) > 0 {
+			select {
+			case result := <-results:
+				if worker, exists := workers[result.id]; exists && worker.token == result.token {
+					delete(workers, result.id)
+					activeConnections.Add(-1)
+				}
+			case <-timer.C:
+				break waitForReaders
+			}
+		}
+		source, _ := currentSource.Load().(string)
+		sink.emit(statusEvent{Type: "status", LineID: opts.lineID, BindIP: opts.bindIP,
+			Bytes: totalBytes.Load(), Connections: activeConnections.Load(), URL: source})
+	}()
 	for {
 		select {
 		case <-ctx.Done():
@@ -696,6 +761,9 @@ func run(ctx context.Context, opts options) error {
 			}
 			reconcileWorkers()
 		case <-statusUpdates:
+			now := time.Now()
+			health.evaluate(now)
+			health.emitMetrics(sink, opts, set, now)
 			source, _ := currentSource.Load().(string)
 			sink.emit(statusEvent{
 				Type:        "status",
@@ -725,6 +793,7 @@ func runWorker(
 		initialSources = opts.sourceSet.snapshot()
 	}
 	health.ensureTracked(initialSources)
+	defer health.releaseConnection(connectionID)
 	urlIndex := connectionID - 1
 	if opts.startupJitterSeconds > 0 {
 		jitter := time.Duration(rand.Float64() * opts.startupJitterSeconds * float64(time.Second))
@@ -738,30 +807,15 @@ func runWorker(
 			return nil
 		default:
 		}
-		url := ""
-		probe := false
-		var sourceEpoch uint64
 		sourceGeneration := ""
-		var nextRetry time.Duration
-		sources := opts.urls
+		primary, fallback := opts.urls, []string(nil)
 		if opts.sourceSet != nil {
-			sources = opts.sourceSet.snapshot()
+			primary, fallback = opts.sourceSet.pools()
 			sourceGeneration = opts.sourceSet.generation()
 		}
-		for checked := 0; checked < len(sources); checked++ {
-			candidate := sources[urlIndex%len(sources)]
-			urlIndex++
-			allowed, retryIn, claimedProbe, epoch := health.claimCurrent(candidate, time.Now())
-			if allowed {
-				url = candidate
-				probe = claimedProbe
-				sourceEpoch = epoch
-				break
-			}
-			if retryIn > 0 && (nextRetry == 0 || retryIn < nextRetry) {
-				nextRetry = retryIn
-			}
-		}
+		choice, nextRetry := health.choose(primary, fallback, connectionID, urlIndex, time.Now())
+		urlIndex++
+		url, probe, sourceEpoch := choice.url, choice.probe, choice.epoch
 		if url == "" {
 			if nextRetry <= 0 {
 				nextRetry = 250 * time.Millisecond
@@ -779,12 +833,26 @@ func runWorker(
 				opts, url, health.snapshot(url, time.Now()), false, sourceGeneration, sourceEpoch,
 			))
 		}
-		if _, err := downloadOnceTracked(ctx, client, expandRequestURL(url), workerID, totalBytes); err != nil {
+		if received, err := downloadSelectedSource(ctx, client, url, workerID, totalBytes, health, choice, connectionID, primary); err != nil {
+			if errors.Is(err, errSourceRotated) {
+				if choice.exploring && received > 0 && ctx.Err() == nil {
+					if recovered, snapshot := health.finishExploration(choice, time.Now()); recovered {
+						sink.emit(sourceStatusEvent(opts, url, snapshot, true, sourceGeneration, sourceEpoch))
+					}
+				}
+				if probe {
+					health.releaseProbeCurrent(url, sourceEpoch)
+				}
+				continue
+			}
 			if ctx.Err() != nil {
 				if probe {
 					health.releaseProbeCurrent(url, sourceEpoch)
 				}
 				return nil
+			}
+			if choice.exploring {
+				health.failedExploration(choice, time.Now())
 			}
 			snapshot, recorded := health.failedCurrent(
 				url, sourceEpoch, time.Now(), err.Error(), probe,
@@ -797,11 +865,17 @@ func runWorker(
 				workerID, url, err, snapshot.State, snapshot.RetryIn)
 			continue
 		}
-		if recovered, snapshot := health.succeededCurrent(url, sourceEpoch); recovered {
+		success := health.succeededCurrent
+		if choice.exploring {
+			success = func(_ string, _ uint64) (bool, sourceSnapshot) { return health.finishExploration(choice, time.Now()) }
+		}
+		if recovered, snapshot := success(url, sourceEpoch); recovered {
 			sink.emit(sourceStatusEvent(opts, url, snapshot, true, sourceGeneration, sourceEpoch))
 			fmt.Fprintf(os.Stderr, "worker=%s url=%s recovered=true\n", workerID, url)
 		}
-		if opts.restartJitterSeconds > 0 {
+		// Modern Ookla downloads are sized requests in a continuous stream.
+		// Sleeping after every completed chunk wastes available line capacity.
+		if opts.restartJitterSeconds > 0 && !isSpeedtestDownload(url) {
 			jitter := time.Duration(rand.Float64() * opts.restartJitterSeconds * float64(time.Second))
 			if err := sleepWithContext(ctx, jitter); err != nil {
 				return nil
@@ -829,6 +903,11 @@ func sourceStatusEvent(
 		Recovered:           recovered,
 		Generation:          generation,
 		SourceEpoch:         sourceEpoch,
+		WindowBytes:         snapshot.WindowBytes,
+		ActiveSeconds:       snapshot.ActiveSeconds,
+		SampleSeconds:       snapshot.SampleSeconds,
+		UnitConnectionMbps:  snapshot.UnitConnectionMbps,
+		Health:              snapshot.Health,
 	}
 	if !snapshot.RetryAfter.IsZero() {
 		event.RetryAfter = snapshot.RetryAfter.UTC().Format(time.RFC3339)
@@ -932,6 +1011,27 @@ func resolvePublicIPv4Bounded(
 	return resolvePublicIPv4(lookupContext, host, lookup)
 }
 
+// DNS must follow the same policy-routed source address as the HTTP connection.
+// Docker's embedded resolver forwards through the container's primary address,
+// which may belong to a disconnected PPPoE account even when this line is healthy.
+func newBoundDNSResolver(bindIP string, servers []string, timeout time.Duration) *net.Resolver {
+	var next atomic.Uint64
+	return &net.Resolver{
+		PreferGo: true,
+		Dial: func(ctx context.Context, network, _ string) (net.Conn, error) {
+			server := servers[(next.Add(1)-1)%uint64(len(servers))]
+			dialer := &net.Dialer{Timeout: timeout}
+			ip := net.ParseIP(bindIP)
+			if strings.HasPrefix(network, "tcp") {
+				dialer.LocalAddr = &net.TCPAddr{IP: ip}
+				return dialer.DialContext(ctx, "tcp4", server)
+			}
+			dialer.LocalAddr = &net.UDPAddr{IP: ip}
+			return dialer.DialContext(ctx, "udp4", server)
+		},
+	}
+}
+
 func newHTTPClientWithPolicy(
 	timeout time.Duration,
 	bindIP string,
@@ -953,6 +1053,17 @@ func newHTTPClientWithPolicy(
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 	if lookup == nil {
 		lookup = net.DefaultResolver.LookupIP
+		if bindIP != "" {
+			var servers []string
+			for _, server := range strings.FieldsFunc(os.Getenv("DISCARDER_DNS_SERVERS"), func(r rune) bool { return r == ',' || r == ' ' }) {
+				servers = append(servers, net.JoinHostPort(server, "53"))
+			}
+			if len(servers) > 0 {
+				resolver := newBoundDNSResolver(bindIP, servers, timeout)
+				lookup = resolver.LookupIP
+				dialer.Resolver = resolver
+			}
+		}
 	}
 	transport.DialContext = func(ctx context.Context, _network, address string) (net.Conn, error) {
 		dialAddress := address
@@ -982,7 +1093,8 @@ func newHTTPClientWithPolicy(
 		}
 		return &idleTimeoutConn{Conn: conn, timeout: timeout}, nil
 	}
-	transport.ForceAttemptHTTP2 = false
+	transport.ForceAttemptHTTP2 = true
+	transport.MaxIdleConnsPerHost = maxConnectionLimit
 	transport.DisableCompression = true
 	transport.ResponseHeaderTimeout = timeout
 	transport.TLSHandshakeTimeout = timeout
@@ -1041,6 +1153,10 @@ func downloadOnceTracked(
 	workerID string,
 	totalBytes *atomic.Int64,
 ) (int64, error) {
+	return downloadOnceMeasured(ctx, client, url, workerID, totalBytes, nil)
+}
+
+func downloadOnceMeasured(ctx context.Context, client *http.Client, url string, workerID string, totalBytes, requestBytes *atomic.Int64) (int64, error) {
 	request, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return 0, err
@@ -1051,26 +1167,53 @@ func downloadOnceTracked(
 		return 0, err
 	}
 	defer response.Body.Close()
-	if response.StatusCode < 200 || response.StatusCode >= 400 {
+	if response.StatusCode < 200 || response.StatusCode >= 300 {
 		return 0, fmt.Errorf("unexpected HTTP status %s", response.Status)
 	}
 	buffer := make([]byte, 64*1024)
-	destination := io.Writer(io.Discard)
-	if totalBytes != nil {
-		destination = countingWriter{total: totalBytes}
+	contentType := strings.ToLower(response.Header.Get("Content-Type"))
+	if strings.Contains(contentType, "text/html") || strings.Contains(contentType, "application/json") || strings.Contains(contentType, "xml") {
+		return 0, fmt.Errorf("download endpoint returned an error document (%s)", contentType)
 	}
-	return io.CopyBuffer(destination, response.Body, buffer)
+	body := bufio.NewReader(response.Body)
+	prefix, _ := body.Peek(512)
+	trimmed := strings.ToLower(strings.TrimSpace(string(prefix)))
+	if strings.HasPrefix(trimmed, "<!doctype html") || strings.HasPrefix(trimmed, "<html") || strings.HasPrefix(trimmed, "{\"error\"") {
+		return 0, fmt.Errorf("download endpoint returned an error document")
+	}
+	destination := io.Writer(io.Discard)
+	if totalBytes != nil || requestBytes != nil {
+		destination = countingWriter{total: totalBytes, request: requestBytes}
+	}
+	received, copyErr := io.CopyBuffer(destination, body, buffer)
+	if received == 0 && copyErr == nil {
+		return 0, fmt.Errorf("download endpoint returned an empty body")
+	}
+	// Traffic generation needs useful bytes, not a complete copy of the file.
+	// Some speedtest servers close a large response early; substantial progress
+	// must not quarantine a working source and strand every connection.
+	if received >= 1<<20 && errors.Is(copyErr, io.ErrUnexpectedEOF) {
+		return received, nil
+	}
+	return received, copyErr
 }
 
 func requestUserAgent(rawURL string, workerID string) string {
+	if isSpeedtestDownload(rawURL) {
+		return "fleet-speedtest-authorized/1.0"
+	}
+	return "broadband-pumper/" + workerID
+}
+
+func isSpeedtestDownload(rawURL string) bool {
 	parsed, err := url.Parse(rawURL)
 	if err == nil && parsed.Path == "/download" {
 		query := parsed.Query()
 		if query.Get("guid") != "" && query.Get("nocache") != "" {
-			return "fleet-speedtest-authorized/1.0"
+			return true
 		}
 	}
-	return "broadband-pumper/" + workerID
+	return false
 }
 
 func sleepWithContext(ctx context.Context, duration time.Duration) error {

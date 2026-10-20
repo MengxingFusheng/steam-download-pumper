@@ -25,14 +25,12 @@ def validate_source_url(url: object) -> str:
         raise ValueError("candidate URL must not contain credentials")
     if parsed.fragment:
         raise ValueError("candidate URL must not contain a fragment")
-    if parsed.query:
-        raise ValueError("candidate URL must not contain a query")
     if port is not None and not 1 <= port <= 65535:
         raise ValueError("candidate URL has an invalid port")
     return url
 
 
-def load_candidates(path: Path) -> list[str]:
+def load_candidate_document(path: Path) -> dict:
     try:
         raw = path.read_bytes()
     except OSError as exc:
@@ -43,13 +41,18 @@ def load_candidates(path: Path) -> list[str]:
         document = json.loads(raw)
     except (json.JSONDecodeError, UnicodeDecodeError) as exc:
         raise ValueError("candidate file is not valid JSON") from exc
-    if not isinstance(document, dict) or set(document) != {"schema", "sources"}:
-        raise ValueError("candidate file must contain only schema and sources")
+    if not isinstance(document, dict) or not {"schema", "sources"} <= set(document) or set(document) - {"schema", "sources", "directories"}:
+        raise ValueError("candidate file must contain schema, sources and optional directories")
     sources = document["sources"]
     if document["schema"] != 1 or not isinstance(sources, list):
         raise ValueError("candidate schema must be 1 with a sources list")
     if len(sources) > MAX_CANDIDATES:
         raise ValueError("candidate list exceeds 200 entries")
+    return document
+
+
+def load_candidates(path: Path) -> list[str]:
+    sources = load_candidate_document(path)["sources"]
 
     result: list[str] = []
     seen: set[str] = set()

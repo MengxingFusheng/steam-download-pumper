@@ -22,17 +22,18 @@ COPY --from=discarder-builder /out/manifestctl /usr/local/bin/manifestctl
 RUN mkdir -p /data /tmp /run/pumper && chmod 1777 /tmp
 
 ENV CONFIG_PATH=/data/config.json \
+    DISCARDER_DNS_SERVERS=223.5.5.5,119.29.29.29 \
     WEB_PORT=80 \
     TARGET_MBPS=4000 \
     ROLLING_DAYS=15 \
     TARGET_RATIO=2.0 \
-    PER_LINE_MBPS=200 \
     ROTATION_MINUTES=30 \
     SNMP_POLL_SECONDS=60 \
     ENGINE_STATUS_SECONDS=5 \
     SCHEDULER_TICK_SECONDS=60 \
     UPLOAD_CEILING_MBPS=50 \
     DOWNLOAD_CEILING_MBPS=500 \
+    DAILY_MODE_ENABLED=true \
     REMOTE_SOURCE_LIST_ENABLED=false \
     RATE_LIMIT_ENABLED=true \
     LAN_INTERFACE=eth0 \

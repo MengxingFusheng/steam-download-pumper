@@ -28,6 +28,13 @@ MAX_REQUEST_BYTES = 1_100_000
 class ProxyHandler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
+    def setup(self) -> None:
+        # The public listener may receive clients that connect but never finish
+        # the TLS handshake or HTTP request.  Keep those sockets from occupying
+        # a worker indefinitely.
+        self.request.settimeout(10)
+        super().setup()
+
     def do_GET(self) -> None:
         self._proxy()
 
@@ -116,7 +123,9 @@ def main() -> None:
     context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     context.minimum_version = ssl.TLSVersion.TLSv1_2
     context.load_cert_chain(TLS_CERT_FILE, TLS_KEY_FILE)
-    server.socket = context.wrap_socket(server.socket, server_side=True)
+    # Defer TLS handshakes to the per-connection threads.  Performing them in
+    # ThreadingHTTPServer.accept() lets one stalled client block every request.
+    server.socket = context.wrap_socket(server.socket, server_side=True, do_handshake_on_connect=False)
     server.serve_forever()
 
 

@@ -10,6 +10,7 @@ from unittest.mock import patch
 from steam_pumper.config import (
     MAX_CONNECTIONS_PER_LINE,
     CommonConfig,
+    FleetConfig,
     IkuaiLineConfig,
     MultiIPConfig,
     default_source_pool,
@@ -26,13 +27,45 @@ class ConfigTests(unittest.TestCase):
 
         cfg = FleetConfig()
         self.assertEqual(
-            (cfg.line_stall_seconds, cfg.line_slow_window_seconds, cfg.line_minimum_mbps, cfg.line_failure_cooldown_minutes),
-            (90, 180, 50, 30),
+            (cfg.line_stall_seconds, cfg.line_slow_window_seconds, cfg.line_failure_cooldown_minutes),
+            (90, 180, 30),
         )
         with self.assertRaises(ValueError):
             FleetConfig(line_slow_window_seconds=60).validate()
-        with self.assertRaises(ValueError):
-            FleetConfig(line_minimum_mbps=201).validate()
+
+    def test_fleet_always_uses_daily_scheduling(self):
+        self.assertTrue(FleetConfig().validate().daily_mode_enabled)
+        with self.assertRaisesRegex(ValueError, "cannot be disabled"):
+            FleetConfig(daily_mode_enabled=False).validate()
+        for field in ("per_line_mbps", "line_minimum_mbps"):
+            self.assertNotIn(field, FleetConfig().to_dict())
+
+    def test_fleet_load_migrates_old_file_without_losing_current_values(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "config.json"
+            saved = {"daily_mode_enabled": False, "per_line_mbps": 500,
+                     "line_minimum_mbps": "obsolete", "target_ratio": 2.4,
+                     "source_pool": ["https://example.test/file"]}
+            path.write_text(json.dumps(saved), encoding="utf-8")
+            with self.assertLogs("steam_pumper.config", level="WARNING") as logs:
+                cfg = load_config("fleet", path, {})
+            self.assertTrue(cfg.daily_mode_enabled)
+            self.assertEqual(cfg.target_ratio, 2.4)
+            self.assertEqual(cfg.source_pool, saved["source_pool"])
+            self.assertTrue(any("Migrating" in entry for entry in logs.output))
+            self.assertEqual(json.loads(path.read_text()), saved)
+            save_config(path, cfg)
+            persisted = json.loads(path.read_text())
+            self.assertTrue(persisted["daily_mode_enabled"])
+            self.assertNotIn("per_line_mbps", persisted)
+            self.assertNotIn("line_minimum_mbps", persisted)
+
+    def test_fleet_load_migrates_old_environment(self):
+        with self.assertLogs("steam_pumper.config", level="WARNING"):
+            cfg = load_config("fleet", "/missing.json", {
+                "DAILY_MODE_ENABLED": "false", "PER_LINE_MBPS": "unused",
+                "LINE_MINIMUM_MBPS": "unused"})
+        self.assertTrue(cfg.daily_mode_enabled)
 
     def test_supported_configs_share_names_and_expected_defaults(self):
         shared_names = {

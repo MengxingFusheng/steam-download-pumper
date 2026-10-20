@@ -1,0 +1,5 @@
+{$DASHBOARD_DOMAIN} {
+	encode gzip
+	header Strict-Transport-Security "max-age=31536000"
+	reverse_proxy dashboard:8080
+}

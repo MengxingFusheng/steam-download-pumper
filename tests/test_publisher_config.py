@@ -23,10 +23,10 @@ class PublisherConfigTests(unittest.TestCase):
         self.assertEqual(cfg.timezone.key, "Asia/Shanghai")
         self.assertEqual(cfg.retry_seconds, (900, 3600, 21600))
         self.assertEqual(cfg.min_healthy_sources, 3)
-        self.assertEqual(cfg.max_healthy_sources, 100)
+        self.assertEqual(cfg.max_healthy_sources, 30)
         self.assertEqual(cfg.probe_concurrency, 4)
-        self.assertEqual(cfg.probe_bytes, 8 * 1024 * 1024)
-        self.assertEqual(cfg.probe_timeout_seconds, 20)
+        self.assertEqual(cfg.probe_bytes, 64 * 1024 * 1024)
+        self.assertEqual(cfg.probe_timeout_seconds, 8)
         self.assertEqual(cfg.min_probe_mbps, 100)
 
     def test_required_public_configuration_is_validated(self):
@@ -58,13 +58,14 @@ class PublisherConfigTests(unittest.TestCase):
         cfg = PublisherConfig.from_env(BASE_ENV)
         self.assertEqual(cfg.bucket, BASE_ENV["OSS_BUCKET"])
 
-    def test_probe_size_is_fixed_to_eight_mib(self):
+    def test_legacy_probe_limits_migrate_to_the_two_stage_contract(self):
         from source_publisher.config import PublisherConfig
 
         self.assertEqual(
             PublisherConfig.from_env({**BASE_ENV, "PROBE_BYTES": "8388608"}).probe_bytes,
-            8 * 1024 * 1024,
+            64 * 1024 * 1024,
         )
+        self.assertEqual(PublisherConfig.from_env({**BASE_ENV, "MAX_HEALTHY_SOURCES": "100", "PROBE_TIMEOUT_SECONDS": "20"}).max_healthy_sources, 100)
         for value in ("2097152", "4194304", "16777216"):
             with self.subTest(value=value), self.assertRaises(ValueError):
                 PublisherConfig.from_env({**BASE_ENV, "PROBE_BYTES": value})

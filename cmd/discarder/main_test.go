@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -18,6 +20,56 @@ import (
 	"testing"
 	"time"
 )
+
+func TestBoundDNSResolverUsesLineIPAndRotatesServers(t *testing.T) {
+	first, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer first.Close()
+	second, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer second.Close()
+	resolver := newBoundDNSResolver("127.0.0.2", []string{first.LocalAddr().String(), second.LocalAddr().String()}, time.Second)
+	for _, server := range []net.PacketConn{first, second, first} {
+		conn, err := resolver.Dial(context.Background(), "udp", "127.0.0.11:53")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := conn.Write([]byte("probe")); err != nil {
+			t.Fatal(err)
+		}
+		server.SetReadDeadline(time.Now().Add(time.Second))
+		buf := make([]byte, 32)
+		_, from, err := server.ReadFrom(buf)
+		conn.Close()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if from.(*net.UDPAddr).IP.String() != "127.0.0.2" {
+			t.Fatalf("DNS escaped bound source: %v", from)
+		}
+	}
+}
+
+func TestBoundDNSResolverTCPFallbackUsesLineIP(t *testing.T) {
+	server, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server.Close()
+	resolver := newBoundDNSResolver("127.0.0.2", []string{server.Addr().String()}, time.Second)
+	conn, err := resolver.Dial(context.Background(), "tcp", "127.0.0.11:53")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	if conn.LocalAddr().(*net.TCPAddr).IP.String() != "127.0.0.2" {
+		t.Fatalf("TCP DNS escaped bound source: %v", conn.LocalAddr())
+	}
+}
 
 func TestValidateOptionsRejectsMoreThanTwelveConnections(t *testing.T) {
 	for _, opts := range []options{
@@ -707,4 +759,85 @@ func mustRequest(t *testing.T, rawURL string) *http.Request {
 		t.Fatal(err)
 	}
 	return request
+}
+
+func TestTruncatedUsefulDownloadDoesNotFailSource(t *testing.T) {
+	for _, size := range []int{1024, 2 << 20} {
+		t.Run(fmt.Sprint(size), func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Length", "4194304")
+				_, _ = w.Write(make([]byte, size))
+			}))
+			defer server.Close()
+			var total atomic.Int64
+			n, err := downloadOnceTracked(context.Background(), server.Client(), server.URL, "test", &total)
+			if n != int64(size) || total.Load() != n {
+				t.Fatalf("bytes=%d counted=%d", n, total.Load())
+			}
+			if size >= 1<<20 && err != nil {
+				t.Fatalf("useful truncated response failed: %v", err)
+			}
+			if size < 1<<20 && err == nil {
+				t.Fatal("tiny broken response must still fail")
+			}
+		})
+	}
+}
+
+func TestDownloadRejectsEmptyAndErrorDocuments(t *testing.T) {
+	for _, body := range []string{"", "<html>error</html>", "{\"error\":\"unavailable\"}"} {
+		t.Run(body, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/octet-stream")
+				fmt.Fprint(w, body)
+			}))
+			defer server.Close()
+			var count atomic.Int64
+			n, err := downloadOnceTracked(context.Background(), newHTTPClient(time.Second, ""), server.URL, "test", &count)
+			if err == nil || n != 0 || count.Load() != 0 {
+				t.Fatalf("invalid body accepted: bytes=%d count=%d error=%v", n, count.Load(), err)
+			}
+		})
+	}
+}
+
+func TestBoundClientNegotiatesHTTP2AndCountsActualBytes(t *testing.T) {
+	var protocol atomic.Int32
+	server := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		protocol.Store(int32(r.ProtoMajor))
+		w.Header().Set("Content-Type", "application/octet-stream")
+		fmt.Fprint(w, "payload")
+	}))
+	server.EnableHTTP2 = true
+	server.StartTLS()
+	defer server.Close()
+	client := newHTTPClient(time.Second, "127.0.0.1")
+	client.Transport.(*http.Transport).TLSClientConfig = server.Client().Transport.(*http.Transport).TLSClientConfig.Clone()
+	var count atomic.Int64
+	n, err := downloadOnceTracked(context.Background(), client, server.URL, "test", &count)
+	if err != nil || n != 7 || count.Load() != 7 || protocol.Load() != 2 {
+		t.Fatalf("download: bytes=%d count=%d protocol=%d err=%v", n, count.Load(), protocol.Load(), err)
+	}
+}
+
+func TestSpeedtestChunksContinueWithoutRestartJitter(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/octet-stream")
+		fmt.Fprint(w, strings.Repeat("x", 1024))
+		if requests.Add(1) >= 2 {
+			cancel()
+		}
+	}))
+	defer server.Close()
+	opts := options{workerID: "test", lineID: "test", urls: []string{server.URL + "/download?size=67108864&guid={{guid}}&nocache={{nonce}}"}, readTimeoutSeconds: 1, restartJitterSeconds: 1000000}
+	var total atomic.Int64
+	var source atomic.Value
+	source.Store("")
+	err := runWorker(ctx, opts, 1, newSourceHealth(), &total, &source, &statusSink{writer: io.Discard})
+	if err != nil || requests.Load() < 2 {
+		t.Fatalf("stream paused between chunks: requests=%d err=%v", requests.Load(), err)
+	}
 }

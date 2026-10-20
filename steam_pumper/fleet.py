@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import hashlib
 import io
 import json
 import math
@@ -14,7 +15,7 @@ import threading
 import time
 from collections import deque
 from dataclasses import asdict, dataclass, field, replace
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from ipaddress import ip_address
 from pathlib import Path
 from typing import Any, Iterable, Mapping
@@ -22,8 +23,11 @@ from zoneinfo import ZoneInfo
 
 from .config import FleetConfig, save_config
 from .engine import EngineProcess
+from .fleet_schedule import WanBudget, allocate_daily, daily_phase
 from .remote_sources import RemoteSourceManager, RemoteSourceRefreshWorker, SourceListSnapshot
 from .topology import LogicalLine, apply_ipv4_addresses
+from .fleet_forecast import daily_prediction, history_model
+from .fleet_sources import FleetSources
 
 
 SHANGHAI = ZoneInfo("Asia/Shanghai")
@@ -35,7 +39,7 @@ IF_DISCONTINUITY_OID = ".1.3.6.1.2.1.31.1.1.1.19"
 IF_OPER_STATUS_OID = ".1.3.6.1.2.1.2.2.1.8"
 SYS_UPTIME_OID = ".1.3.6.1.2.1.1.3.0"
 MAX_ACCOUNTS = 256
-CSV_FIELDS = {"account_id", "bind_ip", "snmp_interface", "enabled"}
+CSV_FIELDS = {"account_id", "bind_ip", "snmp_interface", "enabled", "weight", "group_id"}
 REQUIRED_CSV_FIELDS = {"account_id", "bind_ip", "snmp_interface"}
 
 
@@ -44,6 +48,39 @@ class FleetAccount:
     account_id: str
     bind_ip: str
     snmp_interface: str
+    enabled: bool = True
+    weight: int | None = None
+    group_id: str = ""
+
+    @property
+    def upload_mbps(self) -> int:
+        return 500 if self.weight == 10 else 50
+
+    @property
+    def download_mbps(self) -> int:
+        if self.weight == 10:
+            return 500
+        # Some 50 Mbps uplinks have a 500 Mbps downstream. Keep upload
+        # forecasting independent of the downstream scheduling profile.
+        try:
+            rate = int(os.environ.get("FLEET_STANDARD_DOWNLOAD_MBPS", "200"))
+        except ValueError as exc:
+            raise ValueError("FLEET_STANDARD_DOWNLOAD_MBPS must be an integer") from exc
+        if not 1 <= rate <= 1000:
+            raise ValueError("FLEET_STANDARD_DOWNLOAD_MBPS must be between 1 and 1000")
+        return rate
+
+    @property
+    def profile_confirmed(self) -> bool:
+        return self.weight in {1, 10}
+
+
+@dataclass(frozen=True)
+class FleetGroup:
+    group_id: str
+    name: str
+    download_limit_mbps: float
+    max_active: int
     enabled: bool = True
 
 
@@ -221,13 +258,15 @@ def parse_accounts_csv(payload: str) -> list[FleetAccount]:
         raise ValueError("account CSV is too large")
     reader = csv.DictReader(io.StringIO(payload))
     fields = set(reader.fieldnames or [])
-    if not REQUIRED_CSV_FIELDS.issubset(fields) or not fields.issubset(CSV_FIELDS):
-        raise ValueError("CSV must contain account_id,bind_ip,snmp_interface and optional enabled")
+    if not REQUIRED_CSV_FIELDS.issubset(fields) or not fields.issubset(CSV_FIELDS) or len(fields) != len(reader.fieldnames or []):
+        raise ValueError("CSV must contain account_id,bind_ip,snmp_interface and optional enabled,weight,group_id")
     accounts: list[FleetAccount] = []
     ids: set[str] = set()
     ips: set[str] = set()
     interfaces: set[str] = set()
     for row_number, row in enumerate(reader, start=2):
+        if None in row:
+            raise ValueError(f"CSV row {row_number}: unexpected extra columns")
         account_id = (row.get("account_id") or "").strip()
         bind_ip = (row.get("bind_ip") or "").strip()
         interface = (row.get("snmp_interface") or "").strip()
@@ -244,12 +283,19 @@ def parse_accounts_csv(payload: str) -> list[FleetAccount]:
         if enabled_raw not in {"1", "0", "true", "false", "yes", "no", "on", "off"}:
             raise ValueError(f"CSV row {row_number}: invalid enabled")
         enabled = enabled_raw in {"1", "true", "yes", "on"}
+        weight_raw = (row.get("weight") or "").strip()
+        if weight_raw not in {"", "1", "10"}:
+            raise ValueError(f"CSV row {row_number}: weight must be 1 or 10")
+        weight = int(weight_raw) if weight_raw else None
+        group_id = (row.get("group_id") or "").strip() or ("symmetric500" if weight == 10 else "standard")
+        if len(group_id) > 64 or not re.fullmatch(r"[A-Za-z0-9_.:-]+", group_id):
+            raise ValueError(f"CSV row {row_number}: invalid group_id")
         if account_id in ids or bind_ip in ips or interface in interfaces:
             raise ValueError(f"CSV row {row_number}: account_id, bind_ip and snmp_interface must be unique")
         ids.add(account_id)
         ips.add(bind_ip)
         interfaces.add(interface)
-        accounts.append(FleetAccount(account_id, bind_ip, interface, enabled))
+        accounts.append(FleetAccount(account_id, bind_ip, interface, enabled, weight, group_id))
     if not accounts:
         raise ValueError("CSV must contain at least one account")
     if len(accounts) > MAX_ACCOUNTS:
@@ -266,6 +312,8 @@ class FleetStore:
         self.db.row_factory = sqlite3.Row
         self.db.execute("PRAGMA journal_mode=WAL")
         self.db.execute("PRAGMA synchronous=NORMAL")
+        self._history_cache_key: tuple[int, int] | None = None
+        self._history_cache: dict[str, dict[int, float]] = {}
         self._create_schema()
 
     def _create_schema(self) -> None:
@@ -302,7 +350,16 @@ class FleetStore:
         );
         CREATE INDEX IF NOT EXISTS runtime_window ON runtime_minutes(minute, account_id);
         CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS fleet_groups (
+          group_id TEXT PRIMARY KEY,name TEXT NOT NULL,
+          download_limit_mbps REAL NOT NULL,max_active INTEGER NOT NULL,
+          enabled INTEGER NOT NULL DEFAULT 1
+        );
         """)
+        self._ensure_columns("accounts", {
+            "weight": "INTEGER",
+            "group_id": "TEXT NOT NULL DEFAULT 'standard'",
+        })
         self._ensure_columns("traffic", {
             "measured_upload_bytes": "INTEGER NOT NULL DEFAULT 0",
             "measured_download_bytes": "INTEGER NOT NULL DEFAULT 0",
@@ -311,6 +368,10 @@ class FleetStore:
             "unknown_seconds": "INTEGER NOT NULL DEFAULT 0",
             "sample_seconds": "INTEGER NOT NULL DEFAULT 0",
             "interruptions": "INTEGER NOT NULL DEFAULT 0",
+            "upload_valid_seconds": "INTEGER NOT NULL DEFAULT 0",
+            "upload_capacity_bytes": "REAL NOT NULL DEFAULT 0",
+            "unknown_upload_seconds": "INTEGER NOT NULL DEFAULT 0",
+            "unknown_upload_capacity_bytes": "REAL NOT NULL DEFAULT 0",
         })
         self._ensure_columns("cursors", {
             "baseline_at": "INTEGER",
@@ -321,7 +382,43 @@ class FleetStore:
         self.db.execute("UPDATE cursors SET baseline_at=sampled_at WHERE baseline_at IS NULL AND valid=1")
         if self._meta("snmp_actual_schema_at") is None:
             self._set_meta("snmp_actual_schema_at", str(int(time.time())))
+        # Before profile-aware accounting every accepted upload was checked
+        # against the old 50 Mbps ceiling. Preserve those valid samples once.
+        if self._meta("daily_profile_schema_at") is None:
+            self._migrate_daily_profiles()
+        self.db.executemany("""
+        INSERT OR IGNORE INTO fleet_groups(group_id,name,download_limit_mbps,max_active,enabled)
+        VALUES (?,?,?,?,1)
+        """, [("standard", "普通线路", 4000, 20), ("symmetric500", "500M 对等线路", 5000, 10)])
         self.db.commit()
+
+    def _migrate_daily_profiles(self) -> None:
+        """Backfill derived history without overflowing the small /tmp tmpfs.
+
+        An UPDATE of millions of rows inside an existing write transaction can
+        create a large SQLite statement journal. Commit bounded hourly chunks;
+        all assignments are idempotent, so an interrupted migration can resume.
+        Actual measured/estimated counters are never changed by this migration.
+        """
+        self.db.commit()
+        bounds = self.db.execute("SELECT MIN(minute),MAX(minute) FROM traffic").fetchone()
+        if bounds[0] is not None:
+            for lower in range(int(bounds[0]), int(bounds[1]) + 1, 60):
+                with self.db:
+                    self.db.execute("""
+                    UPDATE traffic SET upload_valid_seconds=sample_seconds,
+                      upload_capacity_bytes=sample_seconds*6250000.0
+                    WHERE minute>=? AND minute<? AND sample_seconds>0
+                      AND quality IN ('ok','recovered') AND upload_capacity_bytes=0
+                    """, (lower, lower + 60))
+                    self.db.execute("""
+                    UPDATE traffic SET unknown_upload_seconds=unknown_seconds,
+                      unknown_upload_capacity_bytes=unknown_seconds*6250000.0
+                    WHERE minute>=? AND minute<? AND unknown_seconds>0
+                      AND unknown_upload_capacity_bytes=0
+                    """, (lower, lower + 60))
+        with self.db:
+            self._set_meta("daily_profile_schema_at", str(int(time.time())))
 
     def _ensure_columns(self, table: str, columns: Mapping[str, str]) -> None:
         existing = {str(row["name"]) for row in self.db.execute(f"PRAGMA table_info({table})")}
@@ -333,16 +430,88 @@ class FleetStore:
         self.db.close()
 
     def accounts(self) -> list[FleetAccount]:
-        rows = self.db.execute("SELECT account_id,bind_ip,snmp_interface,enabled FROM accounts ORDER BY account_id").fetchall()
-        return [FleetAccount(row["account_id"], row["bind_ip"], row["snmp_interface"], bool(row["enabled"])) for row in rows]
+        rows = self.db.execute("SELECT account_id,bind_ip,snmp_interface,enabled,weight,group_id FROM accounts ORDER BY account_id").fetchall()
+        return [FleetAccount(row["account_id"], row["bind_ip"], row["snmp_interface"], bool(row["enabled"]), row["weight"], row["group_id"]) for row in rows]
+
+    def validate_accounts(self, accounts: list[FleetAccount]) -> None:
+        known_groups = {group.group_id for group in self.groups()}
+        for item in accounts:
+            group_id = item.group_id or ("symmetric500" if item.weight == 10 else "standard")
+            if group_id not in known_groups:
+                raise ValueError(f"unknown group_id: {group_id}")
+            if item.weight not in {None, 1, 10}:
+                raise ValueError(f"invalid weight for account {item.account_id}")
+
+    def validate_daily_ready(self, accounts: list[FleetAccount] | None = None) -> None:
+        selected = self.accounts() if accounts is None else accounts
+        self.validate_accounts(selected)
+        unconfirmed = [item.account_id for item in selected if item.enabled and not item.profile_confirmed]
+        if unconfirmed:
+            raise ValueError("daily mode requires a weight-confirmed CSV for all enabled accounts: " + ",".join(unconfirmed[:5]))
 
     def import_accounts(self, accounts: list[FleetAccount]) -> None:
+        self.validate_accounts(accounts)
+        prior = {row["account_id"]: row for row in self.db.execute("SELECT account_id,snmp_interface,last_started FROM accounts")}
         with self.db:
             self.db.execute("DELETE FROM accounts")
             self.db.executemany(
-                "INSERT INTO accounts(account_id,bind_ip,snmp_interface,enabled) VALUES (?,?,?,?)",
-                [(item.account_id, item.bind_ip, item.snmp_interface, int(item.enabled)) for item in accounts],
+                "INSERT INTO accounts(account_id,bind_ip,snmp_interface,enabled,weight,group_id,last_started) VALUES (?,?,?,?,?,?,?)",
+                [(item.account_id, item.bind_ip, item.snmp_interface, int(item.enabled), item.weight,
+                  item.group_id or ("symmetric500" if item.weight == 10 else "standard"),
+                  prior[item.account_id]["last_started"] if item.account_id in prior else 0) for item in accounts],
             )
+            for item in accounts:
+                if item.account_id in prior and prior[item.account_id]["snmp_interface"] != item.snmp_interface:
+                    self.db.execute("DELETE FROM cursors WHERE account_id=?", (item.account_id,))
+        self._history_cache_key = None
+
+    def groups(self) -> list[FleetGroup]:
+        return [FleetGroup(str(row["group_id"]), str(row["name"]), float(row["download_limit_mbps"]), int(row["max_active"]), bool(row["enabled"]))
+                for row in self.db.execute("SELECT * FROM fleet_groups ORDER BY group_id")]
+
+    def update_groups(self, groups: list[dict[str, Any]]) -> None:
+        if not isinstance(groups, list) or not groups or len(groups) > MAX_ACCOUNTS:
+            raise ValueError("groups must be a non-empty list")
+        validated: list[FleetGroup] = []
+        seen: set[str] = set()
+        fields = {"group_id", "name", "download_limit_mbps", "max_active", "enabled"}
+        for payload in groups:
+            if not isinstance(payload, dict) or set(payload) - fields:
+                raise ValueError("invalid group fields")
+            group_id = payload.get("group_id", "")
+            name = payload.get("name", "")
+            limit = payload.get("download_limit_mbps")
+            count = payload.get("max_active")
+            enabled = payload.get("enabled", True)
+            if not isinstance(group_id, str) or len(group_id) > 64 or not re.fullmatch(r"[A-Za-z0-9_.:-]+", group_id) or group_id in seen:
+                raise ValueError("group_id must be valid and unique")
+            if not isinstance(name, str) or not name.strip() or len(name) > 128 or "\x00" in name:
+                raise ValueError("invalid group name")
+            if isinstance(limit, bool) or not isinstance(limit, (int, float)) or not math.isfinite(limit) or not 0 < limit <= 10000:
+                raise ValueError("download_limit_mbps must be between 0 and 10000")
+            if isinstance(count, bool) or not isinstance(count, int) or not 1 <= count <= 20:
+                raise ValueError("max_active must be an integer between 1 and 20")
+            if not isinstance(enabled, bool):
+                raise ValueError("enabled must be boolean")
+            seen.add(group_id)
+            validated.append(FleetGroup(group_id, name.strip(), float(limit), count, enabled))
+        with self.db:
+            self.db.executemany("""
+            INSERT INTO fleet_groups(group_id,name,download_limit_mbps,max_active,enabled) VALUES (?,?,?,?,?)
+            ON CONFLICT(group_id) DO UPDATE SET name=excluded.name,download_limit_mbps=excluded.download_limit_mbps,
+              max_active=excluded.max_active,enabled=excluded.enabled
+            """, [(g.group_id, g.name, g.download_limit_mbps, g.max_active, int(g.enabled)) for g in validated])
+
+    def assign_group(self, group_id: str, account_ids: list[str]) -> None:
+        if not isinstance(group_id, str) or group_id not in {group.group_id for group in self.groups()}:
+            raise ValueError("unknown group_id")
+        if not isinstance(account_ids, list) or not account_ids or not all(isinstance(item, str) for item in account_ids) or len(set(account_ids)) != len(account_ids):
+            raise ValueError("account_ids must be a non-empty list of unique account IDs")
+        known = {account.account_id for account in self.accounts()}
+        if set(account_ids) - known:
+            raise ValueError("unknown account_id")
+        with self.db:
+            self.db.executemany("UPDATE accounts SET group_id=? WHERE account_id=?", [(group_id, account_id) for account_id in account_ids])
 
     def _add_traffic(
         self,
@@ -359,14 +528,19 @@ class FleetStore:
         unknown_seconds: int = 0,
         sample_seconds: int = 0,
         interruptions: int = 0,
+        upload_valid_seconds: int = 0,
+        upload_capacity_bytes: int = 0,
+        unknown_upload_seconds: int = 0,
+        unknown_upload_capacity_bytes: int = 0,
         quality: str = "ok",
     ) -> None:
         self.db.execute("""
         INSERT INTO traffic(
           account_id,minute,upload_bytes,download_bytes,snmp_download_bytes,
           measured_upload_bytes,measured_download_bytes,estimated_upload_bytes,estimated_download_bytes,
-          unknown_seconds,sample_seconds,interruptions,quality
-        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+          unknown_seconds,sample_seconds,interruptions,quality,
+          upload_valid_seconds,upload_capacity_bytes,unknown_upload_seconds,unknown_upload_capacity_bytes
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         ON CONFLICT(account_id,minute) DO UPDATE SET
           upload_bytes=upload_bytes+excluded.upload_bytes,
           download_bytes=download_bytes+excluded.download_bytes,
@@ -378,12 +552,18 @@ class FleetStore:
           unknown_seconds=unknown_seconds+excluded.unknown_seconds,
           sample_seconds=sample_seconds+excluded.sample_seconds,
           interruptions=interruptions+excluded.interruptions,
+          upload_valid_seconds=upload_valid_seconds+excluded.upload_valid_seconds,
+          upload_capacity_bytes=upload_capacity_bytes+excluded.upload_capacity_bytes,
+          unknown_upload_seconds=unknown_upload_seconds+excluded.unknown_upload_seconds,
+          unknown_upload_capacity_bytes=unknown_upload_capacity_bytes+excluded.unknown_upload_capacity_bytes,
           quality=CASE WHEN traffic.quality='ok' THEN excluded.quality ELSE traffic.quality END
         """, (
             account_id, minute, max(0, upload), max(0, download), max(0, snmp_download),
             max(0, measured_upload), max(0, measured_download), max(0, estimated_upload),
             max(0, estimated_download), max(0, unknown_seconds), max(0, sample_seconds),
             max(0, interruptions), quality,
+            max(0, upload_valid_seconds), max(0, upload_capacity_bytes),
+            max(0, unknown_upload_seconds), max(0, unknown_upload_capacity_bytes),
         ))
 
     def record_download(self, account_id: str, amount: int, observed_at: datetime) -> None:
@@ -432,7 +612,10 @@ class FleetStore:
                 if observed is None:
                     self._add_interval_traffic(
                         account.account_id, previous_poll, now,
-                        unknown_seconds=int(max(0, (now - previous_poll).total_seconds())), quality="pending_gap",
+                        unknown_seconds=int(max(0, (now - previous_poll).total_seconds())),
+                        unknown_upload_seconds=int(max(0, (now - previous_poll).total_seconds())),
+                        unknown_upload_capacity_bytes=int(max(0, (now - previous_poll).total_seconds()) * account.upload_mbps * 1_000_000 / 8),
+                        quality="pending_gap",
                     )
                     self._save_missing_cursor(account.account_id, now)
                     results[account.account_id] = unavailable_state
@@ -476,13 +659,19 @@ class FleetStore:
                 else:
                     upload = observed.out_octets - prior["out_octets"]
                     snmp_download = observed.in_octets - prior["in_octets"]
-                upload_maximum = int(self.cfg.upload_ceiling_mbps * 1_000_000 / 8 * elapsed * 1.05)
+                upload_ceiling = account.upload_mbps if account.profile_confirmed else self.cfg.upload_ceiling_mbps
+                # Rated capacity drives forecasts; the configurable physical
+                # ceiling can admit legitimate ISP overdelivery without losing
+                # the authoritative SNMP bytes or changing the account profile.
+                upload_physical_ceiling = max(upload_ceiling, self.cfg.upload_ceiling_mbps)
+                upload_maximum = int(upload_physical_ceiling * 1_000_000 / 8 * elapsed * 1.05)
                 download_maximum = int(self.cfg.download_ceiling_mbps * 1_000_000 / 8 * elapsed * 1.05)
                 upload_valid = 0 <= upload <= upload_maximum
                 download_valid = 0 <= snmp_download <= download_maximum
                 estimated_upload = 0 if upload_valid else self._estimated_bytes(account.account_id, baseline_at, now, "upload")
                 estimated_download = 0 if download_valid else self._estimated_bytes(account.account_id, baseline_at, now, "download")
                 unknown = int(elapsed) if (not upload_valid and estimated_upload is None) or (not download_valid and estimated_download is None) else 0
+                unknown_upload = int(elapsed) if not upload_valid and estimated_upload is None else 0
                 quality = "recovered" if not prior["valid"] else ("ok" if upload_valid and download_valid else "anomaly")
                 self._add_interval_traffic(
                     account.account_id, baseline_at, now,
@@ -492,6 +681,10 @@ class FleetStore:
                     estimated_download=estimated_download or 0,
                     unknown_seconds=unknown,
                     sample_seconds=int(elapsed),
+                    upload_valid_seconds=int(elapsed) if upload_valid else 0,
+                    upload_capacity_bytes=int(upload_ceiling * 1_000_000 / 8 * elapsed) if upload_valid else 0,
+                    unknown_upload_seconds=unknown_upload,
+                    unknown_upload_capacity_bytes=int(upload_ceiling * 1_000_000 / 8 * unknown_upload),
                     quality=quality,
                 )
                 self._save_cursor(account.account_id, observed, now, True, device_uptime)
@@ -534,7 +727,7 @@ class FleetStore:
         first = int(start.timestamp() // 60)
         last = int(end.timestamp() // 60)
         self.db.execute("""
-        UPDATE traffic SET unknown_seconds=0,
+        UPDATE traffic SET unknown_seconds=0,unknown_upload_seconds=0,unknown_upload_capacity_bytes=0,
           quality=CASE WHEN quality='pending_gap' THEN 'recovered' ELSE quality END
         WHERE account_id=? AND minute BETWEEN ? AND ?
         """, (account_id, first, last))
@@ -547,20 +740,33 @@ class FleetStore:
         unknown = max(0, elapsed - capped_seconds)
         if estimated_upload is None or estimated_download is None:
             unknown = elapsed
+        unknown_upload = elapsed if estimated_upload is None else max(0, elapsed - capped_seconds)
+        account = next((item for item in self.accounts() if item.account_id == account_id), None)
+        upload_ceiling = account.upload_mbps if account and account.profile_confirmed else self.cfg.upload_ceiling_mbps
+        capped_end = min(end, start + timedelta(minutes=30))
         self._add_interval_traffic(
-            account_id, start, end,
+            account_id, start, capped_end,
             estimated_upload=estimated_upload or 0,
             estimated_download=estimated_download or 0,
-            unknown_seconds=unknown,
             sample_seconds=capped_seconds,
             interruptions=1,
             quality=quality,
+        )
+        self._add_interval_traffic(account_id, start, end, unknown_seconds=unknown, quality=quality)
+        unknown_start = start if estimated_upload is None else capped_end
+        self._add_interval_traffic(
+            account_id, unknown_start, end, unknown_upload_seconds=unknown_upload,
+            unknown_upload_capacity_bytes=int(upload_ceiling * 1_000_000 / 8 * unknown_upload), quality=quality,
         )
 
     def _estimated_bytes(self, account_id: str, start: datetime, end: datetime, direction: str) -> int | None:
         rate = self._recent_measured_rate(account_id, start, direction, minutes=30)
         if rate is None:
             return None
+        if direction == "upload":
+            row = self.db.execute("SELECT weight FROM accounts WHERE account_id=?", (account_id,)).fetchone()
+            ceiling = 500 if row and row["weight"] == 10 else (50 if row and row["weight"] == 1 else self.cfg.upload_ceiling_mbps)
+            rate = min(rate, ceiling * 1_000_000 / 8)
         capped_end = min(end, start + timedelta(minutes=30))
         seconds = self._business_seconds(start, capped_end) if direction == "upload" else max(0.0, (capped_end - start).total_seconds())
         return int(rate * seconds)
@@ -626,13 +832,24 @@ class FleetStore:
 
     def today(self, now: datetime) -> dict[str, dict[str, int]]:
         """Return traffic booked since local midnight in Asia/Shanghai."""
-        local_now = now.astimezone(SHANGHAI)
-        local_midnight = datetime.combine(local_now.date(), datetime.min.time(), SHANGHAI)
-        lower = int(local_midnight.timestamp() // 60)
-        return self._totals_since(lower)
+        return self.daily_totals(now.astimezone(SHANGHAI).date())
+
+    def daily_totals(self, day: date, before_hour: int | None = None) -> dict[str, dict[str, int]]:
+        if not isinstance(day, date) or isinstance(day, datetime):
+            raise ValueError("day must be a date")
+        if before_hour is not None and (isinstance(before_hour, bool) or not isinstance(before_hour, int) or not 0 <= before_hour <= 24):
+            raise ValueError("before_hour must be an integer between 0 and 24")
+        start = datetime.combine(day, datetime.min.time(), SHANGHAI)
+        finish = start + timedelta(hours=24 if before_hour is None else before_hour)
+        return self._totals_between(int(start.timestamp() // 60), int(finish.timestamp() // 60))
 
     def _totals_since(self, lower: int) -> dict[str, dict[str, int]]:
-        rows = self.db.execute("""
+        return self._totals_between(lower)
+
+    def _totals_between(self, lower: int, upper: int | None = None) -> dict[str, dict[str, int]]:
+        condition = "minute>=?" if upper is None else "minute>=? AND minute<?"
+        parameters = (lower,) if upper is None else (lower, upper)
+        rows = self.db.execute(f"""
         SELECT account_id,
           COALESCE(SUM(upload_bytes),0) AS legacy_upload,
           COALESCE(SUM(snmp_download_bytes),0) AS legacy_download,
@@ -642,15 +859,17 @@ class FleetStore:
           COALESCE(SUM(estimated_upload_bytes),0) AS estimated_upload,
           COALESCE(SUM(estimated_download_bytes),0) AS estimated_download,
           COALESCE(SUM(unknown_seconds),0) AS unknown_seconds,
+          COALESCE(SUM(unknown_upload_seconds),0) AS unknown_upload_seconds,
+          COALESCE(SUM(unknown_upload_capacity_bytes),0) AS unknown_upload_capacity,
           COALESCE(SUM(interruptions),0) AS interruptions
-        FROM traffic WHERE minute>=? GROUP BY account_id
-        """, (lower,)).fetchall()
+        FROM traffic WHERE {condition} GROUP BY account_id
+        """, parameters).fetchall()
         values: dict[str, dict[str, int]] = {}
         for row in rows:
             item = {name: int(row[name]) for name in (
                 "legacy_upload", "legacy_download", "program_download",
                 "measured_upload", "measured_download", "estimated_upload",
-                "estimated_download", "unknown_seconds", "interruptions",
+                "estimated_download", "unknown_seconds", "unknown_upload_seconds", "unknown_upload_capacity", "interruptions",
             )}
             item["upload"] = item["legacy_upload"] + item["measured_upload"] + item["estimated_upload"]
             item["download"] = item["legacy_download"] + item["measured_download"] + item["estimated_download"]
@@ -660,12 +879,87 @@ class FleetStore:
             "legacy_upload": 0, "legacy_download": 0, "program_download": 0,
             "measured_upload": 0, "measured_download": 0,
             "estimated_upload": 0, "estimated_download": 0,
-            "unknown_seconds": 0, "interruptions": 0,
+            "unknown_seconds": 0, "unknown_upload_seconds": 0, "unknown_upload_capacity": 0, "interruptions": 0,
             "upload": 0, "download": 0, "snmp_download": 0,
         }
         for account in self.accounts():
             values.setdefault(account.account_id, dict(empty))
         return values
+
+    def _historical_utilization(self, now: datetime) -> dict[str, dict[int, float]]:
+        local_now = now.astimezone(SHANGHAI)
+        key = (local_now.date().toordinal(), local_now.hour)
+        if self._history_cache_key == key:
+            return self._history_cache
+        end = datetime.combine(local_now.date(), datetime.min.time(), SHANGHAI)
+        lower = int((end - timedelta(days=7)).timestamp() // 60)
+        upper = int(end.timestamp() // 60)
+        rows = self.db.execute("""
+        SELECT account_id,CAST((minute-?)/1440 AS INTEGER) AS historical_day,
+          CAST(((minute-?)%1440)/15 AS INTEGER) AS interval,
+          SUM(measured_upload_bytes) AS upload,SUM(upload_capacity_bytes) AS capacity,
+          SUM(upload_valid_seconds) AS valid_seconds
+        FROM traffic WHERE minute>=? AND minute<?
+        GROUP BY account_id,historical_day,interval
+        """, (lower, lower, lower, upper)).fetchall()
+        self._history_cache = history_model(rows)
+        self._history_cache_key = key
+        return self._history_cache
+
+    def daily_forecasts(self, now: datetime) -> dict[str, dict[str, Any]]:
+        local_now = now.astimezone(SHANGHAI)
+        totals = self.daily_totals(local_now.date())
+        historical = self._historical_utilization(local_now)
+        result: dict[str, dict[str, Any]] = {}
+        for account in self.accounts():
+            values = daily_prediction(
+                local_now, upload_mbps=account.upload_mbps,
+                totals=totals[account.account_id], historical_utilization=historical.get(account.account_id, {}),
+                target_ratio=self.cfg.target_ratio,
+            )
+            # Unprefixed measured fields are convenient for API aggregation.
+            values.update({
+                "measured_upload_bytes": totals[account.account_id]["measured_upload"],
+                "measured_download_bytes": totals[account.account_id]["measured_download"],
+                "estimated_upload_bytes": totals[account.account_id]["estimated_upload"],
+                "estimated_download_bytes": totals[account.account_id]["estimated_download"],
+                "unknown_seconds": totals[account.account_id]["unknown_seconds"],
+            })
+            result[account.account_id] = values
+        return result
+
+    def daily_report(self, day: date) -> dict[str, dict[str, Any]]:
+        # A completed-day report uses its final ledger, not today's forecast or
+        # any debt from the previous day. One microsecond keeps the correct date.
+        finish = datetime.combine(day + timedelta(days=1), datetime.min.time(), SHANGHAI)
+        now = min(datetime.now(SHANGHAI), finish - timedelta(microseconds=1))
+        if now.date() != day:
+            raise ValueError("daily reports cannot use a future date")
+        forecasts = self.daily_forecasts(now)
+        before18 = self.daily_totals(day, before_hour=18)
+        pre18_targets = json.loads(self._meta(f"daily_pre18:{day.isoformat()}") or "{}")
+        result: dict[str, dict[str, Any]] = {}
+        for account in self.accounts():
+            values = dict(forecasts[account.account_id])
+            if datetime.now(SHANGHAI) >= finish:
+                values["future_upload_bytes"] = 0
+                values["predicted_upload_bytes"] = values["today_upload_bytes"] + values["unknown_upload_budget_bytes"]
+                values["target_download_bytes"] = int(values["predicted_upload_bytes"] * self.cfg.target_ratio)
+                values["remaining_download_bytes"] = max(0, values["target_download_bytes"] - values["today_download_bytes"])
+                target_bytes = values["target_download_bytes"]
+                values["target_progress_percent"] = min(100.0, values["today_download_bytes"] * 100.0 / target_bytes) if target_bytes else 100.0
+            early = before18[account.account_id]
+            target = pre18_targets.get(account.account_id)
+            values.update({
+                "date": day.isoformat(),
+                "before18_upload_bytes": early["upload"],
+                "before18_download_bytes": early["download"],
+                "before18_target_download_bytes": target,
+                "before18_achieved": early["download"] >= target if isinstance(target, (int, float)) else None,
+                "final_achieved": values["today_download_bytes"] >= values["target_download_bytes"],
+            })
+            result[account.account_id] = values
+        return result
 
     def recent_upload_rates(self, now: datetime) -> dict[str, float]:
         rates: dict[str, float] = {}
@@ -680,12 +974,20 @@ class FleetStore:
         seconds = int(max(0, (end - start).total_seconds()))
         if seconds <= 0:
             return
-        minute = int(end.timestamp() // 60)
         with self.db:
-            self.db.execute("""
-            INSERT INTO runtime_minutes(account_id,minute,allocated_seconds) VALUES (?,?,?)
-            ON CONFLICT(account_id,minute) DO UPDATE SET allocated_seconds=allocated_seconds+excluded.allocated_seconds
-            """, (account_id, minute, seconds))
+            cursor = start
+            remaining = seconds
+            while cursor < end:
+                minute = int(cursor.timestamp() // 60)
+                boundary = datetime.fromtimestamp((minute + 1) * 60, timezone.utc)
+                segment_end = min(end, boundary)
+                amount = remaining if segment_end == end else min(remaining, int((segment_end - cursor).total_seconds()))
+                self.db.execute("""
+                INSERT INTO runtime_minutes(account_id,minute,allocated_seconds) VALUES (?,?,?)
+                ON CONFLICT(account_id,minute) DO UPDATE SET allocated_seconds=allocated_seconds+excluded.allocated_seconds
+                """, (account_id, minute, amount))
+                remaining -= amount
+                cursor = segment_end
 
     def allocated_last24(self, now: datetime) -> dict[str, int]:
         lower = int((now - timedelta(hours=24)).timestamp() // 60)
@@ -693,6 +995,16 @@ class FleetStore:
         SELECT account_id,COALESCE(SUM(allocated_seconds),0) AS seconds
         FROM runtime_minutes WHERE minute>=? GROUP BY account_id
         """, (lower,)).fetchall()
+        return {str(row["account_id"]): int(row["seconds"]) for row in rows}
+
+    def allocated_today(self, now: datetime) -> dict[str, int]:
+        local_now = now.astimezone(SHANGHAI)
+        start = datetime.combine(local_now.date(), datetime.min.time(), SHANGHAI)
+        finish = start + timedelta(days=1)
+        rows = self.db.execute("""
+        SELECT account_id,COALESCE(SUM(allocated_seconds),0) AS seconds
+        FROM runtime_minutes WHERE minute>=? AND minute<? GROUP BY account_id
+        """, (int(start.timestamp() // 60), int(finish.timestamp() // 60))).fetchall()
         return {str(row["account_id"]): int(row["seconds"]) for row in rows}
 
     def cursor_status(self) -> dict[str, dict[str, int | None]]:
@@ -724,7 +1036,7 @@ class FleetStore:
         return {row["account_id"]: int(row["last_started"]) for row in self.db.execute("SELECT account_id,last_started FROM accounts")}
 
     def _prune(self, now: datetime) -> None:
-        lower = int((now - timedelta(days=self.cfg.rolling_days + 1)).timestamp() // 60)
+        lower = int((now - timedelta(days=max(16, self.cfg.rolling_days + 1))).timestamp() // 60)
         self.db.execute("DELETE FROM traffic WHERE minute<?", (lower,))
         runtime_lower = int((now - timedelta(days=2)).timestamp() // 60)
         self.db.execute("DELETE FROM runtime_minutes WHERE minute<?", (runtime_lower,))
@@ -754,9 +1066,12 @@ class ActiveLine:
     last_progress_at: datetime | None = None
     last_accounted_at: datetime | None = None
     rate_samples: deque[tuple[datetime, int]] = field(default_factory=lambda: deque(maxlen=400))
+    assigned_mbps: float = 0.0
+    last_resize_at: datetime | None = None
+    last_slow_notice_at: datetime | None = None
 
 
-class FleetController:
+class FleetController(FleetSources):
     def __init__(
         self,
         config_path: str | Path,
@@ -787,17 +1102,27 @@ class FleetController:
         self.account_health_errors: dict[str, str] = {}
         self.rate_samples: deque[tuple[float, int]] = deque(maxlen=180)
         self.rate_total = 0
+        self.wan_budget = WanBudget(interface=self.cfg.router_snmp_interface)
+        self.daily_allocation: dict[str, float] = {}
+        self.daily_schedule_key: tuple[str, str] | None = None
+        self.daily_schedule_budget = 0.0
+        self.daily_groups_changed = False
+        self.view_cache_minute: int | None = None
+        self.view_cache: dict[str, Any] = {}
         self.remote_source_manager = remote_source_manager
         self.remote_source_refresher = RemoteSourceRefreshWorker(remote_source_manager) if remote_source_manager is not None else None
         self.remote_source_snapshot = SourceListSnapshot(enabled=remote_source_manager is not None, status="disabled" if remote_source_manager is None else "pending")
         self.effective_source_pool = list(self.cfg.source_pool)
         self.effective_source_origin = "local-fallback"
+        self._init_source_state()
         if remote_source_manager is not None:
             sources, snapshot = remote_source_manager.load_last_known_good()
             self.remote_source_snapshot = snapshot
             if sources:
                 self.effective_source_pool = list(sources)
                 self.effective_source_origin = "last-known-good"
+                self.active_source_revision = snapshot.revision
+                self.source_generation = self._source_generation(self.effective_source_pool, snapshot.revision)
             self.remote_source_refresher.request()
         self.snmp_reader = snmp_reader or self._reader_from_environment()
         inventory = os.environ.get("FLEET_ACCOUNTS_CSV", "").strip()
@@ -810,6 +1135,13 @@ class FleetController:
             else:
                 self.log("no bootstrap account CSV; waiting for Web API import")
         self._attach_addresses()
+        self.dashboard_agent = None
+        if os.environ.get("DASHBOARD_URL", "").strip():
+            from .dashboard_agent import DashboardAgent
+            try:
+                self.dashboard_agent = DashboardAgent(self.data_dir)
+            except Exception:
+                self.log("dashboard initialization failed; check agent settings and restart to reconnect")
 
     def _reader_from_environment(self) -> SnmpV2Reader | None:
         host = os.environ.get("SNMP_HOST", "").strip()
@@ -834,36 +1166,26 @@ class FleetController:
         force_schedule = self._consume_snmp_result(now)
         if now_mono - self.last_engine_at >= self.cfg.engine_status_seconds:
             self.last_engine_at = now_mono
-            force_schedule = self._poll_engines(now)
+            force_schedule = self._poll_engines(now) or force_schedule
         if now_mono - self.last_snmp_at >= self.cfg.snmp_poll_seconds:
             self.last_snmp_at = now_mono
             self._start_snmp_poll()
+        key = (now.date().isoformat(), self._daily_phase(now))
+        if key != self.daily_schedule_key or (self.active and self._router_snapshot(now)["phase_limit_mbps"] <= 0):
+            force_schedule = True
         if force_schedule or now_mono - self.last_schedule_at >= self.cfg.scheduler_tick_seconds:
             self.last_schedule_at = now_mono
             self._schedule(now)
-
-    def _poll_remote_sources(self, monotonic_now: float, now: datetime) -> None:
-        if self.remote_source_refresher is None:
-            return
-        result = self.remote_source_refresher.poll_result()
-        if result is not None:
-            if isinstance(result, Exception):
-                self.log("source-list refresh failed")
-            else:
-                changed, sources, snapshot = result
-                self.remote_source_snapshot = snapshot
-                if sources and changed:
-                    self.effective_source_pool = list(sources)
-                    self.effective_source_origin = "remote"
-                    for line in self.active.values():
-                        line.engine.set_sources(self.effective_source_pool)
-                elif sources:
-                    self.effective_source_origin = "remote"
-        self.remote_source_refresher.request_if_due(now)
+        if self.dashboard_agent is not None:
+            try:
+                self.dashboard_agent.tick(self, now, now_mono)
+            except Exception:
+                self.log("dashboard export failed; local scheduling continues")
 
     def _start_snmp_poll(self) -> None:
         if self.snmp_reader is None:
             self.snmp_status = "disabled"
+            self._dashboard_upload_samples = {}
             return
         if self.snmp_thread is not None and self.snmp_thread.is_alive():
             return
@@ -881,6 +1203,7 @@ class FleetController:
         except (RuntimeError, OSError):
             self.snmp_thread = None
             self.snmp_status = "degraded"
+            self._dashboard_upload_samples = {}
             self.log("SNMP worker could not start; collection will retry without stopping the service")
             return
         self.snmp_thread = thread
@@ -895,13 +1218,39 @@ class FleetController:
             changed = True
             if error is not None or interfaces is None:
                 self.snmp_status = "degraded"
+                self._dashboard_upload_samples = {}
                 self.log("SNMP collection failed; counters will be reconciled or estimated after recovery")
                 continue
             try:
+                prior_baselines = {}
+                if self.dashboard_agent is not None:
+                    prior_baselines = {row["account_id"]: row["baseline_at"] or row["sampled_at"]
+                                       for row in self.store.db.execute("SELECT account_id,baseline_at,sampled_at FROM cursors")}
                 self.snmp_quality = self.store.record_snmp(interfaces, observed_at, device_uptime=device_uptime)
+                if self.dashboard_agent is not None:
+                    corrected = [prior_baselines[account_id] for account_id, quality in self.snmp_quality.items()
+                                 if quality in {"recovered", "reset"} and account_id in prior_baselines]
+                    if corrected:
+                        try:
+                            self.dashboard_agent.invalidate_since(min(corrected))
+                        except Exception:
+                            self.log("dashboard correction queue failed; SNMP accounting continues")
+                self.wan_budget.observe(interfaces, observed_at, device_uptime,
+                                        swap=self.cfg.snmp_direction_swap, stale_seconds=self.cfg.wan_stale_seconds)
                 self.snmp_status = "online"
+                if self.dashboard_agent is not None:
+                    try:
+                        from .dashboard_export import current_upload_rates
+                        # Capture every SNMP sample, including those between
+                        # the slower dashboard exports, before cursors advance.
+                        current_upload_rates(self, observed_at)
+                    except Exception:
+                        self._dashboard_upload_samples = {}
+                        self.log("dashboard upload measurement failed; local scheduling continues")
+                self.view_cache.clear()
             except Exception:
                 self.snmp_status = "degraded"
+                self._dashboard_upload_samples = {}
                 self.log("SNMP accounting failed; sample was not committed")
         return changed
 
@@ -929,6 +1278,19 @@ class FleetController:
             if failure:
                 self._quarantine(account_id, now, failure)
                 replacement_needed = True
+            elif self.cfg.rate_limit_enabled and (now - active.started_at).total_seconds() >= 60 and (
+                active.last_resize_at is None or (now - active.last_resize_at).total_seconds() >= 15
+            ):
+                rate = self._active_rate(active, 60)
+                current_connections = active.engine.state.connections
+                target = current_connections
+                if rate < active.assigned_mbps * 0.9:
+                    target = min(self.cfg.max_connections_per_line, current_connections + 1)
+                elif rate > active.assigned_mbps * 1.15:
+                    target = max(1, current_connections - 1)
+                if target != current_connections:
+                    active.engine.set_connections(target)
+                active.last_resize_at = now
         self.rate_total += aggregate_delta
         self.rate_samples.append((time.monotonic(), self.rate_total))
         return replacement_needed
@@ -951,8 +1313,17 @@ class FleetController:
         if elapsed < window:
             return ""
         mbps = max(0, last_bytes - first_bytes) * 8 / max(0.001, elapsed) / 1_000_000
-        if mbps < self.cfg.line_minimum_mbps:
-            return f"average download {mbps:.1f}Mbps below {self.cfg.line_minimum_mbps}Mbps for {int(elapsed)}s"
+        threshold = min(50.0, active.assigned_mbps * 0.25)
+        if mbps < threshold:
+            # The engine already rotates stalled/slow sources and probes their
+            # recovery. Keep useful traffic flowing while it does so instead
+            # of turning a slow source into a 30-minute whole-line outage.
+            if active.last_slow_notice_at is None or (now - active.last_slow_notice_at).total_seconds() >= window:
+                self.log(
+                    f"account={active.account.account_id} slow download={mbps:.1f}Mbps "
+                    f"threshold={threshold:g}Mbps; continuing download and automatic source recovery"
+                )
+                active.last_slow_notice_at = now
         return ""
 
     def _quarantine(self, account_id: str, now: datetime, reason: str) -> None:
@@ -963,89 +1334,212 @@ class FleetController:
         self.log(f"account={account_id} unhealthy reason={reason} cooldown_until={until.isoformat(timespec='seconds')}")
 
     def _schedule(self, now: datetime) -> None:
+        self._schedule_daily(now)
+
+    def _capture_daily_targets(self, now: datetime, forecasts: Mapping[str, Mapping[str, Any]]) -> None:
+        snapshot = {account_id: int(values["target_download_bytes"]) for account_id, values in forecasts.items()}
+        with self.store.db:
+            self.store._set_meta(f"daily_forecast:{now.date().isoformat()}", json.dumps(snapshot))
+            if now.hour < 18:
+                self.store._set_meta(f"daily_pre18:{now.date().isoformat()}", json.dumps(snapshot))
+
+    def _evening_override(self, now: datetime) -> dict[str, Any] | None:
+        raw = self.store._meta("evening_override")
+        if not raw or now.hour < 18:
+            return None
+        try:
+            value = json.loads(raw)
+            if value.get("date") == now.date().isoformat() and value.get("account_ids"):
+                return value
+        except (ValueError, AttributeError):
+            pass
+        return None
+
+    def _daily_phase(self, now: datetime) -> str:
+        if daily_phase(now) == "upload_only" and self._evening_override(now):
+            return "evening_override"
+        return daily_phase(now)
+
+    def _router_snapshot(self, now: datetime) -> dict[str, Any]:
+        value = self.wan_budget.snapshot(now, self._rates()[2], self.cfg)
+        override = self._evening_override(now)
+        if override and daily_phase(now) == "upload_only":
+            value["phase_limit_mbps"] = min(self.cfg.late_download_limit_mbps, value["available_mbps"])
+        value["evening_override"] = override
+        return value
+
+    def set_evening_override(self, payload: dict[str, Any]) -> dict[str, Any]:
+        if not isinstance(payload, dict) or set(payload) != {"date", "account_ids"}:
+            raise ValueError("expected date and account_ids")
+        now = datetime.now(SHANGHAI)
+        ids = payload["account_ids"]
+        if payload["date"] != now.date().isoformat():
+            raise ValueError("evening override must use today's Shanghai date")
+        if not isinstance(ids, list) or not ids or len(ids) > 20 or not all(isinstance(item, str) for item in ids) or len(ids) != len(set(ids)):
+            raise ValueError("account_ids must contain 1 to 20 unique account IDs")
+        accounts = {item.account_id: item for item in self.store.accounts()}
+        if any(account_id not in accounts or not accounts[account_id].enabled for account_id in ids):
+            raise ValueError("override accounts must exist and be enabled")
+        self.store.validate_daily_ready()
+        expires = datetime.combine(now.date() + timedelta(days=1), datetime.min.time(), SHANGHAI)
+        value = {"date": payload["date"], "account_ids": sorted(ids), "expires_at": expires.isoformat(),
+                 "max_mbps": self.cfg.late_download_limit_mbps}
+        with self.lock:
+            with self.store.db:
+                self.store._set_meta("evening_override", json.dumps(value))
+            self.set_manual_enabled(True)
+            self.daily_groups_changed = True
+            self._schedule(now)
+        self.log(f"temporary evening override accounts={','.join(sorted(ids))} expires={expires.isoformat()}")
+        return value
+
+    def _schedule_daily(self, now: datetime) -> None:
+        forecasts = self._cached_view("forecast", now)
+        self._capture_daily_targets(now, forecasts)
+        budget = self._router_snapshot(now)["phase_limit_mbps"]
+        key = (now.date().isoformat(), self._daily_phase(now))
+        interrupt_minimum = (key != self.daily_schedule_key or self.daily_groups_changed
+                             or budget + 0.001 < self.daily_schedule_budget)
+        self.daily_schedule_key = key
+        self.daily_schedule_budget = budget
         if not self.manual_enabled:
+            self.daily_allocation = {}
             self._stop_all()
             return
-        accounts = [item for item in self.store.accounts() if item.enabled]
-        if not accounts:
+        try:
+            self.store.validate_daily_ready()
+        except ValueError:
+            self.daily_allocation = {}
             self._stop_all()
             return
-        desired = self._desired_count(now, accounts)
         for account_id, until in list(self.account_cooldowns.items()):
             if until <= now:
                 self.account_cooldowns.pop(account_id, None)
-        unusable_snmp_states = {"offline", "missing", "ambiguous"}
-        eligible = [
-            item for item in accounts
-            if item.account_id not in self.account_cooldowns
-            and self.snmp_quality.get(item.account_id) not in unusable_snmp_states
-        ]
-        eligible_ids = {item.account_id for item in eligible}
-        rolling = self.store.rolling(now)
-        last_started = self.store.last_started()
-        allocated = self.store.allocated_last24(now)
+        accounts = [item for item in self.store.accounts() if item.enabled]
+        unusable = {"pending", "baseline", "offline", "missing", "ambiguous"}
+        eligible = [item for item in accounts if item.account_id not in self.account_cooldowns
+                    and self.snmp_quality.get(item.account_id, "pending") not in unusable]
+        override = self._evening_override(now)
+        forced = set(override["account_ids"]) if override else set()
+        if self._daily_phase(now) == "evening_override":
+            eligible = [item for item in eligible if item.account_id in forced]
         minimum = timedelta(minutes=self.cfg.rotation_minutes)
-        keep: list[str] = []
-        for account_id, active in self.active.items():
-            if len(keep) >= desired:
-                continue
-            if (
-                active.account.enabled
-                and account_id in eligible_ids
-                and now - active.started_at < minimum
-                and active.engine.state.status not in {"stopped", "failed"}
-            ):
-                keep.append(account_id)
-        candidates = [item for item in eligible if item.account_id not in keep]
-        candidates.sort(key=lambda item: self._priority(
-            item, rolling[item.account_id], allocated.get(item.account_id, 0), last_started.get(item.account_id, 0),
-        ))
-        selected = set(keep + [item.account_id for item in candidates[:max(0, desired - len(keep))]])
-        for account_id in list(self.active):
-            if account_id not in selected:
+        keep = [] if interrupt_minimum else [account_id for account_id, active in self.active.items()
+                                            if now - active.started_at < minimum
+                                            and active.engine.state.status not in {"stopped", "failed"}]
+        allocation = allocate_daily(eligible, self.store.groups(), forecasts, budget,
+                                    self.store.allocated_today(now), self.store.last_started(), keep, force=forced,
+                                    surplus_seconds=(now.replace(hour=18, minute=0, second=0, microsecond=0) - now).total_seconds()
+                                    if self._daily_phase(now) == "daytime" else 0)
+        self.daily_groups_changed = False
+        # Release old slots before starting new lines. iKuai, not the process,
+        # enforces the per-line profile and aggregate physical limit.
+        for account_id, active in list(self.active.items()):
+            rate = allocation.get(account_id, 0.0)
+            if rate <= 0 or rate != active.assigned_mbps:
                 self._stop(account_id)
-        by_id = {item.account_id: item for item in accounts}
-        for account_id in selected:
-            if account_id not in self.active:
-                self._start(by_id[account_id], now)
+        by_id = {item.account_id: item for item in eligible}
+        for account_id, rate in list(allocation.items()):
+            active = self.active.get(account_id)
+            if active is None:
+                self._start(by_id[account_id], now, rate)
+        self.daily_allocation = allocation
 
-    def _priority(
-        self,
-        account: FleetAccount,
-        totals: Mapping[str, int],
-        allocated_seconds: int,
-        last_started: int,
-    ) -> tuple[float, int, int, int, str]:
-        upload = totals["upload"]
-        download = totals["download"]
-        ratio = download / upload if upload else float("inf")
-        debt = max(0, int(math.ceil(upload * self.cfg.target_ratio)) - download)
-        return (
-            0.0 if ratio < self.cfg.target_ratio else 1.0,
-            -debt,
-            allocated_seconds,
-            last_started,
-            account.account_id,
-        )
+    def groups_snapshot(self) -> list[dict[str, Any]]:
+        groups = []
+        for group in self.store.groups():
+            item = asdict(group)
+            active = [line for line in self.active.values() if line.account.group_id == group.group_id]
+            item.update(active_accounts=len(active), assigned_mbps=sum(line.assigned_mbps for line in active))
+            groups.append(item)
+        return groups
 
-    def _desired_count(self, now: datetime, accounts: list[FleetAccount]) -> int:
-        current = now.timetz().replace(tzinfo=None)
-        if current.hour == 0:
-            return 10
-        if 1 <= current.hour < 7:
-            return 20
-        if 7 <= current.hour < 18:
-            return 10
-        # Reserve the complete PCDN upload window for the original workload.
-        return 0
+    def update_groups(self, payload: dict[str, Any]) -> list[dict[str, Any]]:
+        if not isinstance(payload, dict) or set(payload) != {"groups"}:
+            raise ValueError("expected {groups: [...]} payload")
+        with self.lock:
+            self.store.update_groups(payload["groups"])
+            self.view_cache.clear()
+            self.daily_groups_changed = True
+            self._schedule(datetime.now(SHANGHAI))
+            return self.groups_snapshot()
 
-    def _start(self, account: FleetAccount, now: datetime) -> None:
-        line = LogicalLine(account.account_id, self.cfg.per_line_mbps, account.bind_ip)
-        engine = EngineProcess(self.cfg, line, self.effective_source_pool, self.log, reject_private_destinations=True)
+    def assign_groups(self, payload: dict[str, Any]) -> list[dict[str, Any]]:
+        if not isinstance(payload, dict) or set(payload) != {"group_id", "account_ids"}:
+            raise ValueError("expected group_id and account_ids")
+        with self.lock:
+            self.store.assign_group(payload["group_id"], payload["account_ids"])
+            self.view_cache.clear()
+            # Group identity in ActiveLine must follow the current inventory.
+            by_id = {item.account_id: item for item in self.store.accounts()}
+            for account_id, active in self.active.items():
+                active.account = by_id[account_id]
+            self.daily_groups_changed = True
+            self._schedule(datetime.now(SHANGHAI))
+            return self.groups_snapshot()
+
+    def _cached_view(self, name: str, now: datetime) -> Any:
+        minute = int(now.timestamp() // 60)
+        if self.view_cache_minute != minute:
+            self.view_cache_minute = minute
+            self.view_cache.clear()
+        if name not in self.view_cache:
+            if name == "forecast":
+                value = self.store.daily_forecasts(now)
+            elif name == "rolling":
+                value = self.store.rolling(now)
+            elif name == "today":
+                value = self.store.today(now)
+            elif name == "pre18":
+                value = self.store.daily_totals(now.date(), before_hour=18)
+            else:
+                raise ValueError("unknown cached view")
+            self.view_cache[name] = value
+        return self.view_cache[name]
+
+    def _daily_snapshot(self, now: datetime) -> dict[str, Any]:
+        forecasts = self._cached_view("forecast", now)
+        enabled = {item.account_id for item in self.store.accounts() if item.enabled}
+        rows = [values for account_id, values in forecasts.items() if account_id in enabled]
+        sums = ("today_upload_bytes", "today_download_bytes", "measured_upload_bytes", "measured_download_bytes",
+                "estimated_upload_bytes", "estimated_download_bytes", "unknown_seconds", "predicted_upload_bytes",
+                "target_download_bytes", "remaining_download_bytes", "future_upload_bytes", "unknown_upload_budget_bytes")
+        result: dict[str, Any] = {key: sum(item.get(key, 0) for item in rows) for key in sums}
+        result.update(date=now.date().isoformat(), phase=self._daily_phase(now), total_accounts=len(rows),
+                      evening_override=self._evening_override(now),
+                      achieved_accounts=sum(item.get("remaining_download_bytes", 0) <= 0 for item in rows),
+                      profile_unconfirmed_accounts=sum(item.enabled and not item.profile_confirmed for item in self.store.accounts()))
+        result["pre18_result"] = None
+        result["final_result"] = None
+        pre_raw = self.store._meta(f"daily_pre18:{now.date().isoformat()}")
+        if now.hour >= 18 and pre_raw:
+            targets = json.loads(pre_raw)
+            pre_totals = self._cached_view("pre18", now)
+            ids = enabled & targets.keys()
+            result["pre18_result"] = {
+                "download_bytes": sum(pre_totals[account_id]["download"] for account_id in ids),
+                "target_download_bytes": sum(targets[account_id] for account_id in ids),
+                "achieved_accounts": sum(pre_totals[account_id]["download"] >= targets[account_id] for account_id in ids),
+                "total_accounts": len(ids),
+            }
+        return result
+
+    def _start(self, account: FleetAccount, now: datetime, assigned_mbps: float | None = None) -> None:
+        rate = account.download_mbps if assigned_mbps is None else assigned_mbps
+        line = LogicalLine(account.account_id, rate, account.bind_ip)
+        sources = self.pending_source_pool or self.effective_source_pool
+        generation = self.pending_source_generation or self.source_generation
+        filename = hashlib.sha256(account.account_id.encode()).hexdigest()[:24] + ".json"
+        engine = EngineProcess(self.cfg, line, sources, self.log,
+                               sources_file=self.sources_runtime_dir / filename,
+                               reject_private_destinations=True, source_generation=generation,
+                               fallback_sources=self._fallback_sources(sources),
+                               source_health=self.account_source_health.get(account.account_id))
         engine.start()
         self.active[account.account_id] = ActiveLine(
             account, engine, now, last_progress_at=now,
             rate_samples=deque([(now, 0)], maxlen=400),
+            assigned_mbps=rate,
         )
         self.store.mark_started(account.account_id, now)
         self.log(f"account={account.account_id} start")
@@ -1054,6 +1548,13 @@ class FleetController:
         active = self.active.pop(account_id, None)
         if active is not None:
             active.engine.stop()
+            self.account_source_health[account_id] = dict(getattr(active.engine, "source_health", {}))
+            now = datetime.now(SHANGHAI)
+            delta = max(0, active.engine.state.total_bytes - active.last_bytes)
+            if delta:
+                self.store.record_download(account_id, delta, now)
+                self.rate_total += delta
+                active.last_bytes += delta
             self.log(f"account={account_id} stop")
 
     def _stop_all(self) -> None:
@@ -1073,6 +1574,8 @@ class FleetController:
             self._stop_all()
 
     def shutdown(self) -> None:
+        if self.dashboard_agent is not None:
+            self.dashboard_agent.shutdown()
         self._stop_all()
         if self.remote_source_refresher is not None:
             self.remote_source_refresher.shutdown()
@@ -1080,9 +1583,15 @@ class FleetController:
 
     def import_accounts_csv(self, payload: str) -> dict[str, Any]:
         accounts = parse_accounts_csv(payload)
+        if any(item.enabled and not item.profile_confirmed for item in accounts):
+            raise ValueError("daily mode requires weight=1 or weight=10 for every enabled account")
+        known_groups = {group.group_id for group in self.store.groups()}
+        if any(item.group_id not in known_groups for item in accounts):
+            raise ValueError("CSV references an unknown group; create the group before importing")
         with self.lock:
             self._stop_all()
             self.store.import_accounts(accounts)
+            self.view_cache.clear()
             self._attach_addresses()
         return {"ok": True, "accounts": len(accounts)}
 
@@ -1092,20 +1601,24 @@ class FleetController:
         if unknown:
             raise ValueError(f"unsupported configuration fields: {', '.join(sorted(unknown))}")
         candidate = replace(self.cfg, **data).validate()
+        if candidate.daily_mode_enabled:
+            self.store.validate_daily_ready()
+        wan_changed = (candidate.router_snmp_interface != self.cfg.router_snmp_interface
+                       or candidate.snmp_direction_swap != self.cfg.snmp_direction_swap)
         source_pool_changed = candidate.source_pool != self.cfg.source_pool
+        save_config(self.config_path, candidate)
         self.cfg = candidate
         self.store.cfg = candidate
-        save_config(self.config_path, candidate)
-        # When a signed remote list is configured it remains authoritative.  In
-        # standalone/local-fallback mode, however, applying a curated source
-        # pool must reach the running engines immediately; otherwise operators
-        # would need to restart a healthy fleet just to add a replacement
-        # Speedtest source.
-        if source_pool_changed and self.remote_source_manager is None:
-            self.effective_source_pool = list(candidate.source_pool)
-            self.effective_source_origin = "local-config"
-            for line in self.active.values():
-                line.engine.set_sources(self.effective_source_pool)
+        self.view_cache.clear()
+        if wan_changed:
+            self.wan_budget = WanBudget(interface=candidate.router_snmp_interface)
+        self.daily_groups_changed = True
+        self.last_schedule_at = 0
+        if source_pool_changed:
+            remote_active = self.remote_source_manager is not None and bool(self.remote_source_manager.current_urls)
+            sources = (self.pending_source_pool or self.effective_source_pool) if remote_active else candidate.source_pool
+            self._begin_source_update(list(sources), self.pending_source_revision or self.active_source_revision,
+                                      self.effective_source_origin if remote_active else "local-config", time.monotonic())
         return candidate
 
     def _rates(self) -> tuple[float, float, float]:
@@ -1126,13 +1639,13 @@ class FleetController:
     def metrics(self) -> dict[str, Any]:
         now = datetime.now(SHANGHAI)
         current, avg10, avg60 = self._rates()
-        totals = self.store.rolling(now)
-        today_totals = self.store.today(now)
+        totals = self._cached_view("rolling", now)
+        today_totals = self._cached_view("today", now)
         download = sum(item["download"] for item in totals.values())
         upload = sum(item["upload"] for item in totals.values())
         today_download = sum(item["download"] for item in today_totals.values())
         today_upload = sum(item["upload"] for item in today_totals.values())
-        target_mbps = self._desired_count(now, self.store.accounts()) * self.cfg.per_line_mbps
+        target_mbps = sum(line.assigned_mbps for line in self.active.values())
         rolling_target_download = int(upload * self.cfg.target_ratio)
         today_target_download = int(today_upload * self.cfg.target_ratio)
         return {
@@ -1157,6 +1670,11 @@ class FleetController:
             "rolling_program_download_bytes": sum(item["program_download"] for item in totals.values()),
             "rolling_unknown_seconds": sum(item["unknown_seconds"] for item in totals.values()),
             "rolling_interruptions": sum(item["interruptions"] for item in totals.values()),
+            "daily_mode_enabled": self.cfg.daily_mode_enabled,
+            "daily": self._daily_snapshot(now),
+            "router_budget": self._router_snapshot(now),
+            "groups": self.groups_snapshot(),
+            "diagnostics": self._completion_diagnostics(now),
             "lines": self._line_metrics(now, totals, today_totals),
         }
 
@@ -1181,6 +1699,7 @@ class FleetController:
     ) -> list[dict[str, Any]]:
         result: list[dict[str, Any]] = []
         cursor_status = self.store.cursor_status()
+        forecasts = self._cached_view("forecast", now)
         for account in self.store.accounts():
             active = self.active.get(account.account_id)
             cooldown_until = self.account_cooldowns.get(account.account_id)
@@ -1195,7 +1714,12 @@ class FleetController:
                 "line_id": account.account_id, "account_id": account.account_id,
                 "bind_ip": account.bind_ip, "snmp_interface": account.snmp_interface,
                 "enabled": account.enabled, "active": active is not None,
-                "target_mbps": self.cfg.per_line_mbps if active else 0,
+                "weight": account.weight, "group_id": account.group_id,
+                "profile_confirmed": account.profile_confirmed,
+                "upload_mbps": account.upload_mbps, "download_mbps": account.download_mbps,
+                "assigned_mbps": active.assigned_mbps if active else 0,
+                "daily": forecasts.get(account.account_id, {}),
+                "target_mbps": active.assigned_mbps if active else 0,
                 "current_mbps": current_mbps, "avg60_mbps": avg60_mbps,
                 "today_bytes": int(today_values.get("download", 0)),
                 "today_upload_bytes": int(today_values.get("upload", 0)),
@@ -1229,10 +1753,14 @@ class FleetController:
 
     def accounts_snapshot(self) -> list[dict[str, Any]]:
         now = datetime.now(SHANGHAI)
-        totals = self.store.rolling(now)
-        return self._line_metrics(now, totals, self.store.today(now))
+        totals = self._cached_view("rolling", now)
+        return self._line_metrics(now, totals, self._cached_view("today", now))
 
-    def report_csv(self) -> str:
+    def report_csv(self, period: str = "rolling", date: str | None = None) -> str:
+        if period == "daily":
+            return self._daily_report_csv(date)
+        if period != "rolling" or date is not None:
+            raise ValueError("date is only supported for period=daily")
         output = io.StringIO()
         writer = csv.writer(output)
         writer.writerow([
@@ -1258,18 +1786,62 @@ class FleetController:
             ])
         return output.getvalue()
 
+    def _daily_report_csv(self, date: str | None) -> str:
+        now = datetime.now(SHANGHAI)
+        try:
+            day = datetime.strptime(date, "%Y-%m-%d").date() if date is not None else now.date()
+        except (ValueError, TypeError) as exc:
+            raise ValueError("date must be YYYY-MM-DD") from exc
+        if day > now.date():
+            raise ValueError("cannot report a future date")
+        totals = self.store.daily_totals(day)
+        before18 = self.store.daily_totals(day, before_hour=18)
+        # Forecast snapshots are planning targets, never traffic ledger entries.
+        pre_raw = self.store._meta(f"daily_pre18:{day.isoformat()}")
+        final_raw = self.store._meta(f"daily_forecast:{day.isoformat()}")
+        pre_targets = json.loads(pre_raw) if pre_raw else {}
+        final_targets = json.loads(final_raw) if final_raw else {}
+        live = self.store.daily_forecasts(now) if day == now.date() else {}
+        output = io.StringIO()
+        writer = csv.writer(output)
+        writer.writerow(["date", "account_id", "bind_ip", "snmp_interface", "weight", "group_id",
+                         "upload_bytes", "download_bytes", "ratio", "target_download_bytes", "unmet_bytes",
+                         "pre18_download_bytes", "pre18_target_bytes", "pre18_met", "full_day_met",
+                         "measured_upload_bytes", "measured_download_bytes", "estimated_upload_bytes",
+                         "estimated_download_bytes", "unknown_seconds", "program_download_bytes", "target_quality"])
+        for account in self.store.accounts():
+            values = totals[account.account_id]
+            target = int(live.get(account.account_id, {}).get("target_download_bytes", final_targets.get(account.account_id, 0)))
+            # Completed-day reports use actual known upload (+ conservative
+            # unknown budget), not an obsolete earlier projection.
+            if day != now.date():
+                unknown_budget = values.get("unknown_upload_capacity", 0)
+                target = int((values["upload"] + unknown_budget) * self.cfg.target_ratio)
+            pre_target = pre_targets.get(account.account_id)
+            down = values["download"]
+            pre_down = before18[account.account_id]["download"]
+            writer.writerow([day.isoformat(), account.account_id, account.bind_ip, account.snmp_interface,
+                             account.weight or "", account.group_id, values["upload"], down,
+                             down / values["upload"] if values["upload"] else "", target, max(0, target - down),
+                             pre_down, pre_target if pre_target is not None else "",
+                             int(pre_down >= pre_target) if pre_target is not None else "", int(down >= target),
+                             values["measured_upload"], values["measured_download"], values["estimated_upload"],
+                             values["estimated_download"], values["unknown_seconds"], values["program_download"],
+                             "recorded" if final_raw or live else "no_forecast_snapshot"])
+        return output.getvalue()
+
     def summary(self) -> dict[str, Any]:
         now = datetime.now(SHANGHAI)
         accounts = self.store.accounts()
-        desired = self._desired_count(now, accounts) if accounts else 0
-        totals = self.store.rolling(now)
+        desired = len(self.daily_allocation)
+        totals = self._cached_view("rolling", now)
         upload = sum(item["upload"] for item in totals.values())
         download = sum(item["download"] for item in totals.values())
         count = len(accounts)
         return {
             "active_accounts": len(self.active), "target_accounts": desired,
             "cooldown_accounts": len(self.account_cooldowns),
-            "target_mbps": desired * self.cfg.per_line_mbps,
+            "target_mbps": sum(line.assigned_mbps for line in self.active.values()),
             "snmp_status": self.snmp_status, "warmup": self.store.warmup(now),
             "rolling_upload_bytes": upload, "rolling_download_bytes": download,
             "rolling_ratio": download / upload if upload else None,
@@ -1282,7 +1854,12 @@ class FleetController:
             "rolling_program_download_bytes": sum(item["program_download"] for item in totals.values()),
             "rolling_unknown_seconds": sum(item["unknown_seconds"] for item in totals.values()),
             "worst_case_ratio": (200 / count) if count else None,
+            "daily_mode_enabled": self.cfg.daily_mode_enabled,
+            "daily": self._daily_snapshot(now),
+            "router_budget": self._router_snapshot(now),
+            "groups": self.groups_snapshot(),
             "source_list": self.source_list_status(),
+            "diagnostics": self._completion_diagnostics(now),
         }
 
     def status(self) -> dict[str, Any]:
@@ -1292,29 +1869,12 @@ class FleetController:
                 "now": now.isoformat(timespec="seconds"), "config": self.cfg.to_dict(),
                 "metrics": self.metrics(), "logs": self.logs[-120:]}
 
-    def source_snapshot(self) -> list[dict[str, Any]]:
-        return [{"url": url, "ip": "", "healthy": True, "failures": 0, "state": "healthy", "retry_in_seconds": 0, "last_error": ""} for url in self.effective_source_pool]
-
-    def source_list_status(self) -> dict[str, Any]:
-        if self.remote_source_manager is None:
-            return {
-                "enabled": False, "status": "local", "revision": None,
-                "source_count": len(self.effective_source_pool),
-                "origin": self.effective_source_origin,
-                "last_success_at": None, "next_refresh_at": None,
-                "stale": False, "last_error": "", "active_revision": None,
-                "apply_state": "applied", "apply_error": "",
-            }
-        status = self.remote_source_snapshot.to_dict()
-        status.update({"origin": self.effective_source_origin, "active_revision": self.remote_source_snapshot.revision, "apply_state": "applied", "apply_error": ""})
-        return status
-
     def request_source_list_refresh(self, now: datetime | None = None) -> dict[str, Any]:
         if self.remote_source_refresher is None:
             raise ValueError("remote source list is disabled")
         self.remote_source_refresher.request(now)
         value = self.source_list_status()
-        value["refresh_request_state"] = "queued"
+        value["refresh_request_state"] = self.remote_source_refresher.status()
         return value
 
     refresh_source_list = request_source_list_refresh

@@ -39,6 +39,12 @@ jobs:
           - name: multi-ip
             dockerfile: Dockerfile.multi-ip
             module: steam_pumper.multi_ip_main
+          - name: fleet
+            dockerfile: Dockerfile.fleet
+            module: steam_pumper.fleet_main
+          - name: dashboard
+            dockerfile: Dockerfile.dashboard
+            module: dashboard.app
           - name: source-publisher
             dockerfile: Dockerfile.publisher
             module: source_publisher
