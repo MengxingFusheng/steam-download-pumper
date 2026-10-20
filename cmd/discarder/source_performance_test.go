@@ -131,7 +131,7 @@ func TestHealthStateRestoresAndReloadKeepsSameURL(t *testing.T) {
 	now := time.Now().Truncate(time.Second)
 	addPerformanceSeconds(health, "keep", now.Add(-40*time.Second), 40, 2, 1_000_000)
 	for i := 0; i < 3; i++ {
-		health.failedCurrent("keep", health.epoch("keep"), now, "failed", false)
+		health.failedCurrent("keep", health.epoch("keep"), now.Add(10*time.Second), "failed", false)
 	}
 	saved := health.snapshot("keep", now).Health
 	restored := newSourceHealth()
@@ -153,6 +153,25 @@ func TestHealthStateRestoresAndReloadKeepsSameURL(t *testing.T) {
 	expired.restore(map[string]sourceHealthState{"keep": *saved}, now.Add(61*time.Second))
 	if snapshot := expired.snapshot("keep", now.Add(61*time.Second)); snapshot.ActiveSeconds != 0 {
 		t.Fatal("restored stale rate sample")
+	}
+}
+
+func TestWorkerStallsDoNotQuarantineSourceWithOtherProgress(t *testing.T) {
+	health := newSourceHealth()
+	health.retain([]string{"source"})
+	now := time.Unix(1000, 0)
+	addPerformanceSeconds(health, "source", now.Add(-time.Second), 1, 9, 1_000_000)
+	for i := 0; i < 3; i++ {
+		snapshot, recorded := health.failedCurrent("source", health.epoch("source"), now, errSourceStalled.Error(), false)
+		if !recorded || snapshot.State == "quarantined" || snapshot.RetryIn > 0 {
+			t.Fatalf("productive peer connections were blocked: %+v", snapshot)
+		}
+	}
+	for i := 0; i < 3; i++ {
+		health.failedCurrent("source", health.epoch("source"), now.Add(20*time.Second), errSourceStalled.Error(), false)
+	}
+	if snapshot := health.snapshot("source", now.Add(20*time.Second)); snapshot.State != "quarantined" {
+		t.Fatalf("fully stalled endpoint was not isolated: %+v", snapshot)
 	}
 }
 

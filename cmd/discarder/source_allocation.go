@@ -15,6 +15,21 @@ type sourceAllocation struct {
 	measuredBytes   int64
 	mbps            float64
 	underTargetFrom time.Time
+	trialRetryAfter map[string]time.Time
+}
+
+func (health *sourceHealth) explorationIntervalLocked(now time.Time) time.Duration {
+	if !health.allocation.underTargetFrom.IsZero() && now.Sub(health.allocation.underTargetFrom) >= time.Minute {
+		return sourceEvaluationInterval
+	}
+	return sourceExploreInterval
+}
+
+func (allocation *sourceAllocation) delayTrial(rawURL string, now time.Time) {
+	if allocation.trialRetryAfter == nil {
+		allocation.trialRetryAfter = make(map[string]time.Time)
+	}
+	allocation.trialRetryAfter[rawURL] = now.Add(slowSourceRetry)
 }
 
 func (health *sourceHealth) allocationPoolLocked(primary, fallback []string, now time.Time) []string {
@@ -65,7 +80,7 @@ func (health *sourceHealth) evaluateAllocationLocked(now time.Time) {
 	}
 	if allocation.trial != "" {
 		if !health.availableLocked(allocation.trial, now) || allocation.mbps < allocation.trialBaseline*0.9 {
-			health.performanceForLocked(allocation.trial).slowRetryAfter = now.Add(slowSourceRetry)
+			allocation.delayTrial(allocation.trial, now)
 			allocation.trial, allocation.trialSlots = "", 0
 			return
 		}
@@ -79,7 +94,7 @@ func (health *sourceHealth) evaluateAllocationLocked(now time.Time) {
 			}
 		} else {
 			// No benefit: restore the previous allocation and explore again later.
-			health.performanceForLocked(allocation.trial).slowRetryAfter = now.Add(slowSourceRetry)
+			allocation.delayTrial(allocation.trial, now)
 			allocation.trial, allocation.trialSlots = "", 0
 		}
 		return
@@ -91,7 +106,7 @@ func (health *sourceHealth) evaluateAllocationLocked(now time.Time) {
 	leaderRate := performanceRate(health.performance[best], now, sourceEvaluationInterval)
 	for rawURL, performance := range health.performance {
 		_, _, sampled := performance.window(now, performanceWindow)
-		if sampled < 5 || !health.availableLocked(rawURL, now) {
+		if sampled < 5 || !health.availableLocked(rawURL, now) || now.Before(allocation.trialRetryAfter[rawURL]) {
 			continue
 		}
 		if performanceRate(performance, now, sourceEvaluationInterval) > max(leaderRate*1.05,

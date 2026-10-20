@@ -339,6 +339,11 @@ func (health *sourceHealth) failedCurrent(
 		return sourceSnapshot{State: "unknown"}, false
 	}
 	health.performanceForLocked(url).failedRequests++
+	if recentBytes, _, _ := health.performance[url].window(now, 3*time.Second); !wasProbe && recentBytes > 0 {
+		// Other requests are still delivering. Retry this worker without
+		// blocking every connection to an otherwise productive endpoint.
+		return health.snapshotLocked(url, now), true
+	}
 	health.failedLocked(url, now, lastError, wasProbe)
 	return health.snapshotLocked(url, now), true
 }
@@ -876,6 +881,11 @@ func runWorker(
 			sink.emit(sourceStatusEvent(opts, url, snapshot, false, sourceGeneration, sourceEpoch))
 			fmt.Fprintf(os.Stderr, "worker=%s url=%s error=%v state=%s retry_in=%s\n",
 				workerID, url, err, snapshot.State, snapshot.RetryIn)
+			if snapshot.RetryIn <= 0 {
+				if err := sleepWithContext(ctx, retryDelay(1)); err != nil {
+					return nil
+				}
+			}
 			continue
 		}
 		success := health.succeededCurrent

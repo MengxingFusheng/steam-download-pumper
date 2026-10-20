@@ -273,7 +273,7 @@ func (health *sourceHealth) choose(primary, fallback []string, connectionID, off
 	if health.explorationConnection == connectionID && now.Before(health.explorationUntil) && health.activeEpoch[health.explorationURL] != 0 {
 		candidate, exploring = health.explorationURL, true
 	}
-	if candidate == "" && health.allocation.trial == "" && !now.Before(health.explorationUntil) && (health.lastExplore.IsZero() || now.Sub(health.lastExplore) >= sourceExploreInterval) && (health.explorationReservation == 0 || health.explorationReservation == connectionID) {
+	if candidate == "" && health.allocation.trial == "" && !now.Before(health.explorationUntil) && (health.lastExplore.IsZero() || now.Sub(health.lastExplore) >= health.explorationIntervalLocked(now)) && (health.explorationReservation == 0 || health.explorationReservation == connectionID) {
 		candidate = health.explorationCandidateLocked(urls, now)
 		if candidate != "" {
 			exploring = true
@@ -337,7 +337,7 @@ func (health *sourceHealth) shouldRotate(choice sourceChoice, connectionID int, 
 		return true
 	}
 
-	if health.allocation.trial != "" || health.explorationReservation != 0 || now.Before(health.explorationUntil) || (!health.lastExplore.IsZero() && now.Sub(health.lastExplore) < sourceExploreInterval) {
+	if health.allocation.trial != "" || health.explorationReservation != 0 || now.Before(health.explorationUntil) || (!health.lastExplore.IsZero() && now.Sub(health.lastExplore) < health.explorationIntervalLocked(now)) {
 		return false
 	}
 	if health.explorationCandidateLocked(primary, now) == "" {
@@ -379,6 +379,13 @@ func (health *sourceHealth) evaluate(now time.Time) {
 		}
 	}
 	for rawURL, performance := range health.performance {
+		// A saturated host has a lower per-connection rate than a single probe.
+		// The aggregate allocation trial decides whether to replace an active
+		// leader; per-connection ranking must not evict the whole download.
+		if rawURL == health.allocation.leader || rawURL == health.allocation.trial {
+			performance.lowWindows = 0
+			continue
+		}
 		if now.Before(performance.slowRetryAfter) {
 			continue
 		}

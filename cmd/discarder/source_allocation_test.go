@@ -46,8 +46,42 @@ func TestTrialMovesOnlyTwoThenRollsBackWhenTotalFalls(t *testing.T) {
 	if h.allocation.trial != "" || h.allocation.leader != "leader" {
 		t.Fatalf("rollback=%+v", h.allocation)
 	}
-	if !h.performance["candidate"].slowRetryAfter.After(now.Add(30 * time.Second)) {
+	if !h.allocation.trialRetryAfter["candidate"].After(now.Add(30 * time.Second)) {
 		t.Fatal("trial retry was not delayed")
+	}
+	if !h.availableLocked("candidate", now.Add(30*time.Second)) || h.snapshot("candidate", now.Add(30*time.Second)).State == "quarantined" {
+		t.Fatal("rejected trial was incorrectly quarantined as a failed source")
+	}
+}
+
+func TestSaturatedLeaderIsNotQuarantinedBySingleConnectionProbe(t *testing.T) {
+	h := newSourceHealth()
+	h.retain([]string{"leader", "probe"})
+	h.allocation = sourceAllocation{leader: "leader", connections: 12, targetMbps: 500}
+	now := time.Unix(1000, 0)
+	for second := 0; second < 60; second++ {
+		at := now.Add(time.Duration(second) * time.Second)
+		addPerformanceSeconds(h, "leader", at, 1, 12, 5_000_000)
+		addPerformanceSeconds(h, "probe", at, 1, 1, 25_000_000)
+		if second == 29 || second == 44 || second == 59 {
+			h.evaluate(at.Add(time.Second))
+		}
+	}
+	if s := h.snapshot("leader", now.Add(time.Minute)); s.State == "quarantined" {
+		t.Fatalf("480 Mbps leader evicted by a 200 Mbps probe: %+v", s)
+	}
+}
+
+func TestUnderBudgetExplorationAcceleratesWithoutAddingConnections(t *testing.T) {
+	h := newSourceHealth()
+	now := time.Unix(1000, 0)
+	h.allocation.underTargetFrom = now
+	if h.explorationIntervalLocked(now.Add(59*time.Second)) != time.Minute || h.explorationIntervalLocked(now.Add(time.Minute)) != 15*time.Second {
+		t.Fatal("low throughput did not accelerate exploration after one minute")
+	}
+	h.allocation.underTargetFrom = time.Time{}
+	if h.explorationIntervalLocked(now.Add(2*time.Minute)) != time.Minute {
+		t.Fatal("recovery did not restore the normal exploration interval")
 	}
 }
 
