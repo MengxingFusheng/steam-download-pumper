@@ -41,7 +41,7 @@ class PublisherConfigTests(unittest.TestCase):
             "PUBLISH_TIME": "24:00",
             "PUBLISH_TIMEZONE": "Not/AZone",
             "PUBLISH_RETRY_SECONDS": "900,0,21600",
-            "MIN_HEALTHY_SOURCES": "2",
+            "MIN_HEALTHY_SOURCES": "0",
             "MAX_HEALTHY_SOURCES": "101",
             "PROBE_CONCURRENCY": "9",
             "PROBE_BYTES": str(1024),

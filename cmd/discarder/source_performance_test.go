@@ -79,7 +79,7 @@ func TestSlowSourceNeedsThreeWindowsAndProbesRecover(t *testing.T) {
 	}
 }
 
-func TestSelectionBestThreeAndOnlyOneExploration(t *testing.T) {
+func TestSelectionLeaderAndOnlyOneExploration(t *testing.T) {
 	health := newSourceHealth()
 	sources := []string{"fast", "second", "third", "other", "last"}
 	health.retain(sources)
@@ -89,12 +89,12 @@ func TestSelectionBestThreeAndOnlyOneExploration(t *testing.T) {
 	}
 	now = now.Add(40 * time.Second)
 	choice, _ := health.choose(sources, nil, 1, 0, now)
-	if !choice.exploring || choice.url != "other" {
+	if !choice.exploring || choice.url != "second" {
 		t.Fatalf("first explore=%+v", choice)
 	}
 	for i := 0; i < 10; i++ {
 		other, _ := health.choose(sources, nil, 2, i, now)
-		if other.exploring || other.url == "other" || other.url == "last" {
+		if other.exploring || other.url != "fast" {
 			t.Fatalf("ordinary choice=%+v", other)
 		}
 	}

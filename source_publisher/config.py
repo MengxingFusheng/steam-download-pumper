@@ -78,6 +78,7 @@ class PublisherConfig:
     doh_url: str
     ookla_discovery_enabled: bool = True
     ookla_search_terms: tuple[str, ...] = ("Tianjin", "Beijing", "Shanghai")
+    discarder_path: str = "/usr/local/bin/discarder"
 
     @classmethod
     def from_env(cls, env: Mapping[str, str] | None = None) -> "PublisherConfig":
@@ -123,8 +124,8 @@ class PublisherConfig:
         probe_bytes = _integer(values, "PROBE_BYTES", FIXED_PROBE_BYTES)
         timeout = _integer(values, "PROBE_TIMEOUT_SECONDS", 8)
         min_probe_mbps = _integer(values, "MIN_PROBE_MBPS", 100)
-        if minimum < 3:
-            raise ValueError("MIN_HEALTHY_SOURCES must be at least 3")
+        if minimum < 1:
+            raise ValueError("MIN_HEALTHY_SOURCES must be at least 1")
         # Previously deployed values of 100 are migrated to the new bound.
         if maximum < minimum or maximum > 100 or minimum > 30:
             raise ValueError("MAX_HEALTHY_SOURCES must be between the minimum and 100; minimum at most 30")

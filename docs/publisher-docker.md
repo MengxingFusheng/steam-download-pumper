@@ -206,24 +206,26 @@ The two-stage probe uses these defaults:
 
 | Stage | Transfer limit | Time limit | Concurrency |
 | --- | --- | --- | --- |
-| Every candidate initial screen | 2 MiB | 5 seconds | 4 |
-| Up to 40 screened candidates, three rounds each | 64 MiB per round | 8 seconds per round | 1 |
+| Every candidate initial screen | 2 MiB per request | 5 seconds | 4 |
+| Up to 40 screened endpoints, two sustained rounds each | Continuous streaming; bodies discarded | 15 seconds per round, first 3 seconds warmup | 1 endpoint, 12 connections |
 
-Bodies are discarded as they arrive; only a short prefix is retained to reject
-HTML/error pages. A timed round with at least 2 MiB received is a valid throughput
-sample. At least two of three rounds must succeed, and their median must reach
-`MIN_PROBE_MBPS` (default 100). Candidates are ranked by success rate, worst
-successful round, then median speed. At most two URLs per hostname and at most
-30 total are published. The target is 12 sources across eight hosts. Missing that
-target is reported, while fewer than `MIN_HEALTHY_SOURCES` (minimum three) aborts
-publication and preserves the previous `latest.json`.
+All endpoint types use the same node Go engine for sustained measurements.
+Both rounds must succeed; the lower throughput must reach `MIN_PROBE_MBPS`
+(default 100). Endpoint protocols and paths compete on measured quality before
+host quotas are applied. Each host's best endpoint is considered first, followed
+by secondary endpoints, with at most two URLs per host and the configured total
+(up to 100). The discovery target remains 12 URLs across eight hosts; less than
+three hosts is explicitly reported as degraded redundancy. Publication aborts
+without replacing `latest.json` when no qualifying source exists.
 
-Set `MAX_HEALTHY_SOURCES=30`, `PROBE_CONCURRENCY=4`,
-`PROBE_TIMEOUT_SECONDS=8`, `MIN_PROBE_MBPS=100`, `DISCOVERY_ENABLED=true` in
-`.env.publisher`. Older values `MAX_HEALTHY_SOURCES=100`,
-`PROBE_TIMEOUT_SECONDS=20`, and `PROBE_BYTES=8388608` are accepted and migrated to
-the new 30-source / 8-second / 64-MiB bounds. Probe size is fixed; it need not be
-set in the environment.
+`MIN_HEALTHY_SOURCES` accepts 1–30 and retains the historical default of three;
+the current example sets one. Upgrade node readers and set
+`SOURCE_LIST_MIN_SOURCES=1` **before** publishing fewer than three URLs. The
+signed schema stays at version 1 and `probe_mbps` records the sustained score.
+Daily scheduling, retries and the 30-minute whole-publication deadline remain
+in force; only fully measured candidates can be published. Initial screening
+still uses `PROBE_CONCURRENCY` and `PROBE_TIMEOUT_SECONDS` applies to legacy
+Python probe callers, while production sustained rounds are bounded separately.
 
 Inspect `/state/last-probes.json` for directory failures, discovery counts,
 per-source speed and success rate, rejected/slow counts, total measured transfer,
@@ -246,7 +248,7 @@ host DNS configuration is unchanged.
 
 发布服务器通过 Ookla 网页服务器接口发现候选，`OOKLA_DISCOVERY_ENABLED=true` 开启，`OOKLA_SEARCH_TERMS=Tianjin,Beijing,Shanghai` 配置地区检索。接口没有返回某地区时，也会从已有人工或上一版清单中的 Ookla 静态图片地址提取同主机的现代下载端点，逐个实测验证；节点只消费签名源清单，不自行发现。
 
-下载模板包含 `size=67108864&guid={{guid}}&nocache={{nonce}}`。每次请求展开新标识；发布器对每个直连端点至少完成两次各 2 MiB 的数据验证，拒绝空响应和错误页。直连端点不受云端 `MIN_PROBE_MBPS` 门槛淘汰，节点根据实际下载吞吐选源。普通源仍使用原速度与稳定性门槛。清单为经过验证的直连端点预留一半名额，候选按地区交错选入，单主机最多两个 URL；`MAX_HEALTHY_SOURCES` 现支持最多 100。
+下载模板包含 `size=67108864&guid={{guid}}&nocache={{nonce}}`，每次请求展开新标识。初筛拒绝空响应和错误页，之后所有端点统一执行持续多连接复测并达到 `MIN_PROBE_MBPS`，不再按现代 Ookla 类型豁免门槛或预留名额。每主机先取最快端点，最多两个 URL；`MAX_HEALTHY_SOURCES` 支持最多 100。
 
 Go 下载引擎支持绑定出口的 HTTP/2 协商，继续支持 HTTP/1.1，并拒绝空响应和 HTML/JSON 错误页。每条线路连接上限仍为 12；有进度的低速线路继续运行，由现有健康机制换源和探测恢复。
 

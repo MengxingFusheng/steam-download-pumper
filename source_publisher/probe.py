@@ -447,6 +447,7 @@ def probe_candidates(
     cancel_event: threading.Event | None = None,
     connection_factory: ConnectionFactory = _default_connection_factory,
     deadline: float | None = None,
+    engine_path: str | None = None,
 ) -> list[ProbeResult]:
     """Screen every candidate, then measure up to 40 individually without contention."""
     candidates = list(urls)
@@ -482,9 +483,9 @@ def probe_candidates(
 
     shortlist: list[ProbeResult] = []
     hosts: dict[str, int] = {}
-    for result in sorted((r for r in screened.values() if r.success and not is_ookla_download(r.url)), key=rank_result):
+    for result in sorted((r for r in screened.values() if r.success), key=rank_result):
         host = urlsplit(result.url).hostname or ""
-        if hosts.get(host, 0) >= 2:
+        if hosts.get(host, 0) >= 3:
             continue
         shortlist.append(result)
         hosts[host] = hosts.get(host, 0) + 1
@@ -494,24 +495,40 @@ def probe_candidates(
     for initial in shortlist:
         if cancellation.is_set() or time.monotonic() >= absolute_deadline:
             break
-        measured[initial.url] = probe_source(
-            initial.url, timeout=min(timeout, 8), resolver=resolver,
-            cancel_event=cancellation, connection_factory=connection_factory,
-            deadline=absolute_deadline,
-        )
+        if engine_path:
+            from .benchmark import measure_engine
+            speeds, received, attempted = [], 0, 0
+            for _ in range(2):
+                attempted += 1
+                try:
+                    count, speed = measure_engine(initial.url, engine_path, absolute_deadline, cancellation)
+                    received += count
+                    speeds.append(speed)
+                except (OSError, ValueError, TimeoutError, InterruptedError):
+                    break
+            success = len(speeds) == 2 and not cancellation.is_set()
+            score = round(min(speeds), 3) if success else 0.0
+            measured[initial.url] = ProbeResult(
+                initial.url, datetime.now(timezone.utc), score, received, success,
+                "" if success else "sustained measurement failed", len(speeds) / 2,
+                score, attempted, len(speeds), "sustained",
+            )
+        else:
+            measured[initial.url] = probe_source(
+                initial.url, timeout=min(timeout, 8), resolver=resolver,
+                cancel_event=cancellation, connection_factory=connection_factory,
+                deadline=absolute_deadline,
+            )
     results: list[ProbeResult] = []
     for url in candidates:
-        if is_ookla_download(url) and url in screened:
-            # A pair of byte-validated requests establishes usability. Cloud
-            # throughput cannot exclude an endpoint fast at the nodes.
-            result = screened[url]
-        elif url in measured:
+        if url in measured:
             result = measured[url]
             initial = screened[url]
             result = ProbeResult(
                 result.url, result.checked_at, result.probe_mbps,
                 result.bytes_read + initial.bytes_read, result.success, result.error,
                 result.success_rate, result.worst_mbps, result.attempts, result.successful_probes,
+                result.stage,
             )
         else:
             initial = screened.get(url)

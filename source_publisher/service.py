@@ -184,21 +184,25 @@ class PublicationService:
             cancel_event=cancellation,
             deadline=absolute_deadline,
             resolver=resolver,
+            engine_path=self.config.discarder_path,
         )
         _ensure_active(cancellation, absolute_deadline)
         eligible = [
             result for result in results
             if result.success and math.isfinite(result.probe_mbps) and result.probe_mbps >= 0
-            and (is_ookla_download(result.url) or result.probe_mbps >= self.config.min_probe_mbps)
+            and result.probe_mbps >= self.config.min_probe_mbps
         ]
         healthy: list[ProbeResult] = []
         hosts: Counter[str] = Counter()
-        # Reserve half of the release for usable direct endpoints in discovery
-        # order (region round-robin), independent of the publisher's route speed.
-        by_url = {result.url: result for result in eligible}
-        direct = [by_url[url] for url in discovered.urls if url in by_url and is_ookla_download(url)]
-        preferred = direct[:max(1, self.config.max_healthy_sources // 2)]
-        for result in [*preferred, *sorted(eligible, key=rank_result)]:
+        # Give every host its fastest measured endpoint before adding redundancy.
+        ranked = sorted(eligible, key=rank_result)
+        best_hosts: set[str] = set()
+        first, additional = [], []
+        for result in ranked:
+            host = urlsplit(result.url).hostname or ""
+            (additional if host in best_hosts else first).append(result)
+            best_hosts.add(host)
+        for result in [*first, *additional]:
             host = urlsplit(result.url).hostname or ""
             if hosts[host] >= 2 or any(item.url == result.url for item in healthy):
                 continue
@@ -211,6 +215,7 @@ class PublicationService:
             "eligible_count": len(eligible), "published_count": len(healthy),
             "ookla_published_count": sum(is_ookla_download(result.url) for result in healthy),
             "host_count": len(hosts), "quantity_target_met": len(healthy) >= 12 and len(hosts) >= 8,
+            "redundancy_degraded": len(hosts) < 3,
             "bytes_read": sum(result.bytes_read for result in results),
             "elapsed_seconds": round(time.monotonic() - started, 3),
             "failures": dict(Counter(result.error for result in results if not result.success)),

@@ -113,8 +113,8 @@ class RemoteSourceSettings:
             raise ValueError("SOURCE_LIST_FETCH_TIMEOUT_SECONDS must be between 1 and 300")
         if not 1024 <= max_bytes <= 1_048_576:
             raise ValueError("SOURCE_LIST_MAX_BYTES must be between 1024 and 1048576")
-        if not 3 <= min_sources <= 100:
-            raise ValueError("SOURCE_LIST_MIN_SOURCES must be between 3 and 100")
+        if not 1 <= min_sources <= 100:
+            raise ValueError("SOURCE_LIST_MIN_SOURCES must be between 1 and 100")
 
         if enabled:
             parsed_url = urlsplit(url)

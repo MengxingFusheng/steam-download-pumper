@@ -395,7 +395,7 @@ if __name__ == "__main__":
 
 class OoklaPublisherSelectionTests(unittest.TestCase):
     _config = PublisherServiceTests._config
-    def test_validated_direct_sources_survive_low_publisher_throughput(self):
+    def test_direct_sources_must_pass_the_same_speed_threshold(self):
         from source_publisher.probe import ProbeResult
         from source_publisher.service import PublicationService
         from source_publisher.ookla import DOWNLOAD_QUERY
@@ -407,7 +407,6 @@ class OoklaPublisherSelectionTests(unittest.TestCase):
             now = datetime.now(ZoneInfo('Asia/Shanghai'))
             def probes(values, **kwargs):
                 return [ProbeResult(url, now, 5, 4194304, True, '') for url in values]
-            result = PublicationService(config, probe_fn=probes).run(now, validate_only=True)
-            self.assertEqual(result.source_count, 3)
-            self.assertEqual(result.diagnostics['ookla_published_count'], 3)
-            self.assertEqual([x['url'] for x in json.loads(result.payload)['sources']], urls)
+            from source_publisher.service import InsufficientSources
+            with self.assertRaises(InsufficientSources):
+                PublicationService(config, probe_fn=probes).run(now, validate_only=True)

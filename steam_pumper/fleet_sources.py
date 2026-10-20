@@ -167,6 +167,26 @@ class FleetSources:
         daytime = max(0.0, (now.replace(hour=18, minute=0, second=0, microsecond=0) - now).total_seconds())
         runnable = daytime + min(3600.0, remaining_day)
         rows = []
+        phase = self._daily_phase(now)
+        if phase == "upload_only":
+            rows.append({"line_id": "*", "reason": "upload_only", "message": "18:00–23:00 上传保护：下载暂停，23:00 恢复补量"})
+        eligible = [account for account in self.store.accounts() if account.enabled and account.profile_confirmed
+                    and self.snmp_quality.get(account.account_id, "pending") not in {"pending", "baseline", "offline", "missing", "ambiguous"}
+                    and account.account_id not in self.account_cooldowns]
+        debt_total = sum(forecasts.get(account.account_id, {}).get("remaining_download_bytes", 0) for account in eligible)
+        # An optimistic upper bound is sufficient to prove an impossible goal.
+        group_capacity = sum(min(group.download_limit_mbps,
+                                 sum(sorted((a.download_mbps for a in eligible if a.group_id == group.group_id), reverse=True)[:group.max_active]))
+                             for group in groups.values() if group.enabled)
+        profile_capacity = sum(sorted((a.download_mbps for a in eligible), reverse=True)[:20])
+        day_rate = min(router["available_mbps"], group_capacity, profile_capacity)
+        late_rate = min(day_rate, self.cfg.late_download_limit_mbps)
+        maximum_bytes = int((day_rate * daytime + late_rate * min(3600.0, remaining_day)) * 1_000_000 / 8)
+        if router["status"] == "ok" and debt_total > maximum_bytes:
+            rows.append({"line_id": "*", "reason": "node_capacity_shortfall",
+                         "message": f"剩余时段理论容量不足，至少缺 {max(0, debt_total - maximum_bytes) / 1e9:.1f} GB；需提前完成白天下载",
+                         "remaining_download_bytes": debt_total, "available_download_seconds": runnable,
+                         "maximum_download_bytes": maximum_bytes, "shortfall_bytes": debt_total - maximum_bytes})
         for account in self.store.accounts():
             debt = forecasts.get(account.account_id, {}).get("remaining_download_bytes", 0)
             if not account.enabled or debt <= 0:
@@ -198,4 +218,9 @@ class FleetSources:
                 rows.append({"line_id": account.account_id, "reason": reason, "message": message,
                              "remaining_download_bytes": debt, "available_download_seconds": runnable,
                              "estimated_completion_seconds": estimated})
+            unknown = forecasts.get(account.account_id, {}).get("unknown_upload_budget_bytes", 0)
+            if unknown:
+                rows.append({"line_id": account.account_id, "reason": "unknown_measurement_budget",
+                             "message": f"计量缺失带来的保守上传预算 {unknown / 1e9:.1f} GB，目标包含未知预算，需核对 SNMP",
+                             "unknown_upload_budget_bytes": unknown})
         return rows

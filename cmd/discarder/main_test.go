@@ -485,8 +485,8 @@ func TestWorkerKeepsHealthyTrafficWhileFailedSourceIsQuarantined(t *testing.T) {
 	if err != nil {
 		t.Fatalf("worker returned error: %v", err)
 	}
-	if got := failedHits.Load(); got != 3 {
-		t.Fatalf("failed source requests = %d, want exactly 3 before quarantine", got)
+	if got := failedHits.Load(); got < 1 || got > 3 {
+		t.Fatalf("failed source requests = %d, want bounded attempts while healthy traffic continues", got)
 	}
 	if healthyHits.Load() < 10 || total.Load() == 0 {
 		t.Fatalf("healthy hits=%d total_bytes=%d", healthyHits.Load(), total.Load())

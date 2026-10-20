@@ -72,16 +72,16 @@ class PublisherProbeTests(unittest.TestCase):
 
         return dial
 
-    def test_direct_download_is_byte_validated_twice_without_range_or_speed_shortlist(self):
+    def test_direct_download_is_screened_then_fully_measured(self):
         from source_publisher.probe import probe_candidates
         from source_publisher.ookla import DOWNLOAD_QUERY
         url = self.url.replace('/file', '/download') + '?' + DOWNLOAD_QUERY
         with patch('socket.create_connection', side_effect=self._dial_validated_ip_to_fixture([])):
             result = probe_candidates([url], resolver=lambda *_args: ('8.8.8.8',))[0]
         self.assertTrue(result.success)
-        self.assertEqual(result.successful_probes, 2)
-        self.assertEqual(result.bytes_read, 4 * 1024 * 1024)
-        self.assertEqual(_ProbeHandler.ranges, [None, None])
+        self.assertEqual(result.successful_probes, 3)
+        self.assertGreater(result.bytes_read, 4 * 1024 * 1024)
+        self.assertEqual(_ProbeHandler.ranges, [None] * 5)
 
     def test_source_uses_three_streamed_range_probes_and_needs_two_successes(self):
         from source_publisher.probe import probe_source

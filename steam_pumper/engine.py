@@ -74,6 +74,8 @@ def build_engine_command(
         str(cfg.worker_restart_jitter_seconds),
         "--status-interval-seconds",
         str(getattr(cfg, "engine_status_seconds", 1)),
+        "--target-mbps",
+        str(line.target_mbps),
     ]
     if line.bind_ip:
         command.extend(["--bind-ip", line.bind_ip])

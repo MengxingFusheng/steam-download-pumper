@@ -26,7 +26,7 @@ from .engine import EngineProcess
 from .fleet_schedule import WanBudget, allocate_daily, daily_phase
 from .remote_sources import RemoteSourceManager, RemoteSourceRefreshWorker, SourceListSnapshot
 from .topology import LogicalLine, apply_ipv4_addresses
-from .fleet_forecast import daily_prediction, history_model
+from .fleet_forecast import daily_prediction, evening_fallback, history_model
 from .fleet_sources import FleetSources
 
 
@@ -314,6 +314,7 @@ class FleetStore:
         self.db.execute("PRAGMA synchronous=NORMAL")
         self._history_cache_key: tuple[int, int] | None = None
         self._history_cache: dict[str, dict[int, float]] = {}
+        self._history_fallback: dict[str, float] = {}
         self._create_schema()
 
     def _create_schema(self) -> None:
@@ -893,7 +894,7 @@ class FleetStore:
             return self._history_cache
         end = datetime.combine(local_now.date(), datetime.min.time(), SHANGHAI)
         lower = int((end - timedelta(days=7)).timestamp() // 60)
-        upper = int(end.timestamp() // 60)
+        upper = int(local_now.timestamp() // 60)
         rows = self.db.execute("""
         SELECT account_id,CAST((minute-?)/1440 AS INTEGER) AS historical_day,
           CAST(((minute-?)%1440)/15 AS INTEGER) AS interval,
@@ -902,7 +903,8 @@ class FleetStore:
         FROM traffic WHERE minute>=? AND minute<?
         GROUP BY account_id,historical_day,interval
         """, (lower, lower, lower, upper)).fetchall()
-        self._history_cache = history_model(rows)
+        self._history_cache = history_model([row for row in rows if row["historical_day"] < 7])
+        self._history_fallback = evening_fallback(rows)
         self._history_cache_key = key
         return self._history_cache
 
@@ -916,6 +918,8 @@ class FleetStore:
                 local_now, upload_mbps=account.upload_mbps,
                 totals=totals[account.account_id], historical_utilization=historical.get(account.account_id, {}),
                 target_ratio=self.cfg.target_ratio,
+                physical_upload_mbps=self.cfg.upload_ceiling_mbps,
+                fallback_utilization=self._history_fallback.get(account.account_id, 1.0),
             )
             # Unprefixed measured fields are convenient for API aggregation.
             values.update({

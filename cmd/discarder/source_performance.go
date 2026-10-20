@@ -207,12 +207,31 @@ func (health *sourceHealth) rankedLocked(urls []string, now time.Time) []string 
 }
 
 func (health *sourceHealth) explorationCandidateLocked(urls []string, now time.Time) string {
+	if health.allocation.leader == "" {
+		ranked := health.rankedLocked(urls, now)
+		if len(ranked) > 0 {
+			health.allocation.leader = ranked[0]
+		}
+	}
+	if performance := health.performance[health.allocation.leader]; performance == nil {
+		return ""
+	} else {
+		_, _, sampled := performance.window(now, performanceWindow)
+		if sampled < 5 && (performance.totalBytes == 0 || now.Sub(performance.observedAt) < performanceWindow) {
+			return ""
+		}
+	}
 	ranked := health.rankedLocked(urls, now)
-	if len(ranked) == 0 {
+	candidates := make([]string, 0, len(ranked))
+	for _, rawURL := range ranked {
+		if rawURL != health.allocation.leader && rawURL != health.allocation.trial {
+			candidates = append(candidates, rawURL)
+		}
+	}
+	if len(candidates) == 0 {
 		return ""
 	}
-	// Failed and slow sources receive one half-open probe once their timer expires.
-	for _, rawURL := range ranked {
+	for _, rawURL := range candidates {
 		if state := health.states[rawURL]; state != nil && state.quarantineLevel > 0 {
 			return rawURL
 		}
@@ -220,22 +239,14 @@ func (health *sourceHealth) explorationCandidateLocked(urls []string, now time.T
 			return rawURL
 		}
 	}
-	if len(ranked) <= 3 {
-		return ""
-	}
-	candidates := ranked[3:]
 	return candidates[health.explorationIndex%len(candidates)]
 }
 
 func (health *sourceHealth) choose(primary, fallback []string, connectionID, offset int, now time.Time) (sourceChoice, time.Duration) {
 	health.mu.Lock()
 	defer health.mu.Unlock()
-	urls := primary
+	urls := health.allocationPoolLocked(primary, fallback, now)
 	usingFallback := false
-	if len(health.rankedLocked(urls, now)) == 0 {
-		urls = fallback
-		usingFallback = true
-	}
 	ranked := health.rankedLocked(urls, now)
 	if len(ranked) == 0 {
 		nextRetry := 250 * time.Millisecond
@@ -253,15 +264,23 @@ func (health *sourceHealth) choose(primary, fallback []string, connectionID, off
 		}
 		return sourceChoice{}, min(nextRetry, time.Second)
 	}
+	if !health.availableLocked(health.allocation.leader, now) {
+		health.allocation.leader = ranked[0]
+		health.allocation.trial, health.allocation.trialSlots = "", 0
+	}
 	exploring := false
 	candidate := ""
-	if !now.Before(health.explorationUntil) && (health.lastExplore.IsZero() || now.Sub(health.lastExplore) >= sourceExploreInterval) && (health.explorationReservation == 0 || health.explorationReservation == connectionID) {
+	if health.explorationConnection == connectionID && now.Before(health.explorationUntil) && health.activeEpoch[health.explorationURL] != 0 {
+		candidate, exploring = health.explorationURL, true
+	}
+	if candidate == "" && health.allocation.trial == "" && !now.Before(health.explorationUntil) && (health.lastExplore.IsZero() || now.Sub(health.lastExplore) >= sourceExploreInterval) && (health.explorationReservation == 0 || health.explorationReservation == connectionID) {
 		candidate = health.explorationCandidateLocked(urls, now)
 		if candidate != "" {
 			exploring = true
 			health.explorationIndex++
 			health.lastExplore = now
 			health.explorationURL = candidate
+			health.explorationConnection = connectionID
 			health.explorationUntil = now.Add(sourceExploreDuration)
 			health.explorationReservation = 0
 		}
@@ -270,27 +289,26 @@ func (health *sourceHealth) choose(primary, fallback []string, connectionID, off
 		if health.explorationReservation == connectionID {
 			health.explorationReservation = 0
 		}
-		ordinary := make([]string, 0, len(ranked))
-		for _, rawURL := range ranked {
-			if rawURL == health.explorationURL && now.Before(health.explorationUntil) {
-				continue
+		candidate = health.preferredLocked(connectionID, now)
+		if !health.availableLocked(candidate, now) {
+			for _, rawURL := range ranked {
+				if rawURL != health.explorationURL || !now.Before(health.explorationUntil) {
+					candidate = rawURL
+					break
+				}
 			}
-			if state := health.states[rawURL]; state != nil && state.quarantineLevel > 0 {
-				continue
-			}
-			if performance := health.performance[rawURL]; performance != nil && !performance.slowRetryAfter.IsZero() {
-				continue
-			}
-			ordinary = append(ordinary, rawURL)
 		}
-		if len(ordinary) == 0 {
-			return sourceChoice{}, 250 * time.Millisecond
-		}
-		candidate = ordinary[offset%min(3, len(ordinary))]
 	}
 	allowed, retry, probe, epoch := health.claimLocked(candidate, now)
 	if !allowed {
 		return sourceChoice{}, retry
+	}
+	usingFallback = true
+	for _, rawURL := range primary {
+		if rawURL == candidate {
+			usingFallback = false
+			break
+		}
 	}
 	return sourceChoice{url: candidate, epoch: epoch, probe: probe, exploring: exploring, fallback: usingFallback}, 0
 }
@@ -304,30 +322,22 @@ func (health *sourceHealth) shouldRotate(choice sourceChoice, connectionID int, 
 	if performance := health.performance[choice.url]; performance != nil && now.Before(performance.slowRetryAfter) {
 		return true
 	}
-	if choice.exploring {
-		return now.Sub(started) >= sourceExploreDuration
-	}
-	if choice.fallback && len(health.rankedLocked(primary, now)) > 0 {
-		return true
-	}
-	// Long mirror downloads may never reach EOF. Reassign an established
-	// connection when new measurements move its source outside the best three.
-	if !choice.fallback && now.Sub(started) >= 30*time.Second {
-		ranked := health.rankedLocked(primary, now)
-		if len(ranked) > 3 {
-			preferred := false
-			for _, rawURL := range ranked[:3] {
-				if rawURL == choice.url {
-					preferred = true
-					break
-				}
-			}
-			if !preferred {
-				return true
-			}
+	if health.allocation.leader == "" {
+		if ranked := health.rankedLocked(primary, now); len(ranked) > 0 {
+			health.allocation.leader = ranked[0]
 		}
 	}
-	if health.explorationReservation != 0 || now.Before(health.explorationUntil) || (!health.lastExplore.IsZero() && now.Sub(health.lastExplore) < sourceExploreInterval) {
+	if choice.exploring {
+		return !now.Before(health.explorationUntil) || now.Sub(started) >= sourceExploreDuration
+	}
+	if choice.fallback && len(health.rankedLocked(primary, now)) > 0 && health.performance[choice.url] == nil {
+		return true
+	}
+	if preferred := health.preferredLocked(connectionID, now); preferred != "" && preferred != choice.url && health.availableLocked(preferred, now) {
+		return true
+	}
+
+	if health.allocation.trial != "" || health.explorationReservation != 0 || now.Before(health.explorationUntil) || (!health.lastExplore.IsZero() && now.Sub(health.lastExplore) < sourceExploreInterval) {
 		return false
 	}
 	if health.explorationCandidateLocked(primary, now) == "" {
@@ -343,8 +353,9 @@ func (health *sourceHealth) finishChoice(choice sourceChoice) {
 	}
 	health.mu.Lock()
 	defer health.mu.Unlock()
-	if health.explorationURL == choice.url {
+	if health.explorationURL == choice.url && !time.Now().Before(health.explorationUntil) {
 		health.explorationURL = ""
+		health.explorationConnection = 0
 		health.explorationUntil = time.Time{}
 	}
 }
@@ -356,6 +367,7 @@ func (health *sourceHealth) evaluate(now time.Time) {
 		return
 	}
 	health.lastEvaluation = now
+	health.evaluateAllocationLocked(now)
 	best := 0.0
 	for rawURL, performance := range health.performance {
 		if !health.availableLocked(rawURL, now) {
@@ -580,6 +592,11 @@ func (health *sourceHealth) releaseConnection(connectionID int) {
 	defer health.mu.Unlock()
 	if health.explorationReservation == connectionID {
 		health.explorationReservation = 0
+	}
+	if health.explorationConnection == connectionID {
+		health.explorationConnection = 0
+		health.explorationURL = ""
+		health.explorationUntil = time.Time{}
 	}
 }
 

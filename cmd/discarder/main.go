@@ -9,6 +9,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"math"
 	"math/rand"
 	"net"
 	"net/http"
@@ -32,6 +33,7 @@ type options struct {
 	restartJitterSeconds      float64
 	readTimeoutSeconds        int
 	statusIntervalSeconds     int
+	targetMbps                float64
 	bindIP                    string
 	urls                      []string
 	sourcesFile               string
@@ -94,6 +96,8 @@ type sourceHealth struct {
 	explorationUntil       time.Time
 	explorationReservation int
 	explorationIndex       int
+	explorationConnection  int
+	allocation             sourceAllocation
 }
 
 type sourceSet struct {
@@ -535,6 +539,7 @@ func parseOptions() options {
 	flag.Float64Var(&opts.restartJitterSeconds, "restart-jitter-seconds", 3, "maximum jitter after each short download")
 	flag.IntVar(&opts.readTimeoutSeconds, "read-timeout-seconds", 30, "HTTP client timeout per request")
 	flag.IntVar(&opts.statusIntervalSeconds, "status-interval-seconds", 1, "status output interval, or 0 to disable")
+	flag.Float64Var(&opts.targetMbps, "target-mbps", 0, "assigned line budget; zero disables target-based fallback exploration")
 	flag.StringVar(&opts.bindIP, "bind-ip", "", "local IPv4 address to bind outbound connections")
 	flag.StringVar(&opts.sourcesFile, "sources-file", "", "JSON file containing reloadable source URLs")
 	flag.BoolVar(&opts.rejectPrivateDestinations, "reject-private-destinations", false, "reject non-public IPv4 destinations")
@@ -564,6 +569,9 @@ func validateOptions(opts *options) error {
 	}
 	if opts.readTimeoutSeconds < 1 {
 		return fmt.Errorf("read-timeout-seconds must be greater than 0")
+	}
+	if opts.targetMbps < 0 || math.IsNaN(opts.targetMbps) || math.IsInf(opts.targetMbps, 0) {
+		return fmt.Errorf("target-mbps must be finite and non-negative")
 	}
 	if opts.bindIP != "" {
 		parsedIP := net.ParseIP(opts.bindIP)
@@ -626,6 +634,8 @@ func run(ctx context.Context, opts options) error {
 	targetConnections := opts.connections
 	var nextWorkerToken uint64
 	health := newSourceHealth()
+	health.allocation.targetMbps = opts.targetMbps
+	health.allocation.connections = opts.connections
 	health.retain(combinedSources(initialSources, initialConfig.FallbackSources))
 	health.restore(initialConfig.Health, time.Now())
 	sink.emit(statusEvent{Type: "source-list", LineID: opts.lineID, State: "loaded", Generation: initialConfig.Generation})
@@ -746,6 +756,9 @@ func run(ctx context.Context, opts options) error {
 					}
 				}
 			}
+			health.mu.Lock()
+			health.allocation.connections = targetConnections
+			health.mu.Unlock()
 		case result := <-results:
 			worker, active := workers[result.id]
 			if !active || worker.token != result.token {

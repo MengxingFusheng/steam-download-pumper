@@ -19,12 +19,22 @@ def history_model(rows: Iterable[Mapping[str, Any]]) -> dict[str, dict[int, floa
         if float(row["valid_seconds"]) < 12 * 60 or capacity <= 0:
             continue
         key = (str(row["account_id"]), int(row["interval"]))
-        samples.setdefault(key, []).append(max(0.0, min(1.0, float(row["upload"]) / capacity)))
+        samples.setdefault(key, []).append(max(0.0, float(row["upload"]) / capacity))
     result: dict[str, dict[int, float]] = {}
     for (account_id, interval), values in samples.items():
         if len(values) >= 3:
             result.setdefault(account_id, {})[interval] = float(median(values))
     return result
+
+
+def evening_fallback(rows: Iterable[Mapping[str, Any]]) -> dict[str, float]:
+    """Use measured evening bins when three historical days are not yet available."""
+    samples: dict[str, list[float]] = {}
+    for row in rows:
+        if int(row["interval"]) < 72 or float(row["valid_seconds"]) < 720 or float(row["capacity"]) <= 0:
+            continue
+        samples.setdefault(str(row["account_id"]), []).append(max(0.0, float(row["upload"]) / float(row["capacity"])))
+    return {key: max(1.0, float(median(values))) for key, values in samples.items() if len(values) >= 3}
 
 
 def daily_prediction(
@@ -35,11 +45,14 @@ def daily_prediction(
     historical_utilization: Mapping[int, float],
     target_ratio: float,
     margin: float = 0.2,
+    physical_upload_mbps: float | None = None,
+    fallback_utilization: float = 1.0,
 ) -> dict[str, Any]:
     """Forecast the remaining local day; no prior-day debt is included."""
     midnight = now.replace(hour=0, minute=0, second=0, microsecond=0)
     finish = midnight + timedelta(days=1)
     rate_bytes = upload_mbps * 1_000_000 / 8
+    maximum_utilization = max(upload_mbps, physical_upload_mbps or upload_mbps) / upload_mbps
     future = 0.0
     predicted_seconds = 0.0
     fallback_seconds = 0.0
@@ -49,10 +62,11 @@ def daily_prediction(
         boundary = midnight + timedelta(minutes=(interval + 1) * 15)
         duration = (boundary - cursor).total_seconds()
         if interval in historical_utilization:
-            utilization = min(1.0, historical_utilization[interval] * (1.0 + margin))
+            utilization = min(maximum_utilization, historical_utilization[interval] * (1.0 + margin))
             predicted_seconds += duration
         else:
-            utilization = 1.0 if interval >= 18 * 4 else 0.0
+            utilization = min(maximum_utilization, max(1.0, fallback_utilization) * (1.0 + margin)
+                              if fallback_utilization > 1.0 else 1.0) if interval >= 18 * 4 else 0.0
             fallback_seconds += duration
         future += rate_bytes * utilization * duration
         cursor = boundary
@@ -82,6 +96,8 @@ def daily_prediction(
         "forecast_quality": quality,
         "forecast_historical_seconds": int(predicted_seconds),
         "forecast_fallback_seconds": int(fallback_seconds),
+        "forecast_upload_ceiling_mbps": maximum_utilization * upload_mbps,
+        "forecast_evening_fallback_mbps": upload_mbps * min(maximum_utilization, fallback_utilization),
         "ratio": download / recorded_upload if recorded_upload else None,
         "target_progress_percent": min(100.0, download * 100.0 / target) if target else 100.0,
     }
