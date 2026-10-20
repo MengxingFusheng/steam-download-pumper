@@ -1,6 +1,11 @@
 package main
 
 import (
+	"context"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -56,5 +61,50 @@ func TestSlowPrimaryOpensFallbackExplorationAfterMinute(t *testing.T) {
 	}
 	if got := h.allocationPoolLocked([]string{"primary"}, []string{"fallback"}, now.Add(time.Minute)); len(got) != 2 {
 		t.Fatal("slow healthy primary hid fallback")
+	}
+}
+
+func TestRealWorkersKeepMostTrafficOnFastEndpoint(t *testing.T) {
+	var fastBytes, slowBytes atomic.Int64
+	handler := func(counter *atomic.Int64, size int, pause time.Duration) http.HandlerFunc {
+		return func(w http.ResponseWriter, r *http.Request) {
+			block := make([]byte, size)
+			for n := 0; n < 200; n++ {
+				select {
+				case <-r.Context().Done():
+					return
+				default:
+				}
+				count, err := w.Write(block)
+				counter.Add(int64(count))
+				if err != nil {
+					return
+				}
+				w.(http.Flusher).Flush()
+				select {
+				case <-r.Context().Done():
+					return
+				case <-time.After(pause):
+				}
+			}
+		}
+	}
+	fast := httptest.NewServer(handler(&fastBytes, 32768, 10*time.Millisecond))
+	defer fast.Close()
+	slow := httptest.NewServer(handler(&slowBytes, 2048, 30*time.Millisecond))
+	defer slow.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	defer cancel()
+	err := run(ctx, options{connections: 12, maxConnections: 12, readTimeoutSeconds: 30, statusIntervalSeconds: 1,
+		minSessionSeconds: 300, urls: []string{fast.URL + "/download?size=67108864", slow.URL + "/download?size=67108864"},
+		targetMbps: 500, statusWriter: io.Discard})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fastBytes.Load() == 0 {
+		t.Fatal("fast endpoint was unused")
+	}
+	if slowBytes.Load() > fastBytes.Load()/10 {
+		t.Fatalf("slow endpoint consumed ordinary allocation: fast=%d slow=%d", fastBytes.Load(), slowBytes.Load())
 	}
 }
