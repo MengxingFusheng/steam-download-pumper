@@ -126,10 +126,14 @@ Validate candidates without signing or OSS credentials:
 docker compose -f docker-compose.publisher.yml --env-file .env.publisher run --rm source-publisher validate-only
 ```
 
-Perform one locked publication transaction:
+Perform one locked publication transaction. The scheduler owns the publication
+lock for its lifetime, so stop it before starting the one-shot publisher and
+restart it afterwards, including when publication fails:
 
 ```bash
+docker compose -f docker-compose.publisher.yml --env-file .env.publisher stop source-publisher
 docker compose -f docker-compose.publisher.yml --env-file .env.publisher run --rm source-publisher publish-once
+docker compose -f docker-compose.publisher.yml --env-file .env.publisher up -d source-publisher
 ```
 
 `publish-once` always rechecks sources and creates a higher revision, including on
