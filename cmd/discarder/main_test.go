@@ -821,23 +821,34 @@ func TestBoundClientNegotiatesHTTP2AndCountsActualBytes(t *testing.T) {
 }
 
 func TestSpeedtestChunksContinueWithoutRestartJitter(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-	defer cancel()
-	var requests atomic.Int32
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/octet-stream")
-		fmt.Fprint(w, strings.Repeat("x", 1024))
-		if requests.Add(1) >= 2 {
-			cancel()
-		}
-	}))
-	defer server.Close()
-	opts := options{workerID: "test", lineID: "test", urls: []string{server.URL + "/download?size=67108864&guid={{guid}}&nocache={{nonce}}"}, readTimeoutSeconds: 1, restartJitterSeconds: 1000000}
-	var total atomic.Int64
-	var source atomic.Value
-	source.Store("")
-	err := runWorker(ctx, opts, 1, newSourceHealth(), &total, &source, &statusSink{writer: io.Discard})
-	if err != nil || requests.Load() < 2 {
-		t.Fatalf("stream paused between chunks: requests=%d err=%v", requests.Load(), err)
+	for _, path := range []string{"/download?size=67108864&guid={{guid}}&nocache={{nonce}}", "/speedtest/random4000x4000.jpg"} {
+		t.Run(path, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+			defer cancel()
+			var requests atomic.Int32
+			var legacyKeepAlive atomic.Bool
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path == "/speedtest/random4000x4000.jpg" && !r.Close {
+					legacyKeepAlive.Store(true)
+				}
+				w.Header().Set("Content-Type", "application/octet-stream")
+				fmt.Fprint(w, strings.Repeat("x", 1024))
+				if requests.Add(1) >= 2 {
+					cancel()
+				}
+			}))
+			defer server.Close()
+			opts := options{workerID: "test", lineID: "test", urls: []string{server.URL + path}, readTimeoutSeconds: 1, restartJitterSeconds: 1000000}
+			var total atomic.Int64
+			var source atomic.Value
+			source.Store("")
+			err := runWorker(ctx, opts, 1, newSourceHealth(), &total, &source, &statusSink{writer: io.Discard})
+			if err != nil || requests.Load() < 2 {
+				t.Fatalf("stream paused between chunks: requests=%d err=%v", requests.Load(), err)
+			}
+			if legacyKeepAlive.Load() {
+				t.Fatal("legacy endpoint reused a potentially invalid HTTP/1 stream")
+			}
+		})
 	}
 }

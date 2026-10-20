@@ -898,7 +898,7 @@ func runWorker(
 		}
 		// Modern Ookla downloads are sized requests in a continuous stream.
 		// Sleeping after every completed chunk wastes available line capacity.
-		if opts.restartJitterSeconds > 0 && !isSpeedtestDownload(url) {
+		if opts.restartJitterSeconds > 0 && !isSpeedtestDownload(url) && !isClassicSpeedtestDownload(url) {
 			jitter := time.Duration(rand.Float64() * opts.restartJitterSeconds * float64(time.Second))
 			if err := sleepWithContext(ctx, jitter); err != nil {
 				return nil
@@ -1185,6 +1185,9 @@ func downloadOnceMeasured(ctx context.Context, client *http.Client, url string, 
 		return 0, err
 	}
 	request.Header.Set("User-Agent", requestUserAgent(url, workerID))
+	// Some legacy servers leave excess response bytes on idle HTTP/1 streams.
+	// Close each sized file before reconnecting; modern /download keeps reuse.
+	request.Close = isClassicSpeedtestDownload(url)
 	response, err := client.Do(request)
 	if err != nil {
 		return 0, err
@@ -1222,10 +1225,15 @@ func downloadOnceMeasured(ctx context.Context, client *http.Client, url string, 
 }
 
 func requestUserAgent(rawURL string, workerID string) string {
-	if isSpeedtestDownload(rawURL) {
+	if isSpeedtestDownload(rawURL) || isClassicSpeedtestDownload(rawURL) {
 		return "fleet-speedtest-authorized/1.0"
 	}
 	return "broadband-pumper/" + workerID
+}
+
+func isClassicSpeedtestDownload(rawURL string) bool {
+	parsed, err := url.Parse(rawURL)
+	return err == nil && parsed.Path == "/speedtest/random4000x4000.jpg"
 }
 
 func isSpeedtestDownload(rawURL string) bool {
