@@ -165,7 +165,7 @@ class FleetConfig(CommonConfig):
     engine_status_seconds: int = 5
     scheduler_tick_seconds: int = 60
     upload_ceiling_mbps: int = 50
-    download_ceiling_mbps: int = 500
+    download_ceiling_mbps: int = 1_000
     snmp_direction_swap: bool = False
     line_stall_seconds: int = 90
     line_slow_window_seconds: int = 180

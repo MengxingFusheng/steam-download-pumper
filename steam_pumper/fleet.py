@@ -370,6 +370,10 @@ class FleetStore:
             "sample_seconds": "INTEGER NOT NULL DEFAULT 0",
             "interruptions": "INTEGER NOT NULL DEFAULT 0",
             "upload_valid_seconds": "INTEGER NOT NULL DEFAULT 0",
+            # NULL identifies legacy rows without per-direction durations.
+            # Infer only unambiguously valid legacy minutes when reading;
+            # adding this column never rewrites historical byte counters.
+            "download_valid_seconds": "INTEGER",
             "upload_capacity_bytes": "REAL NOT NULL DEFAULT 0",
             "unknown_upload_seconds": "INTEGER NOT NULL DEFAULT 0",
             "unknown_upload_capacity_bytes": "REAL NOT NULL DEFAULT 0",
@@ -530,6 +534,7 @@ class FleetStore:
         sample_seconds: int = 0,
         interruptions: int = 0,
         upload_valid_seconds: int = 0,
+        download_valid_seconds: int = 0,
         upload_capacity_bytes: int = 0,
         unknown_upload_seconds: int = 0,
         unknown_upload_capacity_bytes: int = 0,
@@ -540,8 +545,9 @@ class FleetStore:
           account_id,minute,upload_bytes,download_bytes,snmp_download_bytes,
           measured_upload_bytes,measured_download_bytes,estimated_upload_bytes,estimated_download_bytes,
           unknown_seconds,sample_seconds,interruptions,quality,
-          upload_valid_seconds,upload_capacity_bytes,unknown_upload_seconds,unknown_upload_capacity_bytes
-        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+          upload_valid_seconds,upload_capacity_bytes,unknown_upload_seconds,unknown_upload_capacity_bytes,
+          download_valid_seconds
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         ON CONFLICT(account_id,minute) DO UPDATE SET
           upload_bytes=upload_bytes+excluded.upload_bytes,
           download_bytes=download_bytes+excluded.download_bytes,
@@ -554,6 +560,10 @@ class FleetStore:
           sample_seconds=sample_seconds+excluded.sample_seconds,
           interruptions=interruptions+excluded.interruptions,
           upload_valid_seconds=upload_valid_seconds+excluded.upload_valid_seconds,
+          download_valid_seconds=COALESCE(traffic.download_valid_seconds,
+            CASE WHEN traffic.quality IN ('ok','recovered') AND traffic.estimated_download_bytes=0
+              AND traffic.unknown_seconds=0 THEN traffic.sample_seconds ELSE 0 END)
+            +excluded.download_valid_seconds,
           upload_capacity_bytes=upload_capacity_bytes+excluded.upload_capacity_bytes,
           unknown_upload_seconds=unknown_upload_seconds+excluded.unknown_upload_seconds,
           unknown_upload_capacity_bytes=unknown_upload_capacity_bytes+excluded.unknown_upload_capacity_bytes,
@@ -565,6 +575,7 @@ class FleetStore:
             max(0, interruptions), quality,
             max(0, upload_valid_seconds), max(0, upload_capacity_bytes),
             max(0, unknown_upload_seconds), max(0, unknown_upload_capacity_bytes),
+            max(0, download_valid_seconds),
         ))
 
     def record_download(self, account_id: str, amount: int, observed_at: datetime) -> None:
@@ -683,6 +694,7 @@ class FleetStore:
                     unknown_seconds=unknown,
                     sample_seconds=int(elapsed),
                     upload_valid_seconds=int(elapsed) if upload_valid else 0,
+                    download_valid_seconds=int(elapsed) if download_valid else 0,
                     upload_capacity_bytes=int(upload_ceiling * 1_000_000 / 8 * elapsed) if upload_valid else 0,
                     unknown_upload_seconds=unknown_upload,
                     unknown_upload_capacity_bytes=int(upload_ceiling * 1_000_000 / 8 * unknown_upload),
@@ -774,11 +786,14 @@ class FleetStore:
 
     def _recent_measured_rate(self, account_id: str, before: datetime, direction: str, *, minutes: int) -> float | None:
         column = "measured_upload_bytes" if direction == "upload" else "measured_download_bytes"
+        valid_seconds = ("upload_valid_seconds" if direction == "upload" else
+                         "COALESCE(download_valid_seconds, CASE WHEN quality IN ('ok','recovered') "
+                         "AND estimated_download_bytes=0 AND unknown_seconds=0 THEN sample_seconds ELSE 0 END)")
         upper = int(before.timestamp() // 60)
         lower = int((before - timedelta(minutes=minutes)).timestamp() // 60)
         row = self.db.execute(f"""
-        SELECT COALESCE(SUM({column}),0) AS bytes,COALESCE(SUM(sample_seconds),0) AS seconds
-        FROM traffic WHERE account_id=? AND minute>=? AND minute<=?
+        SELECT COALESCE(SUM({column}),0) AS bytes,COALESCE(SUM({valid_seconds}),0) AS seconds
+        FROM traffic WHERE account_id=? AND minute>=? AND minute<=? AND ({valid_seconds})>0
         """, (account_id, lower, upper)).fetchone()
         return float(row["bytes"]) / float(row["seconds"]) if row and row["seconds"] > 0 else None
 
