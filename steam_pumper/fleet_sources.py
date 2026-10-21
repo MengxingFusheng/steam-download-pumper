@@ -171,7 +171,7 @@ class FleetSources:
         if phase == "upload_only":
             rows.append({"line_id": "*", "reason": "upload_only", "message": "18:00–23:00 上传保护：下载暂停，23:00 恢复补量"})
         eligible = [account for account in self.store.accounts() if account.enabled and account.profile_confirmed
-                    and self.snmp_quality.get(account.account_id, "pending") not in {"pending", "baseline", "offline", "missing", "ambiguous"}
+                    and self.snmp_quality.get(account.account_id, "pending") not in {"pending", "baseline", "offline", "missing", "ambiguous", "reboot_gap"}
                     and account.account_id not in self.account_cooldowns]
         debt_total = sum(forecasts.get(account.account_id, {}).get("remaining_download_bytes", 0) for account in eligible)
         # An optimistic upper bound is sufficient to prove an impossible goal.
@@ -203,7 +203,7 @@ class FleetSources:
             elif account.account_id in self.account_cooldowns:
                 reason, message = "cooldown", "线路处于故障冷却"
             elif router["status"] != "ok" or self.snmp_quality.get(account.account_id, "pending") in {
-                "pending", "baseline", "offline", "missing", "ambiguous"
+                "pending", "baseline", "offline", "missing", "ambiguous", "reboot_gap"
             }:
                 reason, message = "snmp_unavailable", "SNMP 数据尚不可用于调度"
             elif theoretical > runnable:

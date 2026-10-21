@@ -230,6 +230,28 @@ class AgentTests(unittest.TestCase):
         finally:
             self.controller.dashboard_agent=None
 
+    def test_kernel_reboot_reconciles_offline_upload_and_queues_historical_export(self):
+        now=datetime(2026,10,21,18,tzinfo=TZ)
+        self.controller.dashboard_agent=self.agent
+        try:
+            for seconds, kernel, incoming, outgoing in ((0,360000,1000,2000),(600,12000,5000,9000)):
+                observed_at=now+timedelta(seconds=seconds)
+                self.controller.snmp_results.put((
+                    [SnmpInterface(1,'pppoe-a','',incoming,outgoing,oper_status=1)],
+                    kernel,observed_at,None,kernel))
+                self.controller._consume_snmp_result(observed_at)
+            self.assertEqual(self.controller.snmp_quality['a'],'router_reboot')
+            self.assertEqual(int(self.agent.get('dirty_since')),int(now.timestamp()))
+            totals=self.controller.store.daily_totals(now.date())['a']
+            self.assertEqual(totals['measured_upload'],9000)
+            self.assertEqual(totals['estimated_upload'],0)
+            self.assertEqual(totals['unknown_upload_capacity'],0)
+            self.agent.tick(self.controller,now+timedelta(seconds=600),1000)
+            snapshot=json.loads(self.agent.get('snapshot'))
+            self.assertEqual(snapshot['summary']['upload_bytes'],9000)
+        finally:
+            self.controller.dashboard_agent=None
+
     def test_overdelivered_upload_survives_ledger_and_dashboard_projection(self):
         self.controller.store.import_accounts(parse_accounts_csv(
             'account_id,bind_ip,snmp_interface,weight\n'

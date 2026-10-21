@@ -28,6 +28,7 @@ from .remote_sources import RemoteSourceManager, RemoteSourceRefreshWorker, Sour
 from .topology import LogicalLine, apply_ipv4_addresses
 from .fleet_forecast import daily_prediction, download_targets, evening_fallback, history_model
 from .fleet_sources import FleetSources
+from .fleet_reconcile import router_rebooted
 
 
 SHANGHAI = ZoneInfo("Asia/Shanghai")
@@ -38,6 +39,7 @@ IF_HC_OUT_OID = ".1.3.6.1.2.1.31.1.1.1.10"
 IF_DISCONTINUITY_OID = ".1.3.6.1.2.1.31.1.1.1.19"
 IF_OPER_STATUS_OID = ".1.3.6.1.2.1.2.2.1.8"
 SYS_UPTIME_OID = ".1.3.6.1.2.1.1.3.0"
+SYSTEM_UPTIME_OID = ".1.3.6.1.2.1.25.1.1.0"
 MAX_ACCOUNTS = 256
 CSV_FIELDS = {"account_id", "bind_ip", "snmp_interface", "enabled", "weight", "group_id"}
 REQUIRED_CSV_FIELDS = {"account_id", "bind_ip", "snmp_interface"}
@@ -131,6 +133,7 @@ class SnmpV2Reader:
         self.timeout_seconds = timeout_seconds
         self._config_path: Path | None = None
         self.last_sys_uptime: int | None = None
+        self.last_system_uptime: int | None = None
 
     def read(self) -> list[SnmpInterface]:
         config = self._config_file()
@@ -143,6 +146,7 @@ class SnmpV2Reader:
             "oper": self._walk(IF_OPER_STATUS_OID, config),
         }
         self.last_sys_uptime = self._get_int(SYS_UPTIME_OID, config)
+        self.last_system_uptime = self._get_int(SYSTEM_UPTIME_OID, config)
         result: list[SnmpInterface] = []
         for index, name in columns["name"].items():
             try:
@@ -351,6 +355,11 @@ class FleetStore:
         );
         CREATE INDEX IF NOT EXISTS runtime_window ON runtime_minutes(minute, account_id);
         CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS router_reboots (
+          detected_at INTEGER PRIMARY KEY, boot_at REAL NOT NULL,
+          previous_sampled_at INTEGER NOT NULL, previous_uptime INTEGER NOT NULL,
+          uptime INTEGER NOT NULL
+        );
         CREATE TABLE IF NOT EXISTS fleet_groups (
           group_id TEXT PRIMARY KEY,name TEXT NOT NULL,
           download_limit_mbps REAL NOT NULL,max_active INTEGER NOT NULL,
@@ -591,6 +600,7 @@ class FleetStore:
         observed_at: datetime,
         *,
         device_uptime: int | None = None,
+        system_uptime: int | None = None,
     ) -> dict[str, str]:
         now = observed_at.astimezone(timezone.utc)
         by_identity: dict[str, list[SnmpInterface]] = {}
@@ -599,6 +609,7 @@ class FleetStore:
                 by_identity.setdefault(identity, []).append(item)
         results: dict[str, str] = {}
         with self.db:
+            reboot_at = self._observe_router_uptime(now, device_uptime, system_uptime)
             if self._meta("baseline_at") is None:
                 self._set_meta("baseline_at", str(int(now.timestamp())))
             for account in self.accounts():
@@ -608,6 +619,10 @@ class FleetStore:
                 # authoritative successor regardless of stale down entries.
                 live_matches = [item for item in matches if item.oper_status in {None, 1}]
                 observed = live_matches[0] if len(live_matches) == 1 else None
+                if not live_matches and len(matches) == 1 and matches[0].oper_status == 2:
+                    # A down interface can still expose authoritative counters.
+                    # Read its zero/last increments instead of inventing upload.
+                    observed = matches[0]
                 unavailable_state = "ambiguous" if len(live_matches) > 1 else ("offline" if matches else "missing")
                 prior = self.db.execute("SELECT * FROM cursors WHERE account_id=?", (account.account_id,)).fetchone()
                 if prior is None:
@@ -620,8 +635,17 @@ class FleetStore:
                     continue
 
                 previous_poll = datetime.fromtimestamp(prior["sampled_at"], timezone.utc)
-                baseline_at = datetime.fromtimestamp(prior["baseline_at"] or prior["sampled_at"], timezone.utc)
+                baseline_at = datetime.fromtimestamp(prior["baseline_at"] or prior["missing_since"] or prior["sampled_at"], timezone.utc)
+                reboot_gap = reboot_at is not None and baseline_at.timestamp() < reboot_at <= now.timestamp()
                 if observed is None:
+                    if reboot_gap:
+                        self._clear_pending_unknown(account.account_id, baseline_at, now)
+                        self._add_interval_traffic(account.account_id, baseline_at, now,
+                                                   unknown_seconds=int((now - baseline_at).total_seconds()),
+                                                   quality="reboot_gap")
+                        self._save_missing_cursor(account.account_id, now)
+                        results[account.account_id] = "reboot_gap"
+                        continue
                     self._add_interval_traffic(
                         account.account_id, previous_poll, now,
                         unknown_seconds=int(max(0, (now - previous_poll).total_seconds())),
@@ -633,16 +657,14 @@ class FleetStore:
                     results[account.account_id] = unavailable_state
                     continue
 
-                if observed.oper_status not in {None, 1}:
-                    self._save_cursor(account.account_id, observed, now, False, device_uptime)
-                    results[account.account_id] = "offline"
+                offline = observed.oper_status == 2
+                if reboot_gap:
+                    self._clear_pending_unknown(account.account_id, baseline_at, now)
+                    self._record_router_reboot(account, baseline_at, now, reboot_at, observed)
+                    self._save_cursor(account.account_id, observed, now, not offline, device_uptime)
+                    results[account.account_id] = "offline" if offline else "router_reboot"
                     continue
 
-                device_reset = (
-                    prior["device_uptime"] is not None
-                    and device_uptime is not None
-                    and device_uptime < prior["device_uptime"]
-                )
                 counter_reset = (
                     prior["if_index"] is None
                     or prior["if_index"] != observed.index
@@ -656,11 +678,11 @@ class FleetStore:
                         and prior["discontinuity"] != observed.discontinuity
                     )
                 )
-                if device_reset or counter_reset:
+                if counter_reset:
                     self._clear_pending_unknown(account.account_id, baseline_at, now)
-                    self._record_estimated_gap(account.account_id, baseline_at, now, quality="reset")
-                    self._save_cursor(account.account_id, observed, now, True, device_uptime)
-                    results[account.account_id] = "reset"
+                    self._record_estimated_gap(account.account_id, baseline_at, now, quality="reset", upload_offline=offline)
+                    self._save_cursor(account.account_id, observed, now, not offline, device_uptime)
+                    results[account.account_id] = "offline" if offline else "reset"
                     continue
 
                 self._clear_pending_unknown(account.account_id, baseline_at, now)
@@ -680,11 +702,11 @@ class FleetStore:
                 download_maximum = int(self.cfg.download_ceiling_mbps * 1_000_000 / 8 * elapsed * 1.05)
                 upload_valid = 0 <= upload <= upload_maximum
                 download_valid = 0 <= snmp_download <= download_maximum
-                estimated_upload = 0 if upload_valid else self._estimated_bytes(account.account_id, baseline_at, now, "upload")
+                estimated_upload = 0 if upload_valid or offline else self._estimated_bytes(account.account_id, baseline_at, now, "upload")
                 estimated_download = 0 if download_valid else self._estimated_bytes(account.account_id, baseline_at, now, "download")
                 unknown = int(elapsed) if (not upload_valid and estimated_upload is None) or (not download_valid and estimated_download is None) else 0
-                unknown_upload = int(elapsed) if not upload_valid and estimated_upload is None else 0
-                quality = "recovered" if not prior["valid"] else ("ok" if upload_valid and download_valid else "anomaly")
+                unknown_upload = int(elapsed) if not offline and not upload_valid and estimated_upload is None else 0
+                quality = "offline" if offline else "recovered" if not prior["valid"] else ("ok" if upload_valid and download_valid else "anomaly")
                 self._add_interval_traffic(
                     account.account_id, baseline_at, now,
                     measured_upload=upload if upload_valid else 0,
@@ -700,10 +722,53 @@ class FleetStore:
                     unknown_upload_capacity_bytes=int(upload_ceiling * 1_000_000 / 8 * unknown_upload),
                     quality=quality,
                 )
-                self._save_cursor(account.account_id, observed, now, True, device_uptime)
+                self._save_cursor(account.account_id, observed, now, not offline, device_uptime)
                 results[account.account_id] = quality
             self._prune(now)
         return results
+
+    def _observe_router_uptime(self, now: datetime, device_uptime: int | None,
+                               system_uptime: int | None) -> float | None:
+        previous = json.loads(self._meta("router_uptime_sample") or "null")
+        if system_uptime is not None and 0 < system_uptime < 1 << 32:
+            timestamp = now.timestamp()
+            if previous and router_rebooted(previous["system_uptime"], system_uptime,
+                                            timestamp - previous["sampled_at"]):
+                self.db.execute("INSERT OR IGNORE INTO router_reboots VALUES (?,?,?,?,?)",
+                                (int(timestamp), timestamp - system_uptime / 100,
+                                 int(previous["sampled_at"]), previous["system_uptime"], system_uptime))
+            self._set_meta("router_uptime_sample", json.dumps({
+                "sampled_at": timestamp, "system_uptime": system_uptime, "device_uptime": device_uptime,
+            }))
+        row = self.db.execute("SELECT MAX(boot_at) FROM router_reboots").fetchone()
+        return row[0]
+
+    def _record_router_reboot(self, account: FleetAccount, start: datetime, now: datetime,
+                              boot_at: float, observed: SnmpInterface) -> None:
+        boot = datetime.fromtimestamp(boot_at, timezone.utc)
+        # A reboot proves the old counters cannot bridge the gap. Uptime does
+        # not reveal when power was lost, so retain an unreconciled gap marker
+        # without charging estimated upload or a full-bandwidth upload budget.
+        self._add_interval_traffic(account.account_id, start, boot,
+                                  unknown_seconds=int((boot - start).total_seconds()),
+                                  interruptions=1, quality="reboot_gap")
+        elapsed = max(0.0, (now - boot).total_seconds())
+        upload, download = ((observed.in_octets, observed.out_octets) if self.cfg.snmp_direction_swap
+                            else (observed.out_octets, observed.in_octets))
+        ceiling = account.upload_mbps if account.profile_confirmed else self.cfg.upload_ceiling_mbps
+        upload_valid = upload <= max(ceiling, self.cfg.upload_ceiling_mbps) * 1_000_000 / 8 * elapsed * 1.05
+        download_valid = download <= self.cfg.download_ceiling_mbps * 1_000_000 / 8 * elapsed * 1.05
+        self._add_interval_traffic(
+            account.account_id, boot, now, measured_upload=upload if upload_valid else 0,
+            measured_download=download if download_valid else 0, sample_seconds=int(elapsed),
+            upload_valid_seconds=int(elapsed) if upload_valid else 0,
+            download_valid_seconds=int(elapsed) if download_valid else 0,
+            upload_capacity_bytes=int(ceiling * 1_000_000 / 8 * elapsed) if upload_valid else 0,
+            unknown_seconds=int(elapsed) if not upload_valid or not download_valid else 0,
+            unknown_upload_seconds=int(elapsed) if not upload_valid else 0,
+            unknown_upload_capacity_bytes=int(ceiling * 1_000_000 / 8 * elapsed) if not upload_valid else 0,
+            quality="router_reboot",
+        )
 
     def _save_cursor(
         self,
@@ -731,10 +796,11 @@ class FleetStore:
     def _save_missing_cursor(self, account_id: str, now: datetime) -> None:
         timestamp = int(now.timestamp())
         self.db.execute("""
-        INSERT INTO cursors(account_id,sampled_at,valid,missing_since) VALUES (?,?,0,?)
+        INSERT INTO cursors(account_id,sampled_at,valid,missing_since,baseline_at) VALUES (?,?,0,?,?)
         ON CONFLICT(account_id) DO UPDATE SET sampled_at=excluded.sampled_at,valid=0,
+          baseline_at=COALESCE(cursors.baseline_at,cursors.missing_since,cursors.sampled_at),
           missing_since=COALESCE(cursors.missing_since,excluded.missing_since)
-        """, (account_id, timestamp, timestamp))
+        """, (account_id, timestamp, timestamp, timestamp))
 
     def _clear_pending_unknown(self, account_id: str, start: datetime, end: datetime) -> None:
         first = int(start.timestamp() // 60)
@@ -745,15 +811,16 @@ class FleetStore:
         WHERE account_id=? AND minute BETWEEN ? AND ?
         """, (account_id, first, last))
 
-    def _record_estimated_gap(self, account_id: str, start: datetime, end: datetime, *, quality: str) -> None:
+    def _record_estimated_gap(self, account_id: str, start: datetime, end: datetime, *, quality: str,
+                              upload_offline: bool = False) -> None:
         elapsed = int(max(0, (end - start).total_seconds()))
-        estimated_upload = self._estimated_bytes(account_id, start, end, "upload")
+        estimated_upload = 0 if upload_offline else self._estimated_bytes(account_id, start, end, "upload")
         estimated_download = self._estimated_bytes(account_id, start, end, "download")
         capped_seconds = min(elapsed, 30 * 60)
         unknown = max(0, elapsed - capped_seconds)
         if estimated_upload is None or estimated_download is None:
             unknown = elapsed
-        unknown_upload = elapsed if estimated_upload is None else max(0, elapsed - capped_seconds)
+        unknown_upload = 0 if upload_offline else elapsed if estimated_upload is None else max(0, elapsed - capped_seconds)
         account = next((item for item in self.accounts() if item.account_id == account_id), None)
         upload_ceiling = account.upload_mbps if account and account.profile_confirmed else self.cfg.upload_ceiling_mbps
         capped_end = min(end, start + timedelta(minutes=30))
@@ -1114,7 +1181,7 @@ class FleetController(FleetSources):
         self.last_engine_at = 0.0
         self.snmp_status = "pending"
         self.snmp_quality: dict[str, str] = {}
-        self.snmp_results: queue.SimpleQueue[tuple[list[SnmpInterface] | None, int | None, datetime, Exception | None]] = queue.SimpleQueue()
+        self.snmp_results: queue.SimpleQueue[tuple[list[SnmpInterface] | None, int | None, datetime, Exception | None, int | None]] = queue.SimpleQueue()
         self.snmp_thread: threading.Thread | None = None
         self.account_cooldowns: dict[str, datetime] = {}
         self.account_health_errors: dict[str, str] = {}
@@ -1211,9 +1278,10 @@ class FleetController(FleetSources):
         def collect() -> None:
             try:
                 interfaces = self.snmp_reader.read()
-                self.snmp_results.put((interfaces, getattr(self.snmp_reader, "last_sys_uptime", None), datetime.now(SHANGHAI), None))
+                self.snmp_results.put((interfaces, getattr(self.snmp_reader, "last_sys_uptime", None), datetime.now(SHANGHAI), None,
+                                       getattr(self.snmp_reader, "last_system_uptime", None)))
             except Exception as exc:
-                self.snmp_results.put((None, None, datetime.now(SHANGHAI), exc))
+                self.snmp_results.put((None, None, datetime.now(SHANGHAI), exc, None))
 
         try:
             thread = threading.Thread(target=collect, name="fleet-snmp", daemon=True)
@@ -1230,7 +1298,9 @@ class FleetController(FleetSources):
         changed = False
         while True:
             try:
-                interfaces, device_uptime, observed_at, error = self.snmp_results.get_nowait()
+                sample = self.snmp_results.get_nowait()
+                interfaces, device_uptime, observed_at, error = sample[:4]
+                system_uptime = sample[4] if len(sample) > 4 else None
             except queue.Empty:
                 break
             changed = True
@@ -1242,12 +1312,14 @@ class FleetController(FleetSources):
             try:
                 prior_baselines = {}
                 if self.dashboard_agent is not None:
-                    prior_baselines = {row["account_id"]: row["baseline_at"] or row["sampled_at"]
-                                       for row in self.store.db.execute("SELECT account_id,baseline_at,sampled_at FROM cursors")}
-                self.snmp_quality = self.store.record_snmp(interfaces, observed_at, device_uptime=device_uptime)
+                    prior_baselines = {row["account_id"]: row["baseline_at"] or row["missing_since"] or row["sampled_at"]
+                                       for row in self.store.db.execute("SELECT account_id,baseline_at,missing_since,sampled_at FROM cursors")}
+                self.snmp_quality = self.store.record_snmp(interfaces, observed_at, device_uptime=device_uptime,
+                                                          system_uptime=system_uptime)
                 if self.dashboard_agent is not None:
                     corrected = [prior_baselines[account_id] for account_id, quality in self.snmp_quality.items()
-                                 if quality in {"recovered", "reset"} and account_id in prior_baselines]
+                                 if quality in {"recovered", "reset", "router_reboot", "reboot_gap", "offline"}
+                                 and account_id in prior_baselines]
                     if corrected:
                         try:
                             self.dashboard_agent.invalidate_since(min(corrected))
@@ -1434,7 +1506,7 @@ class FleetController(FleetSources):
             if until <= now:
                 self.account_cooldowns.pop(account_id, None)
         accounts = [item for item in self.store.accounts() if item.enabled]
-        unusable = {"pending", "baseline", "offline", "missing", "ambiguous"}
+        unusable = {"pending", "baseline", "offline", "missing", "ambiguous", "reboot_gap"}
         eligible = [item for item in accounts if item.account_id not in self.account_cooldowns
                     and self.snmp_quality.get(item.account_id, "pending") not in unusable]
         override = self._evening_override(now)
