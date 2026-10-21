@@ -26,7 +26,7 @@ from .engine import EngineProcess
 from .fleet_schedule import WanBudget, allocate_daily, daily_phase
 from .remote_sources import RemoteSourceManager, RemoteSourceRefreshWorker, SourceListSnapshot
 from .topology import LogicalLine, apply_ipv4_addresses
-from .fleet_forecast import daily_prediction, evening_fallback, history_model
+from .fleet_forecast import daily_prediction, download_targets, evening_fallback, history_model
 from .fleet_sources import FleetSources
 
 
@@ -948,10 +948,9 @@ class FleetStore:
             if datetime.now(SHANGHAI) >= finish:
                 values["future_upload_bytes"] = 0
                 values["predicted_upload_bytes"] = values["today_upload_bytes"] + values["unknown_upload_budget_bytes"]
-                values["target_download_bytes"] = int(values["predicted_upload_bytes"] * self.cfg.target_ratio)
-                values["remaining_download_bytes"] = max(0, values["target_download_bytes"] - values["today_download_bytes"])
-                target_bytes = values["target_download_bytes"]
-                values["target_progress_percent"] = min(100.0, values["today_download_bytes"] * 100.0 / target_bytes) if target_bytes else 100.0
+                values.update(download_targets(upload_mbps=account.upload_mbps,
+                    predicted_upload_bytes=values["predicted_upload_bytes"],
+                    download_bytes=values["today_download_bytes"], target_ratio=self.cfg.target_ratio))
             early = before18[account.account_id]
             target = pre18_targets.get(account.account_id)
             values.update({
@@ -1432,9 +1431,7 @@ class FleetController(FleetSources):
                                             if now - active.started_at < minimum
                                             and active.engine.state.status not in {"stopped", "failed"}]
         allocation = allocate_daily(eligible, self.store.groups(), forecasts, budget,
-                                    self.store.allocated_today(now), self.store.last_started(), keep, force=forced,
-                                    surplus_seconds=(now.replace(hour=18, minute=0, second=0, microsecond=0) - now).total_seconds()
-                                    if self._daily_phase(now) == "daytime" else 0)
+                                    self.store.allocated_today(now), self.store.last_started(), keep, force=forced)
         self.daily_groups_changed = False
         # Release old slots before starting new lines. iKuai, not the process,
         # enforces the per-line profile and aggregate physical limit.
@@ -1507,10 +1504,13 @@ class FleetController(FleetSources):
         rows = [values for account_id, values in forecasts.items() if account_id in enabled]
         sums = ("today_upload_bytes", "today_download_bytes", "measured_upload_bytes", "measured_download_bytes",
                 "estimated_upload_bytes", "estimated_download_bytes", "unknown_seconds", "predicted_upload_bytes",
-                "target_download_bytes", "remaining_download_bytes", "future_upload_bytes", "unknown_upload_budget_bytes")
+                "target_download_bytes", "remaining_download_bytes", "future_upload_bytes", "unknown_upload_budget_bytes",
+                "minimum_upload_bytes", "minimum_download_bytes", "predicted_download_bytes",
+                "maximum_download_bytes", "remaining_minimum_download_bytes")
         result: dict[str, Any] = {key: sum(item.get(key, 0) for item in rows) for key in sums}
         result.update(date=now.date().isoformat(), phase=self._daily_phase(now), total_accounts=len(rows),
                       evening_override=self._evening_override(now),
+                      minimum_achieved_accounts=sum(item.get("remaining_minimum_download_bytes", 0) <= 0 for item in rows),
                       achieved_accounts=sum(item.get("remaining_download_bytes", 0) <= 0 for item in rows),
                       profile_unconfirmed_accounts=sum(item.enabled and not item.profile_confirmed for item in self.store.accounts()))
         result["pre18_result"] = None
@@ -1812,15 +1812,19 @@ class FleetController(FleetSources):
                          "upload_bytes", "download_bytes", "ratio", "target_download_bytes", "unmet_bytes",
                          "pre18_download_bytes", "pre18_target_bytes", "pre18_met", "full_day_met",
                          "measured_upload_bytes", "measured_download_bytes", "estimated_upload_bytes",
-                         "estimated_download_bytes", "unknown_seconds", "program_download_bytes", "target_quality"])
+                         "estimated_download_bytes", "unknown_seconds", "program_download_bytes", "target_quality",
+                         "minimum_download_bytes", "maximum_download_bytes", "minimum_met"])
         for account in self.store.accounts():
             values = totals[account.account_id]
-            target = int(live.get(account.account_id, {}).get("target_download_bytes", final_targets.get(account.account_id, 0)))
+            prediction = live.get(account.account_id, {})
             # Completed-day reports use actual known upload (+ conservative
             # unknown budget), not an obsolete earlier projection.
             if day != now.date():
                 unknown_budget = values.get("unknown_upload_capacity", 0)
-                target = int((values["upload"] + unknown_budget) * self.cfg.target_ratio)
+                prediction = download_targets(upload_mbps=account.upload_mbps,
+                    predicted_upload_bytes=values["upload"] + unknown_budget,
+                    download_bytes=values["download"], target_ratio=self.cfg.target_ratio)
+            target = int(prediction.get("target_download_bytes", final_targets.get(account.account_id, 0)))
             pre_target = pre_targets.get(account.account_id)
             down = values["download"]
             pre_down = before18[account.account_id]["download"]
@@ -1831,7 +1835,9 @@ class FleetController(FleetSources):
                              int(pre_down >= pre_target) if pre_target is not None else "", int(down >= target),
                              values["measured_upload"], values["measured_download"], values["estimated_upload"],
                              values["estimated_download"], values["unknown_seconds"], values["program_download"],
-                             "recorded" if final_raw or live else "no_forecast_snapshot"])
+                             "recorded" if final_raw or live else "no_forecast_snapshot",
+                             prediction["minimum_download_bytes"], prediction["maximum_download_bytes"],
+                             int(down >= prediction["minimum_download_bytes"])])
         return output.getvalue()
 
     def summary(self) -> dict[str, Any]:

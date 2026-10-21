@@ -203,10 +203,11 @@ class FleetDailyStoreTests(unittest.TestCase):
             self.store._set_meta(f"daily_pre18:{day.isoformat()}", json.dumps({"a": 220}))
         report = self.store.daily_report(day)["a"]
         self.assertEqual(report["future_upload_bytes"], 0)
-        self.assertEqual(report["target_download_bytes"], 240)
+        self.assertEqual(report["predicted_download_bytes"], 240)
+        self.assertEqual(report["target_download_bytes"], 270_000_000_000)
         self.assertEqual(report["before18_download_bytes"], 200)
         self.assertFalse(report["before18_achieved"])
-        self.assertTrue(report["final_achieved"])
+        self.assertFalse(report["final_achieved"])
 
 
 if __name__ == "__main__":

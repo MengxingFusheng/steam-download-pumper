@@ -35,9 +35,12 @@ class DailyReportTests(unittest.TestCase):
                                unknown_upload_seconds=1, unknown_upload_capacity_bytes=50)
             store._set_meta("daily_pre18:2026-09-01", json.dumps({"a": 400}))
         row = list(csv.DictReader(io.StringIO(self.controller.report_csv("daily", "2026-09-01"))))[0]
-        self.assertEqual(row["target_download_bytes"], "300")
+        self.assertEqual(row["target_download_bytes"], "2700000000000")
+        self.assertEqual(row["minimum_download_bytes"], "2700000000000")
+        self.assertEqual(row["maximum_download_bytes"], "2700000000000")
+        self.assertEqual(row["minimum_met"], "0")
         self.assertEqual(row["pre18_met"], "1")
-        self.assertEqual(row["full_day_met"], "1")
+        self.assertEqual(row["full_day_met"], "0")
         self.assertEqual(row["upload_bytes"], "100")  # Unknown budget is not actual upload.
 
     def test_views_are_cached_by_minute_and_invalidated_after_configuration(self):
@@ -51,6 +54,23 @@ class DailyReportTests(unittest.TestCase):
             self.assertEqual(calculate.call_count, 2)
             self.controller._daily_snapshot(now.replace(minute=1))
             self.assertEqual(calculate.call_count, 3)
+
+    def test_report_and_csv_share_upper_prediction_and_fixed_floor(self):
+        store = self.controller.store
+        at = datetime(2026, 9, 1, 23, tzinfo=ZoneInfo("Asia/Shanghai"))
+        with store.db:
+            store._add_traffic('a', int(at.timestamp() // 60),
+                               measured_upload=2_000_000_000_000, measured_download=3_000_000_000_000)
+        before = store.daily_totals(at.date())
+        report = store.daily_report(at.date())['a']
+        row = list(csv.DictReader(io.StringIO(self.controller.report_csv('daily', '2026-09-01'))))[0]
+        self.assertEqual(report['target_download_bytes'], 4_000_000_000_000)
+        self.assertEqual(report['minimum_download_bytes'], 2_700_000_000_000)
+        self.assertTrue(report['minimum_achieved'])
+        self.assertFalse(report['final_achieved'])
+        self.assertEqual(int(row['target_download_bytes']), report['maximum_download_bytes'])
+        self.assertEqual(row['minimum_met'], '1')
+        self.assertEqual(store.daily_totals(at.date()), before)
 
     def test_legacy_csv_cannot_replace_confirmed_inventory_and_daily_mode_cannot_be_disabled(self):
         with self.assertRaises(ValueError):

@@ -139,19 +139,16 @@ class WanBudgetTests(unittest.TestCase):
 
 
 class WholeLineAllocationTests(unittest.TestCase):
-    def test_surplus_tiers_yield_to_primary_and_stop_at_three(self):
-        accounts = [self.account(name) for name in ['primary', 'extra', 'higher', 'done']]
+    def test_completed_upper_target_does_not_receive_surplus_or_forced_downloads(self):
+        accounts = [self.account(name) for name in ['primary', 'done']]
         groups = [FleetGroup('standard', '普通', 4000, 20)]
         forecasts = {
             'primary': {'remaining_download_bytes': 1},
-            'extra': {'remaining_download_bytes': 0, 'predicted_upload_bytes': 1000000000, 'today_download_bytes': 2000000000},
-            'higher': {'remaining_download_bytes': 0, 'predicted_upload_bytes': 1000000000, 'today_download_bytes': 2500000000},
-            'done': {'remaining_download_bytes': 0, 'predicted_upload_bytes': 1000000000, 'today_download_bytes': 3000000000},
+            'done': {'remaining_download_bytes': 0, 'predicted_upload_bytes': 1000000000,
+                     'today_download_bytes': 2000000000},
         }
-        self.assertEqual(allocate_daily(accounts, groups, forecasts, 200, {}, {}, keep=['higher'], surplus_seconds=3600), {'primary': 200})
-        self.assertEqual(list(allocate_daily(accounts, groups, forecasts, 600, {}, {}, surplus_seconds=3600)), ['primary', 'extra', 'higher'])
-        self.assertEqual(allocate_daily(accounts, groups, forecasts, 600, {}, {}, surplus_seconds=1), {'primary': 200})
-        self.assertEqual(allocate_daily(accounts, groups, forecasts, 600, {}, {}), {'primary': 200})
+        self.assertEqual(allocate_daily(accounts, groups, forecasts, 600, {}, {}, keep=['done'], force=['done']),
+                         {'primary': 200})
 
     @staticmethod
     def account(name, weight=1, group="standard"):
@@ -275,7 +272,7 @@ class DailyControllerTests(unittest.TestCase):
                 "expires_at": "2026-10-04T00:00:00+08:00", "max_mbps": 2000,
             }))
 
-    def test_tonight_override_only_runs_requested_lines_even_after_targets_are_met(self):
+    def test_tonight_override_stops_at_upper_target(self):
         now = moment(19)
         self.import_accounts([("adsl1001", 10), ("adsl1002", 10), ("other", 1)])
         for name in ("adsl1001", "adsl1002"):
@@ -283,8 +280,8 @@ class DailyControllerTests(unittest.TestCase):
         self.set_override(now)
         self.set_budget(4800, now)
         self.schedule(now)
-        self.assertEqual(set(self.controller.active), {"adsl1001", "adsl1002"})
-        self.assertEqual(sum(x.assigned_mbps for x in self.controller.active.values()), 1000)
+        self.assertFalse(self.controller.active)
+        self.assertEqual(sum(x.assigned_mbps for x in self.controller.active.values()), 0)
         self.assertEqual(self.controller._router_snapshot(now)["phase_limit_mbps"], 2000)
 
     def test_tonight_override_expires_at_midnight_and_preserves_next_day_policy(self):

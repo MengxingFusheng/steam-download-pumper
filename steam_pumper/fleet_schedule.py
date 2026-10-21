@@ -83,7 +83,6 @@ def allocate_daily(
     budget: float, allocated: Mapping[str, int], last_started: Mapping[str, int],
     keep: Iterable[str] = (),
     force: Iterable[str] = (),
-    surplus_seconds: float = 0,
 ) -> dict[str, float]:
     """Allocate <=20 engines, bounded by profile, group count/rate and WAN budget."""
     group_map = {group.group_id: group for group in groups if group.enabled}
@@ -93,20 +92,13 @@ def allocate_daily(
     for account in accounts:
         view = forecasts.get(account.account_id, {})
         debt = view.get("remaining_download_bytes", 0)
-        tier = 0
-        if debt <= 0 and surplus_seconds > 0:
-            predicted = view.get("predicted_upload_bytes", 0)
-            downloaded = view.get("today_download_bytes", 0)
-            for tier, ratio in ((1, 2.5), (2, 3.0)):
-                debt = max(0, int(predicted * ratio) - downloaded)
-                if debt > 0:
-                    break
-            # Only attempt extra traffic that can fit before the upload window.
-            if debt * 8 / (account.download_mbps * 1_000_000) > surplus_seconds:
-                debt = 0
+        minimum_debt = view.get("remaining_minimum_download_bytes", debt)
+        tier = 0 if minimum_debt > 0 else 1
+        if tier == 0:
+            debt = min(debt, minimum_debt)
         needs[account.account_id] = (tier, debt)
     candidates = [account for account in accounts if account.group_id in group_map
-                  and (account.account_id in forced or needs[account.account_id][1] > 0)]
+                  and needs[account.account_id][1] > 0]
     protected = set(keep)
     def priority(account: Any) -> tuple[Any, ...]:
         tier, debt = needs[account.account_id]

@@ -7,6 +7,26 @@ from statistics import median
 from typing import Any, Iterable, Mapping
 
 
+def download_targets(*, upload_mbps: float, predicted_upload_bytes: int,
+                     download_bytes: int, target_ratio: float) -> dict[str, Any]:
+    """A whole-day six-hour nominal floor, with the forecast as the upper goal."""
+    nominal_upload = int(upload_mbps * 1_000_000 / 8 * 6 * 3600)
+    minimum = int(nominal_upload * target_ratio)
+    predicted = int(predicted_upload_bytes * target_ratio)
+    maximum = max(minimum, predicted)
+    return {
+        "minimum_upload_bytes": nominal_upload,
+        "minimum_download_bytes": minimum,
+        "predicted_download_bytes": predicted,
+        "maximum_download_bytes": maximum,
+        "target_download_bytes": maximum,
+        "remaining_minimum_download_bytes": max(0, minimum - download_bytes),
+        "minimum_achieved": download_bytes >= minimum,
+        "remaining_download_bytes": max(0, maximum - download_bytes),
+        "target_progress_percent": min(100.0, download_bytes * 100.0 / maximum) if maximum else 100.0,
+    }
+
+
 def history_model(rows: Iterable[Mapping[str, Any]]) -> dict[str, dict[int, float]]:
     """Normalize each historical day using its recorded bandwidth profile.
 
@@ -75,7 +95,6 @@ def daily_prediction(
     recorded_upload = int(totals.get("upload", measured_upload + estimated_upload))
     unknown_budget = max(0, int(totals.get("unknown_upload_capacity", 0)))
     predicted_upload = recorded_upload + unknown_budget + int(future)
-    target = int(predicted_upload * target_ratio)
     download = int(totals.get("download", 0))
     quality = "historical" if fallback_seconds == 0 else ("cold-start" if predicted_seconds == 0 else "mixed")
     return {
@@ -91,13 +110,12 @@ def daily_prediction(
         "unknown_upload_budget_bytes": unknown_budget,
         "future_upload_bytes": int(future),
         "predicted_upload_bytes": predicted_upload,
-        "target_download_bytes": target,
-        "remaining_download_bytes": max(0, target - download),
+        **download_targets(upload_mbps=upload_mbps, predicted_upload_bytes=predicted_upload,
+                           download_bytes=download, target_ratio=target_ratio),
         "forecast_quality": quality,
         "forecast_historical_seconds": int(predicted_seconds),
         "forecast_fallback_seconds": int(fallback_seconds),
         "forecast_upload_ceiling_mbps": maximum_utilization * upload_mbps,
         "forecast_evening_fallback_mbps": upload_mbps * min(maximum_utilization, fallback_utilization),
         "ratio": download / recorded_upload if recorded_upload else None,
-        "target_progress_percent": min(100.0, download * 100.0 / target) if target else 100.0,
     }
