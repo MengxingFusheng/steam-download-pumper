@@ -117,7 +117,49 @@ function renderLines(){
   $('linePrev').disabled=linePage===0;$('lineNext').disabled=(linePage+1)*50>=lines.length;
 }
 function svg(tag,attrs={}){const n=document.createElementNS('http://www.w3.org/2000/svg',tag);for(const [k,v] of Object.entries(attrs))n.setAttribute(k,v);return n;}
-async function loadSeries(){const selected=nodeId,line=$('chartLine').value;const data=await api(`/nodes/${selected}/series`+(line?'?line_id='+encodeURIComponent(line):''));if(nodeId!==selected||line!==$('chartLine').value)return;const points=data.points;$('actualCurveLabel').textContent=current.snapshot.mode==='multi_ip'?'● SNMP 未接入':'● SNMP 下行';$('programCurveLabel').textContent=current.snapshot.mode==='multi_ip'?'● 下载统计':'● 拉流进程';const chart=svg('svg',{viewBox:'0 0 1000 280',role:'img','aria-label':current.snapshot.mode==='multi_ip'?'最近24小时下载统计折线，未接入SNMP，详细数值见下方表格':'最近24小时SNMP与拉流下载速度曲线，详细数值见下方表格'});const max=Math.max(1,...points.flatMap(p=>[p.actual_mbps||0,p.program_mbps||0]))*1.15,x=i=>60+i*920/Math.max(1,points.length-1),y=v=>230-v/max*210;for(let i=0;i<=4;i++){const yy=y(max*i/4);chart.append(svg('line',{x1:60,x2:980,y1:yy,y2:yy,class:'grid'}));const text=svg('text',{x:4,y:yy+4});text.textContent=(max*i/4).toFixed(0);chart.append(text);}for(let i=0;i<points.length;i+=24){const text=svg('text',{x:x(i),y:263});text.textContent=clock(points[i].start);chart.append(text);}for(const [key,cls] of [['actual_mbps','actual'],['program_mbps','program']]){let segment=[];const flush=()=>{if(segment.length)chart.append(svg('polyline',{points:segment.join(' '),class:cls}));segment=[];};points.forEach((p,i)=>{if(p[key]==null){flush();return;}segment.push(x(i)+','+y(p[key]));if(key==='actual_mbps'){const circle=svg('circle',{cx:x(i),cy:y(p[key]),r:3,class:'point'}),title=svg('title');title.textContent=`${stamp(p.start)} · ${p[key].toFixed(2)} Mbps · 未知 ${p.unknown_seconds}s · ${p.reporting_lines} 条线路`;circle.append(title);chart.append(circle);}});flush();}$('chart').replaceChildren(chart);if(points.every(p=>p.actual_mbps==null&&p.program_mbps==null))$('chart').append(el('p','暂无已完成的10分钟采集区间。','muted'));$('chartRows').replaceChildren();for(const p of points){const row=el('tr');for(const value of [stamp(p.start),p.actual_mbps==null?(current.snapshot.mode==='multi_ip'?'未接入':'缺失'):p.actual_mbps.toFixed(2),p.program_mbps==null?'缺失':p.program_mbps.toFixed(2),p.unknown_seconds??'—',bytes(p.expected_bytes),p.reporting_lines??'—'])row.append(el('td',value));$('chartRows').append(row);}}
+function chartHover(chart,points,x,y,multiIp){
+  if(!points.length)return;
+  const host=$('chart'),tip=el('div',null,'fleet-chart-tooltip');
+  tip.setAttribute('role','tooltip');tip.hidden=true;host.append(tip);
+  const guide=svg('line',{y1:20,y2:230,class:'chart-guide',visibility:'hidden'});
+  const markers=['actual','program'].map(kind=>svg('circle',{r:4,class:'chart-marker '+kind,visibility:'hidden'}));
+  chart.append(guide,...markers);
+  let selected=points.length-1;
+  const hide=()=>{tip.hidden=true;guide.setAttribute('visibility','hidden');markers.forEach(marker=>marker.setAttribute('visibility','hidden'));};
+  const show=index=>{
+    selected=index;const point=points[index],xx=x(index);
+    tip.replaceChildren(el('strong',stamp(point.start)+' – '+clock(point.end??point.start+600)),el('small','北京时间 · 10 分钟区间均速'));
+    for(const [key,label,kind] of [['actual_mbps','SNMP 下行','actual'],['program_mbps',multiIp?'下载统计':'拉流进程','program']]){
+      const value=point[key],row=el('div',null,'fleet-chart-tooltip-row');
+      row.append(el('span',label,'chart-label-'+kind),el('b',value==null?(key==='actual_mbps'&&multiIp?'未接入':'缺失'):Number(value).toFixed(2)+' Mbps'));
+      tip.append(row);
+    }
+    tip.append(el('small','未知 '+(point.unknown_seconds??'—')+' 秒 · 上报 '+(point.reporting_lines??'—')+' 条线路'));
+    guide.setAttribute('x1',xx);guide.setAttribute('x2',xx);guide.setAttribute('visibility','visible');
+    markers.forEach((marker,i)=>{const value=point[i===0?'actual_mbps':'program_mbps'];marker.setAttribute('visibility',value==null?'hidden':'visible');if(value!=null){marker.setAttribute('cx',xx);marker.setAttribute('cy',y(value));}});
+    tip.hidden=false;
+    const anchor=chart.createSVGPoint();anchor.x=xx;anchor.y=20;
+    const screen=anchor.matrixTransform(chart.getScreenCTM()),bounds=host.getBoundingClientRect();
+    const left=screen.x-bounds.left+12;
+    tip.style.left=Math.max(0,Math.min(left,host.clientWidth-tip.offsetWidth))+'px';
+    tip.style.top=Math.max(0,screen.y-bounds.top+8)+'px';
+  };
+  chart.addEventListener('pointermove',event=>{
+    const cursor=chart.createSVGPoint();cursor.x=event.clientX;cursor.y=event.clientY;
+    const at=cursor.matrixTransform(chart.getScreenCTM().inverse());
+    if(at.x<59.5||at.x>980.5||at.y<19.5||at.y>230.5){hide();return;}
+    show(Math.max(0,Math.min(points.length-1,Math.round((at.x-60)/920*(points.length-1)))));
+  });
+  chart.addEventListener('pointerleave',hide);
+  chart.setAttribute('tabindex','0');
+  chart.addEventListener('focus',()=>show(selected));chart.addEventListener('blur',hide);
+  chart.addEventListener('keydown',event=>{
+    if(event.key==='Escape'){hide();return;}
+    if(!['ArrowLeft','ArrowRight','Home','End'].includes(event.key))return;
+    event.preventDefault();show(event.key==='Home'?0:event.key==='End'?points.length-1:Math.max(0,Math.min(points.length-1,selected+(event.key==='ArrowRight'?1:-1))));
+  });
+}
+async function loadSeries(){const selected=nodeId,line=$('chartLine').value;const data=await api(`/nodes/${selected}/series`+(line?'?line_id='+encodeURIComponent(line):''));if(nodeId!==selected||line!==$('chartLine').value)return;const points=data.points;$('actualCurveLabel').textContent=current.snapshot.mode==='multi_ip'?'● SNMP 未接入':'● SNMP 下行';$('programCurveLabel').textContent=current.snapshot.mode==='multi_ip'?'● 下载统计':'● 拉流进程';const chart=svg('svg',{viewBox:'0 0 1000 280',role:'img','aria-label':current.snapshot.mode==='multi_ip'?'最近24小时下载统计折线，未接入SNMP，详细数值见下方表格':'最近24小时SNMP与拉流下载速度曲线，详细数值见下方表格'});const max=Math.max(1,...points.flatMap(p=>[p.actual_mbps||0,p.program_mbps||0]))*1.15,x=i=>60+i*920/Math.max(1,points.length-1),y=v=>230-v/max*210;for(let i=0;i<=4;i++){const yy=y(max*i/4);chart.append(svg('line',{x1:60,x2:980,y1:yy,y2:yy,class:'grid'}));const text=svg('text',{x:4,y:yy+4});text.textContent=(max*i/4).toFixed(0);chart.append(text);}for(let i=0;i<points.length;i+=24){const text=svg('text',{x:x(i),y:263});text.textContent=clock(points[i].start);chart.append(text);}for(const [key,cls] of [['actual_mbps','actual'],['program_mbps','program']]){let segment=[];const flush=()=>{if(segment.length)chart.append(svg('polyline',{points:segment.join(' '),class:cls}));segment=[];};points.forEach((p,i)=>{if(p[key]==null){flush();return;}segment.push(x(i)+','+y(p[key]));if(key==='actual_mbps'){const circle=svg('circle',{cx:x(i),cy:y(p[key]),r:3,class:'point'}),title=svg('title');title.textContent=`${stamp(p.start)} · ${p[key].toFixed(2)} Mbps · 未知 ${p.unknown_seconds}s · ${p.reporting_lines} 条线路`;circle.append(title);chart.append(circle);}});flush();}$('chart').replaceChildren(chart);chartHover(chart,points,x,y,current.snapshot.mode==='multi_ip');if(points.every(p=>p.actual_mbps==null&&p.program_mbps==null))$('chart').append(el('p','暂无已完成的10分钟采集区间。','muted'));$('chartRows').replaceChildren();for(const p of points){const row=el('tr');for(const value of [stamp(p.start),p.actual_mbps==null?(current.snapshot.mode==='multi_ip'?'未接入':'缺失'):p.actual_mbps.toFixed(2),p.program_mbps==null?'缺失':p.program_mbps.toFixed(2),p.unknown_seconds??'—',bytes(p.expected_bytes),p.reporting_lines??'—'])row.append(el('td',value));$('chartRows').append(row);}}
 async function loadPeriods(){
   const selected=nodeId,day=$('periodDate').value,data=await api(`/nodes/${selected}/periods?day=${encodeURIComponent(day)}`);
   if(selected!==nodeId||day!==$('periodDate').value)return;$('periods').replaceChildren();
