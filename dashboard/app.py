@@ -109,6 +109,12 @@ def create_app(env=None):
         raise ValueError('management token must contain 32+ characters')
     username = env.get('DASHBOARD_ADMIN_USER', 'admin')
     password_hash = secret_setting(env, 'DASHBOARD_ADMIN_PASSWORD_HASH')
+    viewer_username = env.get('DASHBOARD_VIEWER_USER', '')
+    viewer_hash = secret_setting(env, 'DASHBOARD_VIEWER_PASSWORD_HASH')
+    if (bool(viewer_username) != bool(viewer_hash) or viewer_username and
+            (viewer_username == username or not viewer_hash.startswith('scrypt$'))):
+        store.close()
+        raise ValueError('configure a distinct viewer username and scrypt password hash together')
     if len(enrollment) < 32 or not password_hash.startswith('scrypt$') or len(read_token) < 32:
         store.close()
         raise ValueError('configure enrollment token, read token (32+ characters) and scrypt admin password hash')
@@ -122,17 +128,25 @@ def create_app(env=None):
     app = FastAPI(title='Fleet Dashboard API', version='1.0.0', lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None)
     app.state.store = store
 
-    def admin(credentials: Annotated[HTTPBasicCredentials | None, Depends(basic)]):
+    def login_account(credentials):
         if credentials and secrets.compare_digest(credentials.username.encode(), username.encode()) and verify_password(credentials.password, password_hash):
-            return username
+            return username, 'admin'
+        if credentials and viewer_username and secrets.compare_digest(credentials.username.encode(), viewer_username.encode()) and verify_password(credentials.password, viewer_hash):
+            return viewer_username, 'viewer'
         raise HTTPException(401, 'authentication required', headers={'WWW-Authenticate': 'Basic realm="Fleet Dashboard"'})
+
+    def admin(credentials: Annotated[HTTPBasicCredentials | None, Depends(basic)]):
+        name, role = login_account(credentials)
+        if role != 'admin':
+            raise HTTPException(403, 'read-only account')
+        return name
 
     def reader(credentials: Annotated[HTTPAuthorizationCredentials | None, Depends(bearer)],
                login: Annotated[HTTPBasicCredentials | None, Depends(basic)]):
         if credentials and (secrets.compare_digest(credentials.credentials.encode(), read_token.encode())
                             or (management_token and secrets.compare_digest(credentials.credentials.encode(), management_token.encode()))):
             return 'integration'
-        return admin(login)
+        return login_account(login)[0]
 
     def node_auth(credentials: Annotated[HTTPAuthorizationCredentials | None, Depends(bearer)]):
         node = store.node_by_token(credentials.credentials) if credentials else None
