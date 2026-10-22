@@ -47,6 +47,19 @@ class AgentTests(unittest.TestCase):
         tomorrow = export_snapshot(self.controller, now + timedelta(days=1), {})
         self.assertTrue(all(p['evening_override'] == [] for p in tomorrow['periods']))
 
+    def test_completed_day_correction_invalidates_daily_history_cache(self):
+        now = datetime(2026, 10, 22, 12, tzinfo=TZ)
+        minute = int((now-timedelta(days=1)).timestamp())//60
+        with self.controller.store.db:
+            self.controller.store._add_traffic('a',minute,measured_upload=100,measured_download=200,sample_seconds=60)
+        self.agent.tick(self.controller,now,100)
+        self.assertEqual(json.loads(self.agent.get('snapshot'))['daily_history'][-1]['upload_bytes'],100)
+        with self.controller.store.db:
+            self.controller.store._add_traffic('a',minute,measured_upload=50,measured_download=50,sample_seconds=60)
+        self.agent.invalidate_since(minute*60)
+        self.agent.tick(self.controller,now+timedelta(seconds=30),140)
+        self.assertEqual(json.loads(self.agent.get('snapshot'))['daily_history'][-1]['upload_bytes'],150)
+
     def test_export_uses_daily_schedule_and_projects_source_application_status(self):
         now = datetime(2026, 10, 19, 12, tzinfo=TZ)
         with patch.object(self.controller, 'source_list_status', return_value={

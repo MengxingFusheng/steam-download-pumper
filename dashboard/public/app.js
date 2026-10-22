@@ -85,7 +85,7 @@ async function overview(){
     for(const [label,value] of [[(node.snapshot.mode==='multi_ip'?(node.snapshot.stats_source==='interface_fallback'?'当日下载 · 接口统计':'当日下载 · 程序统计'):'当日实际下载'),s.actual_bytes],['预计下载目标',s.target_bytes]]){
       const n=el('div',label);n.append(el('strong',bytes(value)));values.append(n);
     }
-    card.append(values,completionMeter(s.actual_bytes,s.target_bytes,'当日下载完成度','',s));
+    card.append(values,completionMeter(s.actual_bytes,s.target_bytes,'当日下载完成度','',s));card.append(yesterdayTotals(node.yesterday));
     const uploads=el('div',null,'values uploads'),liveUpload=uploadView(node.snapshot,node.online);
     for(const [label,value] of [['当日累计上传',bytes(s.upload_bytes)],[liveUpload.label,liveUpload.value]]){
       const n=el('div',label);n.append(el('strong',value));uploads.append(n);
@@ -117,6 +117,72 @@ function renderLines(){
   $('linePrev').disabled=linePage===0;$('lineNext').disabled=(linePage+1)*50>=lines.length;
 }
 function svg(tag,attrs={}){const n=document.createElementNS('http://www.w3.org/2000/svg',tag);for(const [k,v] of Object.entries(attrs))n.setAttribute(k,v);return n;}
+function yesterdayTotals(value){
+  const box=el('div',null,'daily-yesterday');
+  box.append(el('small','昨日 · '+(value?.date?.slice(5).replace('-','/')||'等待上报')));
+  for(const [key,label,kind] of [['download_bytes','下载','download'],['upload_bytes','上传','upload']]){
+    const row=el('span',null,'daily-total-'+kind);
+    row.append(el('span',label),el('strong',value?.[key]==null?'缺失':bytes(value[key])));box.append(row);
+  }
+  return box;
+}
+function renderDailyTraffic(days,yesterday){
+  let panel=$('dailyTrafficPanel');
+  if(!panel){
+    panel=el('article',null,'panel daily-traffic-panel');panel.id='dailyTrafficPanel';
+    $('chart').closest('article').before(panel);
+  }
+  panel.dataset.nodeId=nodeId;
+  panel.replaceChildren(el('h2','最近 14 天上传下载总量'),el('p','北京时间 · 截至昨日的完整自然日 · 已记录量含估算，缺失不补零','muted'),yesterdayTotals(yesterday));
+  const legend=el('div',null,'legend');legend.append(el('span','● 下载','daily-total-download'),el('span','● 上传','daily-total-upload'));panel.append(legend);
+  const scroll=el('div',null,'daily-bars-scroll'),chart=svg('svg',{viewBox:'0 0 1000 300',role:'group','aria-label':'最近14个完整自然日上传、下载已记录总量柱状图'});
+  const tooltip=el('div',null,'fleet-chart-tooltip');tooltip.id='dailyTrafficTooltip';tooltip.setAttribute('role','tooltip');tooltip.hidden=true;
+  const maximum=Math.max(1,...days.flatMap(day=>[day.download_bytes||0,day.upload_bytes||0]))*1.12;
+  const unit=maximum>=1024**4?1024**4:1024**3,unitName=unit===1024**4?'TiB':'GiB',step=920/Math.max(1,days.length),height=value=>value/maximum*210;
+  for(let i=0;i<=4;i++){
+    const yy=240-i*210/4;chart.append(svg('line',{x1:60,x2:980,y1:yy,y2:yy,class:'daily-grid'}));
+    const text=svg('text',{x:52,y:yy+4,'text-anchor':'end'});text.textContent=(maximum*i/4/unit).toFixed(1);chart.append(text);
+  }
+  const axis=svg('text',{x:8,y:16});axis.textContent=unitName;chart.append(axis);
+  const show=(day,index)=>{
+    tooltip.replaceChildren(el('strong',day.date+' · 北京时间'));
+    for(const [key,label,kind] of [['download_bytes','下载','download'],['upload_bytes','上传','upload']]){
+      const row=el('div',null,'fleet-chart-tooltip-row');row.append(el('span',label,'daily-total-'+kind),el('b',day[key]==null?'缺失':bytes(day[key])));tooltip.append(row);
+    }
+    const estimated=(day.estimated_upload_bytes||0)+(day.estimated_download_bytes||0);
+    tooltip.append(el('small',estimated?'含估算：下载 '+bytes(day.estimated_download_bytes)+' / 上传 '+bytes(day.estimated_upload_bytes):'已记录账本总量'));
+    tooltip.append(el('small','记录 '+(day.observed_minutes||0)+' / 1440 分钟 · 未知 '+(day.unknown_seconds||0)+' 秒'));
+    tooltip.hidden=false;
+    const anchor=chart.createSVGPoint();anchor.x=60+(index+.5)*step;anchor.y=30;
+    const at=anchor.matrixTransform(chart.getScreenCTM()),bounds=panel.getBoundingClientRect();
+    tooltip.style.left=Math.max(0,Math.min(at.x-bounds.left+10,panel.clientWidth-tooltip.offsetWidth))+'px';
+    tooltip.style.top=Math.max(0,at.y-bounds.top+8)+'px';
+  };
+  days.forEach((day,index)=>{
+    const group=svg('g',{tabindex:0,role:'img','aria-label':day.date+'，下载 '+(day.download_bytes==null?'缺失':bytes(day.download_bytes))+'，上传 '+(day.upload_bytes==null?'缺失':bytes(day.upload_bytes)),'data-date':day.date});
+    for(const [key,kind,offset] of [['download_bytes','download',-21],['upload_bytes','upload',1]]){
+      const value=day[key],xx=60+(index+.5)*step+offset;
+      if(value==null){const mark=svg('text',{x:xx+9,y:234,'text-anchor':'middle',class:'daily-missing'});mark.textContent='—';group.append(mark);}
+      else group.append(svg('rect',{x:xx,y:240-Math.max(1,height(value)),width:18,height:Math.max(1,height(value)),rx:2,class:'daily-bar-'+kind,'data-bytes':value}));
+    }
+    group.append(svg('rect',{x:60+index*step,y:25,width:step,height:220,fill:'transparent'}));
+    const label=svg('text',{x:60+(index+.5)*step,y:266,'text-anchor':'middle'});label.textContent=day.date.slice(5).replace('-','/');group.append(label);
+    group.addEventListener('pointermove',()=>show(day,index));group.addEventListener('focus',()=>show(day,index));group.addEventListener('blur',()=>{tooltip.hidden=true;});group.addEventListener('keydown',event=>{if(event.key==='Escape')tooltip.hidden=true;});chart.append(group);
+  });
+  chart.addEventListener('pointerleave',()=>{tooltip.hidden=true;});scroll.append(chart);panel.append(scroll,tooltip);
+  const details=el('details'),wrap=el('div',null,'table-wrap'),table=el('table'),head=el('tr');
+  for(const title of ['日期（北京时间）','下载总量','上传总量','估算下载 / 上传','记录分钟 / 未知秒数'])head.append(el('th',title));
+  const thead=el('thead');thead.append(head);table.append(thead);const body=el('tbody');body.id='dailyTrafficRows';
+  for(const day of days){const row=el('tr');for(const value of [day.date,day.download_bytes==null?'缺失':bytes(day.download_bytes),day.upload_bytes==null?'缺失':bytes(day.upload_bytes),bytes(day.estimated_download_bytes)+' / '+bytes(day.estimated_upload_bytes),(day.observed_minutes||0)+' / '+(day.unknown_seconds||0)])row.append(el('td',value));body.append(row);}
+  table.append(body);wrap.append(table);details.append(el('summary','查看每日数据'),wrap);panel.append(details);
+}
+async function loadDailyTraffic(){
+  const selected=nodeId,previous=$('dailyTrafficPanel');
+  if(previous&&previous.dataset.nodeId!==selected)previous.remove();
+  const data=await api(`/nodes/${selected}/daily-traffic`);
+  if(selected!==nodeId)return;
+  renderDailyTraffic(data.days,data.days[data.days.length-1]);
+}
 function chartHover(chart,points,x,y,multiIp){
   if(!points.length)return;
   const host=$('chart'),tip=el('div',null,'fleet-chart-tooltip');
@@ -213,7 +279,7 @@ async function detail(){
   options($('chartLine'),(s.lines||[]).map(l=>[l.line_id,l.line_id]),'全部线路');
   options($('groupFilter'),[...new Set((s.lines||[]).map(l=>l.group_id))].map(g=>[g,g]),'全部分组');
   renderSourceStatus(s);renderDiagnostics(s);
-  $('nodeControls').hidden=Array.isArray(s.capabilities)&&s.capabilities.length===0;renderLines();renderConfig();await Promise.all([loadSeries(),loadPeriods(),loadCommands()]);
+  $('nodeControls').hidden=Array.isArray(s.capabilities)&&s.capabilities.length===0;renderLines();renderConfig();await Promise.all([loadSeries(),loadPeriods(),loadCommands(),loadDailyTraffic()]);
 }
 async function sendCommand(action,params={}){if(busy||!current?.online)return;const description=action==='update_schedule'?'确认修改以下调度参数？\n'+JSON.stringify(params,null,2):action==='start'?'确认允许此节点启动下载？仍遵循现有时段和预算限制。':'确认停止此节点所有拉流下载？';if(!window.confirm(description))return;busy=true;setControlState();try{await api(`/nodes/${nodeId}/commands`,{method:'POST',body:JSON.stringify({action,params,config_version:(action==='update_schedule'?formVersion:current.snapshot.config_version)||''})});formDirty=false;await loadCommands();}catch(e){fail(e);busy=false;setControlState();}}
 async function refresh(){if(refreshing)return;refreshing=true;try{$('error').hidden=true;await(nodeId?detail():overview());$('freshness').textContent='页面更新 '+clock(Date.now()/1000);}catch(e){fail(e);$('freshness').textContent='连接异常';}finally{refreshing=false;if(refreshPending){refreshPending=false;refresh();}}}

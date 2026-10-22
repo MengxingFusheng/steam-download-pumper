@@ -120,6 +120,8 @@ class DashboardAgent:
             return
         targets = json.loads(self.get('targets') or '{}')
         previous = json.loads(self.get('snapshot') or 'null')
+        if self.get('dirty_since'):
+            controller._dashboard_daily_history = None
         snapshot = export_snapshot(controller, now, targets)
         if previous and previous['date'] != snapshot['date']:
             # Finish the previous date from its actual ledger and captured config.

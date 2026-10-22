@@ -10,6 +10,42 @@ from .dashboard_protocol import config_version, schedule_config
 SHANGHAI = ZoneInfo('Asia/Shanghai')
 
 
+def daily_history(controller, now):
+    """Recorded ledger totals for fourteen completed Beijing calendar days."""
+    midnight = now.astimezone(SHANGHAI).replace(hour=0, minute=0, second=0, microsecond=0)
+    lower = midnight - timedelta(days=14)
+    cache_key = (lower.date(), int(now.timestamp()) // 600)
+    cached = getattr(controller, '_dashboard_daily_history', None)
+    if cached and cached[0] == cache_key:
+        return cached[1]
+    lower_minute, upper_minute = int(lower.timestamp()) // 60, int(midnight.timestamp()) // 60
+    rows = controller.store.db.execute('''
+        SELECT CAST((minute-?)/1440 AS INTEGER) AS day_index,
+          SUM(upload_bytes+measured_upload_bytes+estimated_upload_bytes) AS upload_bytes,
+          SUM(snmp_download_bytes+measured_download_bytes+estimated_download_bytes) AS download_bytes,
+          SUM(estimated_upload_bytes) AS estimated_upload_bytes,
+          SUM(estimated_download_bytes) AS estimated_download_bytes,
+          SUM(upload_valid_seconds) AS upload_seconds,
+          SUM(COALESCE(download_valid_seconds,CASE WHEN quality IN ('ok','recovered')
+              AND estimated_download_bytes=0 AND unknown_seconds=0 THEN sample_seconds ELSE 0 END)) AS download_seconds,
+          SUM(unknown_seconds) AS unknown_seconds,COUNT(DISTINCT minute) AS observed_minutes
+        FROM traffic WHERE minute>=? AND minute<? GROUP BY day_index
+    ''', (lower_minute, lower_minute, upper_minute)).fetchall()
+    indexed = {row['day_index']: dict(row) for row in rows}
+    result = []
+    for index in range(14):
+        row = indexed.get(index, {})
+        item = {'date': (lower + timedelta(days=index)).date().isoformat()}
+        for direction in ('upload', 'download'):
+            value = row.get(direction + '_bytes', 0)
+            item[direction + '_bytes'] = value if value or row.get(direction + '_seconds') else None
+            item['estimated_' + direction + '_bytes'] = row.get('estimated_' + direction + '_bytes', 0)
+        item.update(unknown_seconds=row.get('unknown_seconds', 0), observed_minutes=row.get('observed_minutes', 0))
+        result.append(item)
+    controller._dashboard_daily_history = (cache_key, result)
+    return result
+
+
 def current_upload_rates(controller, now):
     """Latest accepted SNMP counter deltas; missing or stale samples stay unknown.
 
@@ -157,6 +193,7 @@ def export_snapshot(controller, now, targets):
             'summary': summary, 'lines': lines, 'groups': controller.groups_snapshot(),
             'router_budget': controller._router_snapshot(now), 'periods': period_views(controller, now, targets),
             'source_list': source_list_view(controller.source_list_status()),
+            'daily_history': daily_history(controller, now),
             'diagnostics': metrics.get('diagnostics', []),
             'rolling': {'actual_bytes': metrics['rolling_download_bytes'], 'target_bytes': metrics['rolling_target_download_bytes'],
                         'days': controller.cfg.rolling_days}}

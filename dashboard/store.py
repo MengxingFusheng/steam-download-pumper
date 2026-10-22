@@ -35,6 +35,8 @@ class Store:
           CREATE INDEX IF NOT EXISTS buckets_retention ON buckets(start);
           CREATE TABLE IF NOT EXISTS periods(node_id TEXT, date TEXT, mode TEXT, phase TEXT, payload TEXT NOT NULL,
             PRIMARY KEY(node_id,date,mode,phase));
+          CREATE TABLE IF NOT EXISTS daily_traffic(node_id TEXT, date TEXT, observed_at INTEGER NOT NULL,
+            payload TEXT NOT NULL, PRIMARY KEY(node_id,date));
           CREATE TABLE IF NOT EXISTS commands(id TEXT PRIMARY KEY,node_id TEXT NOT NULL,action TEXT NOT NULL,
             params TEXT NOT NULL,config_version TEXT NOT NULL,actor TEXT NOT NULL,created_at INTEGER NOT NULL,
             expires_at INTEGER NOT NULL,state TEXT NOT NULL,result TEXT,finished_at INTEGER);
@@ -92,6 +94,7 @@ class Store:
             from zoneinfo import ZoneInfo
             date = (datetime.fromtimestamp(now, ZoneInfo('Asia/Shanghai')) - timedelta(days=15)).date().isoformat()
             db.execute('DELETE FROM periods WHERE date<?', (date,))
+            db.execute('DELETE FROM daily_traffic WHERE date<?', (date,))
             db.execute('DELETE FROM commands WHERE created_at<? AND state NOT IN (?,?)', (now - 90 * 86400, 'queued', 'dispatched'))
             self.expire(db, now)
         self.last_prune = now

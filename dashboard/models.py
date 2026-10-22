@@ -122,6 +122,7 @@ class Snapshot(Model):
     rolling: Rolling | None = None
     source_list: SourceList | None = None
     diagnostics: list[dict] = Field(default_factory=list, max_length=1500)
+    daily_history: list['DailyTraffic'] = Field(default_factory=list, max_length=14)
 
     @model_validator(mode='after')
     def classic_accounting(self):
@@ -135,3 +136,16 @@ class Snapshot(Model):
             if self.summary.upload_mbps is not None or any(line.current_upload_mbps is not None for line in self.lines):
                 raise ValueError('multi_ip snapshots cannot claim upload rates')
         return self
+
+
+class DailyTraffic(Model):
+    date: str = Field(pattern=r'^\d{4}-\d{2}-\d{2}$')
+    upload_bytes: int | None = Field(default=None, ge=0, le=10**18)
+    download_bytes: int | None = Field(default=None, ge=0, le=10**18)
+    estimated_upload_bytes: int = Field(default=0, ge=0, le=10**18)
+    estimated_download_bytes: int = Field(default=0, ge=0, le=10**18)
+    unknown_seconds: int = Field(default=0, ge=0)
+    observed_minutes: int = Field(default=0, ge=0, le=1440)
+
+
+Snapshot.model_rebuild()

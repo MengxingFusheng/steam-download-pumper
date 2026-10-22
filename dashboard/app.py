@@ -4,7 +4,8 @@ import secrets
 import time
 import uuid
 from contextlib import asynccontextmanager
-from datetime import date
+from datetime import date, datetime, timedelta
+from zoneinfo import ZoneInfo
 from pathlib import Path
 from typing import Annotated, Literal
 
@@ -157,6 +158,22 @@ def create_app(env=None):
             raise HTTPException(404, 'node not found')
         return node
 
+    def daily_traffic(node_id, days=14):
+        today = datetime.fromtimestamp(time.time(), ZoneInfo('Asia/Shanghai')).date()
+        lower = today - timedelta(days=days)
+        with store.lock:
+            rows = store.db.execute('SELECT date,payload FROM daily_traffic WHERE node_id=? AND date>=? AND date<? ORDER BY date',
+                                    (node_id, lower.isoformat(), today.isoformat())).fetchall()
+        indexed = {row['date']: json.loads(row['payload']) for row in rows}
+        return [indexed.get((lower + timedelta(days=i)).isoformat(), {
+            'date': (lower + timedelta(days=i)).isoformat(), 'upload_bytes': None, 'download_bytes': None,
+            'estimated_upload_bytes': 0, 'estimated_download_bytes': 0, 'unknown_seconds': 0, 'observed_minutes': 0}) for i in range(days)]
+
+    def node_view(node):
+        value = public_node(node)
+        value['yesterday'] = daily_traffic(node['id'], 1)[0]
+        return value
+
     @app.middleware('http')
     async def limits(request, call_next):
         # Bound chunked as well as Content-Length bodies before JSON parsing.
@@ -220,6 +237,13 @@ def create_app(env=None):
             if snapshot['mode'] not in {'daily', 'legacy', 'multi_ip'} or len(snapshot['lines']) > 1500 or len(snapshot['periods']) > 16:
                 raise ValueError('invalid snapshot size/mode')
             encoded = json.dumps(snapshot, allow_nan=False)
+            today = datetime.fromtimestamp(time.time(), ZoneInfo('Asia/Shanghai')).date()
+            report_day = datetime.fromtimestamp(snapshot['observed_at'], ZoneInfo('Asia/Shanghai')).date()
+            history_dates = [date.fromisoformat(item['date']) for item in snapshot['daily_history']]
+            if len(set(history_dates)) != len(history_dates) or any(not today - timedelta(days=15) <= day < report_day or day > today for day in history_dates):
+                raise ValueError('daily history must contain unique completed Beijing days within 15 days')
+            if snapshot['mode'] == 'multi_ip' and any(item['upload_bytes'] is not None for item in snapshot['daily_history']):
+                raise ValueError('program accounting cannot claim SNMP upload totals')
             for period in snapshot['periods']:
                 date.fromisoformat(period['date'])
                 if period['mode'] not in {'daily', 'legacy', 'multi_ip'} or not isinstance(period['phase'], str):
@@ -231,6 +255,11 @@ def create_app(env=None):
             previous = json.loads(node['snapshot'])
             if snapshot['observed_at'] >= previous.get('observed_at', 0):
                 db.execute('UPDATE nodes SET last_seen=?,snapshot=? WHERE id=?', (now, encoded, node['id']))
+                for item in snapshot['daily_history']:
+                    db.execute('''INSERT INTO daily_traffic VALUES (?,?,?,?)
+                        ON CONFLICT(node_id,date) DO UPDATE SET observed_at=excluded.observed_at,payload=excluded.payload
+                        WHERE excluded.observed_at>=daily_traffic.observed_at''',
+                        (node['id'], item['date'], snapshot['observed_at'], json.dumps(item)))
                 for period in snapshot['periods']:
                     db.execute('INSERT INTO periods VALUES (?,?,?,?,?) ON CONFLICT(node_id,date,mode,phase) DO UPDATE SET payload=excluded.payload',
                                (node['id'], period['date'], period['mode'], period['phase'], json.dumps(period)))
@@ -273,7 +302,7 @@ def create_app(env=None):
     def nodes(q: str = Query(default='', max_length=100), status: Literal['all', 'online', 'offline'] = 'all',
               offset: int = Query(default=0, ge=0), limit: int = Query(default=25, ge=1, le=100)):
         with store.lock:
-            rows = [public_node(dict(row)) for row in store.db.execute('SELECT * FROM nodes ORDER BY name,id')]
+            rows = [node_view(dict(row)) for row in store.db.execute('SELECT * FROM nodes ORDER BY name,id')]
         rows = [row for row in rows if q.casefold() in (row['name'] + row['id'] + row['external_id']).casefold()
                 and (status == 'all' or row['online'] == (status == 'online'))]
         totals = {key: sum(row['snapshot'].get('summary', {}).get(key, 0) for row in rows) for key in ('actual_bytes', 'target_bytes', 'remaining_bytes')}
@@ -281,7 +310,12 @@ def create_app(env=None):
 
     @app.get('/api/v1/nodes/{node_id}', dependencies=[Depends(reader)])
     def detail(node_id: uuid.UUID):
-        return public_node(require_node(str(node_id)))
+        return node_view(require_node(str(node_id)))
+
+    @app.get('/api/v1/nodes/{node_id}/daily-traffic', dependencies=[Depends(reader)])
+    def daily_traffic_endpoint(node_id: uuid.UUID):
+        require_node(str(node_id))
+        return {'timezone': 'Asia/Shanghai', 'basis': 'recorded_ledger', 'days': daily_traffic(str(node_id))}
 
     @app.patch('/api/v1/nodes/{node_id}')
     def rename(node_id: uuid.UUID, data: NodeRename, actor=Depends(writing)):

@@ -13,7 +13,7 @@ import tempfile
 import threading
 import time
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from unittest.mock import patch
 from zoneinfo import ZoneInfo
@@ -100,6 +100,39 @@ def verify_translucent_curves(page):
             assert .45 <= style['opacity'] <= .7, style
             assert style['fill'] == 'none', style
     assert page.locator('#chartRows tr').filter(has_text='缺失').count() >= 5
+
+
+def verify_daily_history(page, agent, snapshot):
+    known = copy.deepcopy(snapshot)
+    today = datetime.now(ZoneInfo('Asia/Shanghai')).date()
+    known['daily_history'] = [dict(date=(today-timedelta(days=14-i)).isoformat(),
+        upload_bytes=None if i==0 else 0 if i==1 else (i+1)*1024**3,
+        download_bytes=None if i==0 else 0 if i==1 else (i+1)*2*1024**3,
+        estimated_upload_bytes=0, estimated_download_bytes=0,unknown_seconds=0,observed_minutes=0 if i==0 else 1440) for i in range(14)]
+    agent.request('/heartbeat', {'snapshot':known})
+    page.goto(page.url.split('#')[0]);page.reload()
+    expect(page.locator('#nodes .daily-yesterday')).to_contain_text('28.00 GiB')
+    expect(page.locator('#nodes .daily-yesterday')).to_contain_text('14.00 GiB')
+    page.get_by_role('button',name='天津 · 分时拉流验证节点',exact=True).click()
+    expect(page.locator('#dailyTrafficRows tr')).to_have_count(14)
+    expect(page.locator('#dailyTrafficPanel .daily-yesterday')).to_contain_text('28.00 GiB')
+    assert page.locator('#dailyTrafficPanel .daily-bar-download').count()==13
+    assert page.locator('#dailyTrafficPanel .daily-bar-upload').count()==13
+    for width in [1440,375]:
+        page.set_viewport_size({'width':width,'height':1000})
+        for index in [0,1,13]:
+            group=page.locator('#dailyTrafficPanel g[data-date]').nth(index)
+            group.focus()
+            tip=page.locator('#dailyTrafficTooltip');expect(tip).to_be_visible()
+            expect(tip).to_contain_text(known['daily_history'][index]['date'])
+            expect(tip).to_contain_text('缺失' if index==0 else '0.0 MiB' if index==1 else '28.00 GiB')
+            assert tip.evaluate('e=>Number(getComputedStyle(e).opacity)')==1
+            box=tip.bounding_box();assert box['x']>=0 and box['x']+box['width']<=width+1
+            group.press('Escape');expect(tip).not_to_be_visible()
+        assert page.evaluate('document.documentElement.scrollWidth<=innerWidth')
+        page.locator('#dailyTrafficPanel').screenshot(path=f'/tmp/fleet-daily-history-{width}.png')
+    page.set_viewport_size({'width':1440,'height':1000})
+    agent.request('/heartbeat', {'snapshot':snapshot});page.reload()
 
 
 def verify_completion_and_upload(page, agent, snapshot):
@@ -284,6 +317,7 @@ def verify_route_during_refresh(page, agent, classic_id, classic_name):
         window.fetch=async (...args) => {
             const response=await originalFetch(...args);
             const url=String(args[0]?.url||args[0]);
+            if(url.includes('/daily-traffic')&&!url.includes(oldId))await new Promise(resolve=>setTimeout(resolve,1500));
             if(!delayed&&url.endsWith('/api/v1/nodes/'+oldId+'/commands')) {
                 delayed=true;window.__routeDelayPending=true;
                 await new Promise(resolve=>setTimeout(resolve,1500));
@@ -299,6 +333,8 @@ def verify_route_during_refresh(page, agent, classic_id, classic_name):
         page.locator('#back').click()
         page.get_by_role('button',name=classic_name,exact=True).click()
         expect(page.locator('#nodeName')).to_have_text(classic_name,timeout=5000)
+        expect(page.locator('#dailyTrafficPanel[data-node-id="'+agent.node_id+'"]')).to_have_count(0)
+        expect(page.locator('#dailyTrafficPanel')).to_have_attribute('data-node-id',classic_id)
         assert time.monotonic()-started < 5, 'new-node rendering must not wait for the 15-second refresh'
         assert page.url.split('#')[-1] == classic_id
         expect(page.locator('#lineRows tr')).to_have_count(2)
@@ -365,7 +401,7 @@ def verify_partial_upload_and_classic(page, agent, snapshot, transport):
     classic.update(mode='multi_ip', measurement_basis='program', target_basis='configured_speed',
                    stats_source='program', capabilities=[], config={},
                    config_version=hashlib.sha256(b'{}').hexdigest(), observed_at=int(time.time()),
-                   snmp_status='unavailable', periods=[], rolling=None, groups=[], router_budget={})
+                   snmp_status='unavailable', periods=[], rolling=None, groups=[], router_budget={}, daily_history=[])
     classic['summary'].update(actual_bytes=actual, program_bytes=actual, target_bytes=target,
                               remaining_bytes=target-actual, measured_bytes=0, estimated_bytes=0,
                               legacy_bytes=0, unknown_seconds=0, upload_bytes=None, upload_mbps=None)
@@ -506,6 +542,7 @@ def main():
                 page.on('pageerror',lambda e:errors.append(str(e)))
                 page.goto(base);page.get_by_role('button',name='天津 · 分时拉流验证节点',exact=True).wait_for()
                 verify_completion_and_upload(page,agent,visual_snapshot)
+                verify_daily_history(page,agent,visual_snapshot)
                 verify_partial_upload_and_classic(page,agent,visual_snapshot,transport)
                 page.locator('#lineRows tr').first.wait_for()
                 assert page.locator('#lineRows tr').count()==2
