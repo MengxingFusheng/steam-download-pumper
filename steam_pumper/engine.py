@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import signal
 import subprocess
@@ -21,6 +22,10 @@ class SourceRuntimeState:
     retry_after: str = ""
     retry_in_seconds: int = 0
     last_error: str = ""
+    window_bytes: int = 0
+    active_seconds: float = 0.0
+    sample_seconds: float = 0.0
+    unit_connection_mbps: float = 0.0
 
 
 @dataclass
@@ -40,6 +45,7 @@ class EngineState:
     pending_source_generation: str = ""
     confirmed_source_generation: str = ""
     source_reload_error: str = ""
+    source_reload_started_at: float = 0.0
 
 
 def build_engine_command(
@@ -68,6 +74,8 @@ def build_engine_command(
         str(cfg.worker_restart_jitter_seconds),
         "--status-interval-seconds",
         str(getattr(cfg, "engine_status_seconds", 1)),
+        "--target-mbps",
+        str(line.target_mbps),
     ]
     if line.bind_ip:
         command.extend(["--bind-ip", line.bind_ip])
@@ -93,10 +101,14 @@ class EngineProcess:
         sources_file: str | Path | None = None,
         reject_private_destinations: bool = False,
         source_generation: str = "",
+        fallback_sources: list[str] | None = None,
+        source_health: dict | None = None,
     ) -> None:
         self.cfg = cfg
         self.line = line
         self.sources = list(sources)
+        self.fallback_sources = list(fallback_sources or [])
+        self.source_health = dict(source_health or {})
         self.sources_file = Path(sources_file) if sources_file is not None else None
         self.reject_private_destinations = reject_private_destinations
         self.log = log
@@ -122,6 +134,14 @@ class EngineProcess:
         self.stop_requested = False
         self.state.status = "starting"
         self.state.last_error = ""
+        generation = self.state.pending_source_generation or self.state.confirmed_source_generation
+        self._source_epochs = {}
+        self._output_buffer = ""
+        if generation:
+            self.state.pending_source_generation = generation
+            self.state.confirmed_source_generation = ""
+            self.state.source_reload_started_at = time.monotonic()
+            self._pending_sources = list(self.sources)
         try:
             if self.sources_file is not None:
                 self._write_sources_file(
@@ -181,6 +201,8 @@ class EngineProcess:
             raise ValueError("source generation cannot be empty")
         new_sources = list(sources)
         self._pending_sources = new_sources
+        if self.state.pending_source_generation != generation:
+            self.state.source_reload_started_at = time.monotonic()
         self.state.pending_source_generation = generation
         self.state.source_reload_error = ""
         try:
@@ -192,7 +214,8 @@ class EngineProcess:
         self.sources = new_sources
         process = self.process
         if process is None or process.poll() is not None:
-            self._confirm_source_generation(generation)
+            if self.stop_requested:
+                self._confirm_source_generation(generation)
             return True
         try:
             os.kill(process.pid, signal.SIGHUP)
@@ -212,7 +235,7 @@ class EngineProcess:
     def _confirm_source_generation(self, generation: str) -> None:
         if generation != self.state.pending_source_generation:
             return
-        active = set(self._pending_sources or self.sources)
+        active = set([*(self._pending_sources or self.sources), *self.fallback_sources])
         self.state.source_failures = {
             url: failures for url, failures in self.state.source_failures.items() if url in active
         }
@@ -220,9 +243,11 @@ class EngineProcess:
             url: source_state for url, source_state in self.state.source_states.items() if url in active
         }
         self._source_epochs = {}
+        self.source_health = {url: state for url, state in self.source_health.items() if url in active}
         self.state.confirmed_source_generation = generation
         self.state.pending_source_generation = ""
         self.state.source_reload_error = ""
+        self.state.source_reload_started_at = 0.0
         self._pending_sources = []
 
     def _write_sources_file(
@@ -242,8 +267,13 @@ class EngineProcess:
         try:
             with os.fdopen(descriptor, "w", encoding="utf-8") as temporary:
                 payload: Any = sources_to_write
-                if generation is not None:
-                    payload = {"generation": generation, "sources": sources_to_write}
+                if generation is not None or self.fallback_sources or self.source_health:
+                    payload = {"generation": generation or "local", "sources": sources_to_write}
+                    if self.fallback_sources:
+                        payload["fallback_sources"] = self.fallback_sources
+                    if self.source_health:
+                        allowed = set([*sources_to_write, *self.fallback_sources])
+                        payload["health"] = {url: state for url, state in self.source_health.items() if url in allowed}
                 json.dump(payload, temporary, ensure_ascii=True, separators=(",", ":"))
                 temporary.write("\n")
                 temporary.flush()
@@ -263,6 +293,8 @@ class EngineProcess:
             code = self.process.poll()
             if code is None:
                 return
+            if self.process.stdout is not None:
+                self.process.stdout.close()
             self.process = None
             self.state.pid = None
             if self.stop_requested:
@@ -290,18 +322,30 @@ class EngineProcess:
     def stop(self) -> None:
         self.stop_requested = True
         process = self.process
-        self.process = None
         self.state.pid = None
         if process and process.poll() is None:
             try:
                 os.killpg(os.getpgid(process.pid), signal.SIGTERM)
-                process.wait(timeout=5)
+                deadline = time.monotonic() + 5
+                while True:
+                    self._drain_output()
+                    try:
+                        process.wait(timeout=min(0.1, max(0.001, deadline - time.monotonic())))
+                        break
+                    except subprocess.TimeoutExpired:
+                        if time.monotonic() >= deadline:
+                            raise
             except (OSError, subprocess.TimeoutExpired):
                 if process.poll() is None:
                     try:
                         os.killpg(os.getpgid(process.pid), signal.SIGKILL)
                     except OSError:
                         pass
+        if process is not None:
+            self._drain_output()
+            if process.stdout is not None:
+                process.stdout.close()
+        self.process = None
         self.state.status = "stopped"
 
     def _schedule_restart(self, error: str, now: float | None = None) -> None:
@@ -352,7 +396,7 @@ class EngineProcess:
                 if not generation or generation == self.state.pending_source_generation:
                     self.state.source_reload_error = error[-500:]
                 return
-            if event.get("state") == "reloaded" and isinstance(generation, str):
+            if event.get("state") in {"loaded", "reloaded"} and isinstance(generation, str):
                 self._confirm_source_generation(generation)
             return
         if event_type == "status":
@@ -371,7 +415,7 @@ class EngineProcess:
         if event_type != "source" or not isinstance(event.get("url"), str):
             return
         url = event["url"]
-        if url not in self.sources:
+        if url not in [*self.sources, *self.fallback_sources]:
             return
         generation = event.get("generation")
         current_generation = self.state.confirmed_source_generation
@@ -386,13 +430,14 @@ class EngineProcess:
         if source_epoch < known_epoch:
             return
         self._source_epochs[url] = source_epoch
+        health = event.get("health")
+        if isinstance(health, dict):
+            self.source_health[url] = health
         if event.get("recovered") is True:
-            self.state.source_failures[url] = 0
-            self.state.source_states[url] = SourceRuntimeState()
-            return
+            event = {**event, "state": "healthy", "consecutive_failures": 0, "error": ""}
         error = event.get("error")
         raw_state = event.get("state")
-        state = raw_state if raw_state in {"healthy", "degraded", "quarantined", "probing"} else "degraded"
+        state = raw_state if raw_state in {"unknown", "healthy", "degraded", "quarantined", "probing"} else "degraded"
         failures = event.get("consecutive_failures")
         if not isinstance(failures, int) or isinstance(failures, bool) or failures < 0:
             failures = self.state.source_failures.get(url, 0) + (1 if error else 0)
@@ -414,6 +459,10 @@ class EngineProcess:
             retry_after=retry_after,
             retry_in_seconds=retry_in_seconds,
             last_error=last_error,
+            window_bytes=max(0, event.get("window_bytes", 0)) if isinstance(event.get("window_bytes", 0), int) else 0,
+            **{key: max(0.0, float(event.get(key, 0))) if isinstance(event.get(key, 0), (int, float))
+               and math.isfinite(event.get(key, 0)) else 0.0
+               for key in ("active_seconds", "sample_seconds", "unit_connection_mbps")},
         )
         if isinstance(error, str) and error:
             self.state.last_error = error[-500:]

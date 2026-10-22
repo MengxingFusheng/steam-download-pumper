@@ -200,8 +200,10 @@ def run_scheduler(
                     "publication_failed",
                     consecutive_failures=failures,
                     next_retry_at=due.isoformat(timespec="seconds"),
+                    diagnostics=getattr(service, "last_diagnostics", {}),
                 )
         else:
+            _log_event("publication_succeeded", diagnostics=getattr(service, "last_diagnostics", {}))
             failures = 0
             last_success = clock()
             health["last_success_at"] = last_success.isoformat(timespec="seconds")

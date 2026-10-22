@@ -15,3 +15,15 @@ publisher-secrets/
 fleet-secrets/
 fleet-config/accounts.csv
 publisher-config/
+.env.dashboard
+.env.fleet
+dashboard-secrets/
+dashboard-data/
+certbot/
+# Independent egress collector build outputs and private runtime state.
+collector/*.o
+collector/fleet-egress
+collector/collector.test
+collector/config.json
+collector/secrets/
+collector/data/

@@ -1,0 +1,12 @@
+# Append after the existing integrated dashboard and production override files.
+services:
+  jusha:
+    environment:
+      DASHBOARD_PUBLIC_ORIGIN: https://${DASHBOARD_IP}
+  gateway:
+    ports: !override
+      - '443:443'
+      - '8443:8443'
+      - '3000:3000'
+    volumes:
+      - ./deploy/dashboard-https443.Caddyfile:/etc/caddy/Caddyfile:ro

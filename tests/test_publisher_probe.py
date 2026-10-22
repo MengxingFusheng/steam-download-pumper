@@ -72,7 +72,18 @@ class PublisherProbeTests(unittest.TestCase):
 
         return dial
 
-    def test_source_requires_two_bounded_range_probes(self):
+    def test_direct_download_is_screened_then_fully_measured(self):
+        from source_publisher.probe import probe_candidates
+        from source_publisher.ookla import DOWNLOAD_QUERY
+        url = self.url.replace('/file', '/download') + '?' + DOWNLOAD_QUERY
+        with patch('socket.create_connection', side_effect=self._dial_validated_ip_to_fixture([])):
+            result = probe_candidates([url], resolver=lambda *_args: ('8.8.8.8',))[0]
+        self.assertTrue(result.success)
+        self.assertEqual(result.successful_probes, 3)
+        self.assertGreater(result.bytes_read, 4 * 1024 * 1024)
+        self.assertEqual(_ProbeHandler.ranges, [None] * 5)
+
+    def test_source_uses_three_streamed_range_probes_and_needs_two_successes(self):
         from source_publisher.probe import probe_source
 
         dialed = []
@@ -83,23 +94,25 @@ class PublisherProbeTests(unittest.TestCase):
                 resolver=lambda _host, _port: ("93.184.216.34",),
             )
         self.assertTrue(result.success, result.error)
-        self.assertEqual(_ProbeHandler.ranges, ["bytes=0-8388607", "bytes=0-8388607"])
+        self.assertEqual(_ProbeHandler.ranges, ["bytes=0-67108863"] * 3)
         self.assertEqual(_ProbeHandler.hosts, [
+            f"probe.example:{self.server.server_port}",
             f"probe.example:{self.server.server_port}",
             f"probe.example:{self.server.server_port}",
         ])
         self.assertEqual(dialed, [
             ("93.184.216.34", self.server.server_port),
             ("93.184.216.34", self.server.server_port),
+            ("93.184.216.34", self.server.server_port),
         ])
         self.assertGreaterEqual(result.probe_mbps, 0)
-        self.assertEqual(result.bytes_read, 4 * 1024 * 1024)
+        self.assertEqual(result.bytes_read, 6 * 1024 * 1024)
 
     def test_rejects_failed_or_short_probe(self):
         from source_publisher.probe import probe_source
 
         dialed = []
-        _ProbeHandler.statuses = [206, 500]
+        _ProbeHandler.statuses = [206, 500, 500]
         with patch("socket.create_connection", side_effect=self._dial_validated_ip_to_fixture(dialed)):
             failed = probe_source(
                 self.url, timeout=5, resolver=lambda *_args: ("93.184.216.34",)
@@ -126,8 +139,8 @@ class PublisherProbeTests(unittest.TestCase):
         ):
             result = probe_source(self.url, timeout=5)
         self.assertTrue(result.success, result.error)
-        self.assertEqual(resolver.call_count, 2)
-        self.assertEqual([address[0] for address in dialed], ["93.184.216.34", "93.184.216.34"])
+        self.assertEqual(resolver.call_count, 3)
+        self.assertEqual([address[0] for address in dialed], ["93.184.216.34"] * 3)
 
     def test_mixed_public_and_private_answers_are_rejected_before_dial(self):
         from source_publisher.probe import probe_source
@@ -158,8 +171,9 @@ class PublisherProbeTests(unittest.TestCase):
         self.assertEqual(resolved, [
             "probe.example", "redirected.example",
             "probe.example", "redirected.example",
+            "probe.example", "redirected.example",
         ])
-        self.assertEqual(len(dialed), 4)
+        self.assertEqual(len(dialed), 6)
 
     def test_https_dials_validated_ip_but_uses_original_hostname_for_sni(self):
         from source_publisher.probe import _PinnedHTTPSConnection
@@ -286,6 +300,55 @@ class PublisherProbeTests(unittest.TestCase):
         )
         release.set()
         self.assertLessEqual(dns_threads - baseline, 4)
+
+    def test_two_successful_rounds_survive_one_http_failure(self):
+        from source_publisher.probe import probe_source
+
+        _ProbeHandler.statuses = [206, 500, 206]
+        with patch("socket.create_connection", side_effect=self._dial_validated_ip_to_fixture([])):
+            result = probe_source(self.url, timeout=1, resolver=lambda *_: ("93.184.216.34",))
+        self.assertTrue(result.success)
+        self.assertEqual(result.successful_probes, 2)
+        self.assertAlmostEqual(result.success_rate, 2 / 3)
+
+    def test_probe_payload_is_streamed_and_retains_only_small_prefix(self):
+        from source_publisher.probe import pinned_request
+
+        with patch("socket.create_connection", side_effect=self._dial_validated_ip_to_fixture([])):
+            result = pinned_request(self.url, headers={}, max_bytes=2 * 1024 * 1024,
+                                    timeout=2, resolver=lambda *_: ("93.184.216.34",), discard_body=True)
+        self.assertEqual(result.bytes_read, 2 * 1024 * 1024)
+        self.assertLessEqual(len(result.body), 512)
+
+    def test_screen_visits_every_candidate_then_refines_at_most_40_serially(self):
+        from source_publisher.probe import ProbeResult, probe_candidates
+
+        screen_calls = []
+        refine_calls = []
+        active = 0
+        maximum = 0
+        lock = threading.Lock()
+        def probe(url, **kwargs):
+            nonlocal active, maximum
+            if kwargs.get("rounds") == 1:
+                screen_calls.append(url)
+                self.assertEqual(kwargs["timeout"], 5)
+                self.assertEqual(kwargs["max_bytes"], 2 * 1024 * 1024)
+            else:
+                refine_calls.append(url)
+                with lock:
+                    active += 1
+                    maximum = max(maximum, active)
+                time.sleep(0.001)
+                with lock:
+                    active -= 1
+            return ProbeResult(url, datetime.now(timezone.utc), 200, 2 * 1024 * 1024, True, "")
+        with patch("source_publisher.probe.probe_source", side_effect=probe):
+            results = probe_candidates([f"https://host{i}.example/file" for i in range(200)])
+        self.assertEqual(len(screen_calls), 200)
+        self.assertEqual(len(refine_calls), 40)
+        self.assertEqual(maximum, 1)
+        self.assertEqual(sum(r.success for r in results), 40)
 
     def test_probe_pool_never_exceeds_four_workers(self):
         from source_publisher.probe import ProbeResult, probe_candidates

@@ -17,9 +17,11 @@ from typing import Callable, Iterable, Mapping
 from urllib.parse import urljoin, urlsplit, urlunsplit
 
 from .candidates import resolve_public_ipv4, validate_source_url
+from .ookla import is_ookla_download
 
 
-PROBE_BYTES = 8 * 1024 * 1024
+PROBE_BYTES = 64 * 1024 * 1024
+SCREEN_BYTES = 2 * 1024 * 1024
 MIN_PROBE_BYTES = 2 * 1024 * 1024
 MAX_REDIRECTS = 3
 MAX_WORKERS = 4
@@ -115,6 +117,11 @@ class ProbeResult:
     bytes_read: int
     success: bool
     error: str
+    success_rate: float = 1.0
+    worst_mbps: float = 0.0
+    attempts: int = 0
+    successful_probes: int = 0
+    stage: str = "refine"
 
 
 @dataclass(frozen=True)
@@ -122,6 +129,7 @@ class PinnedResponse:
     status: int
     headers: Mapping[str, str]
     body: bytes
+    bytes_read: int = 0
 
 
 class _PinnedHTTPSConnection(http.client.HTTPSConnection):
@@ -190,11 +198,12 @@ def _validated_addresses(
     resolver: Resolver,
     deadline: float,
     cancel_event: threading.Event,
+    resolved_addresses: tuple[str, ...] | None = None,
 ) -> tuple[str, str, int, str, tuple[str, ...]]:
     parsed = urlsplit(validate_source_url(url))
     hostname = parsed.hostname or ""
     port = parsed.port or (443 if parsed.scheme == "https" else 80)
-    raw_addresses = _resolve_with_deadline(
+    raw_addresses = resolved_addresses if resolved_addresses is not None else _resolve_with_deadline(
         resolver, hostname, port, deadline, cancel_event
     )
     addresses: list[str] = []
@@ -233,11 +242,13 @@ def pinned_request(
     connection_factory: ConnectionFactory = _default_connection_factory,
     deadline: float | None = None,
     cancel_event: threading.Event | None = None,
+    discard_body: bool = False,
+    resolved_addresses: tuple[str, ...] | None = None,
 ) -> PinnedResponse:
     cancellation = cancel_event or threading.Event()
     absolute_deadline = deadline or (time.monotonic() + max(0.1, timeout))
     scheme, hostname, port, target, addresses = _validated_addresses(
-        url, resolver, absolute_deadline, cancellation
+        url, resolver, absolute_deadline, cancellation, resolved_addresses
     )
     _check_deadline(absolute_deadline, cancellation)
     default_port = 443 if scheme == "https" else 80
@@ -281,18 +292,33 @@ def pinned_request(
         response = connection.getresponse()
         response_headers = {name.lower(): value for name, value in response.getheaders()}
         chunks: list[bytes] = []
+        prefix = b""
+        bytes_read = 0
         remaining_bytes = max_bytes
         if response.status not in {301, 302, 303, 307, 308}:
             while remaining_bytes > 0:
-                _check_deadline(absolute_deadline, cancellation)
-                chunk = response.read(min(64 * 1024, remaining_bytes))
+                try:
+                    _check_deadline(absolute_deadline, cancellation)
+                    chunk = response.read(min(64 * 1024, remaining_bytes))
+                except (OSError, http.client.HTTPException):
+                    # A timed probe may use the bytes already received. Cancellation
+                    # and transport failures before its time limit remain failures.
+                    if discard_body and not cancellation.is_set() and time.monotonic() >= absolute_deadline:
+                        break
+                    raise
                 if not chunk:
                     break
-                chunks.append(chunk)
+                if discard_body:
+                    if not prefix:
+                        prefix = chunk[:512]
+                else:
+                    chunks.append(chunk)
+                bytes_read += len(chunk)
                 remaining_bytes -= len(chunk)
-        _check_deadline(absolute_deadline, cancellation)
-        body = b"".join(chunks)
-        return PinnedResponse(response.status, response_headers, body)
+        if cancellation.is_set() or not discard_body:
+            _check_deadline(absolute_deadline, cancellation)
+        body = prefix if discard_body else b"".join(chunks)
+        return PinnedResponse(response.status, response_headers, body, bytes_read)
     finally:
         finished.set()
         if response is not None:
@@ -307,24 +333,27 @@ def _probe_once(
     cancel_event: threading.Event,
     connection_factory: ConnectionFactory,
     deadline: float,
+    max_bytes: int,
 ) -> tuple[int, float]:
     current_url = url
     started = time.monotonic()
     for redirect_count in range(MAX_REDIRECTS + 1):
         _check_deadline(deadline, cancel_event)
+        headers = {"Accept-Encoding": "identity", "User-Agent": "pumper-source-publisher/1"}
+        if urlsplit(current_url).path == "/download":
+            headers["User-Agent"] = "fleet-speedtest-authorized/1.0"
+        else:
+            headers["Range"] = f"bytes=0-{max_bytes - 1}"
         response = pinned_request(
             current_url,
-            headers={
-                "Accept-Encoding": "identity",
-                "Range": f"bytes=0-{PROBE_BYTES - 1}",
-                "User-Agent": "pumper-source-publisher/1",
-            },
-            max_bytes=PROBE_BYTES,
+            headers=headers,
+            max_bytes=max_bytes,
             timeout=max(0.1, timeout),
             resolver=resolver,
             connection_factory=connection_factory,
             deadline=deadline,
             cancel_event=cancel_event,
+            discard_body=True,
         )
         if response.status in {301, 302, 303, 307, 308}:
             location = response.headers.get("location", "")
@@ -334,7 +363,11 @@ def _probe_once(
             continue
         if response.status not in (200, 206):
             raise ValueError("unexpected HTTP status")
-        total = len(response.body)
+        content_type = response.headers.get("content-type", "").lower()
+        prefix = response.body.lstrip().lower()
+        if "text/html" in content_type or prefix.startswith((b"<!doctype html", b"<html", b"<?xml", b"{\"error\"")):
+            raise ValueError("probe response is an HTML or error document")
+        total = response.bytes_read
         if total < MIN_PROBE_BYTES:
             raise ValueError("probe response is shorter than 2 MiB")
         elapsed = max(time.monotonic() - started, 1e-9)
@@ -356,113 +389,156 @@ def _expand_speedtest_template(url: str) -> str:
 def probe_source(
     url: str,
     *,
-    timeout: float = 20,
+    timeout: float = 8,
     resolver: Resolver = resolve_public_ipv4,
     cancel_event: threading.Event | None = None,
     connection_factory: ConnectionFactory = _default_connection_factory,
     deadline: float | None = None,
+    rounds: int = 3,
+    min_successes: int = 2,
+    max_bytes: int = PROBE_BYTES,
 ) -> ProbeResult:
     cancellation = cancel_event or threading.Event()
     checked_at = datetime.now(timezone.utc)
-    absolute_deadline = deadline or (
-        time.monotonic() + min(25.0, max(0.1, timeout * 2))
-    )
+    absolute_deadline = deadline or (time.monotonic() + max(0.1, timeout) * rounds)
     speeds: list[float] = []
     total_bytes = 0
-    try:
-        for _ in range(2):
-            remaining = absolute_deadline - time.monotonic()
-            if remaining <= 0:
-                raise TimeoutError("probe deadline exceeded")
+    attempted = 0
+    errors: list[str] = []
+    for _ in range(rounds):
+        if cancellation.is_set() or time.monotonic() >= absolute_deadline:
+            break
+        attempted += 1
+        try:
             read, mbps = _probe_once(
-                _expand_speedtest_template(url),
-                min(timeout, remaining),
-                resolver,
-                cancellation,
-                connection_factory,
-                absolute_deadline,
+                _expand_speedtest_template(url), timeout, resolver, cancellation,
+                connection_factory, min(absolute_deadline, time.monotonic() + timeout),
+                max_bytes,
             )
             total_bytes += read
             speeds.append(mbps)
-        speed = float(statistics.median(speeds))
-        return ProbeResult(url, checked_at, round(speed, 3), total_bytes, True, "")
-    except (
-        OSError,
-        ValueError,
-        TimeoutError,
-        InterruptedError,
-        http.client.HTTPException,
-        ssl.SSLError,
-    ):
-        reason = "interrupted" if cancellation.is_set() else "probe failed"
-        return ProbeResult(url, checked_at, 0.0, total_bytes, False, reason)
+        except (OSError, ValueError, http.client.HTTPException, ssl.SSLError) as exc:
+            # Only fixed diagnostic messages are retained, never raw URL/error values.
+            if isinstance(exc, ValueError):
+                errors.append(str(exc))
+            else:
+                errors.append("request timeout or transport failure")
+    success = len(speeds) >= min_successes and not cancellation.is_set()
+    error = "" if success else (
+        "interrupted" if cancellation.is_set() else errors[-1] if errors else "probe deadline exceeded"
+    )
+    return ProbeResult(
+        url, checked_at, round(float(statistics.median(speeds)), 3) if success else 0.0,
+        total_bytes, success, error, len(speeds) / rounds,
+        round(min(speeds), 3) if speeds else 0.0, attempted, len(speeds),
+    )
+
+
+def rank_result(result: ProbeResult) -> tuple:
+    return (-result.success_rate, -(result.worst_mbps or result.probe_mbps), -result.probe_mbps, result.url)
 
 
 def probe_candidates(
     urls: Iterable[str],
     *,
-    timeout: float = 20,
+    timeout: float = 8,
     concurrency: int = 4,
     resolver: Resolver = resolve_public_ipv4,
     cancel_event: threading.Event | None = None,
     connection_factory: ConnectionFactory = _default_connection_factory,
     deadline: float | None = None,
+    engine_path: str | None = None,
 ) -> list[ProbeResult]:
+    """Screen every candidate, then measure up to 40 individually without contention."""
     candidates = list(urls)
     cancellation = cancel_event or threading.Event()
+    absolute_deadline = deadline or (time.monotonic() + 30 * 60)
     workers = min(MAX_WORKERS, max(1, concurrency))
-    absolute_deadline = deadline or (time.monotonic() + 25.0)
 
-    def run(url: str) -> ProbeResult:
+    def screen(url: str) -> ProbeResult:
         return probe_source(
-            url,
-            timeout=timeout,
-            resolver=resolver,
-            cancel_event=cancellation,
-            connection_factory=connection_factory,
-            deadline=absolute_deadline,
+            url, timeout=5, resolver=resolver, cancel_event=cancellation,
+            connection_factory=connection_factory, deadline=absolute_deadline,
+            rounds=2 if is_ookla_download(url) else 1,
+            min_successes=2 if is_ookla_download(url) else 1, max_bytes=SCREEN_BYTES,
         )
 
     pool = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="publisher-probe")
-    futures = {pool.submit(run, url): index for index, url in enumerate(candidates)}
+    futures = {pool.submit(screen, url): index for index, url in enumerate(candidates)}
     pending = set(futures)
-    results: list[ProbeResult | None] = [None] * len(candidates)
+    screened: dict[str, ProbeResult] = {}
     try:
-        while pending:
-            if cancellation.is_set() or time.monotonic() >= absolute_deadline:
-                break
-            completed, pending = wait(
-                pending,
-                timeout=min(0.05, max(0.0, absolute_deadline - time.monotonic())),
-                return_when=FIRST_COMPLETED,
-            )
+        while pending and not cancellation.is_set() and time.monotonic() < absolute_deadline:
+            completed, pending = wait(pending, timeout=0.05, return_when=FIRST_COMPLETED)
             for future in completed:
-                index = futures[future]
+                url = candidates[futures[future]]
                 try:
-                    results[index] = future.result()
+                    screened[url] = future.result()
                 except Exception:
-                    results[index] = ProbeResult(
-                        candidates[index],
-                        datetime.now(timezone.utc),
-                        0.0,
-                        0,
-                        False,
-                        "probe failed",
-                    )
+                    screened[url] = ProbeResult(url, datetime.now(timezone.utc), 0, 0, False, "screen failed")
     finally:
         for future in pending:
             future.cancel()
         pool.shutdown(wait=False, cancel_futures=True)
 
-    error = "interrupted" if cancellation.is_set() else "probe failed"
-    for index, result in enumerate(results):
-        if result is None:
-            results[index] = ProbeResult(
-                candidates[index],
-                datetime.now(timezone.utc),
-                0.0,
-                0,
-                False,
-                error,
+    shortlist: list[ProbeResult] = []
+    hosts: dict[str, int] = {}
+    for result in sorted((r for r in screened.values() if r.success), key=rank_result):
+        host = urlsplit(result.url).hostname or ""
+        if hosts.get(host, 0) >= 3:
+            continue
+        shortlist.append(result)
+        hosts[host] = hosts.get(host, 0) + 1
+        if len(shortlist) >= 40:
+            break
+    measured: dict[str, ProbeResult] = {}
+    for initial in shortlist:
+        if cancellation.is_set() or time.monotonic() >= absolute_deadline:
+            break
+        if engine_path:
+            from .benchmark import measure_engine
+            speeds, received, attempted = [], 0, 0
+            for _ in range(2):
+                attempted += 1
+                try:
+                    count, speed = measure_engine(initial.url, engine_path, absolute_deadline, cancellation)
+                    received += count
+                    speeds.append(speed)
+                except (OSError, ValueError, TimeoutError, InterruptedError):
+                    break
+            success = len(speeds) == 2 and not cancellation.is_set()
+            score = round(min(speeds), 3) if success else 0.0
+            measured[initial.url] = ProbeResult(
+                initial.url, datetime.now(timezone.utc), score, received, success,
+                "" if success else "sustained measurement failed", len(speeds) / 2,
+                score, attempted, len(speeds), "sustained",
             )
-    return [result for result in results if result is not None]
+        else:
+            measured[initial.url] = probe_source(
+                initial.url, timeout=min(timeout, 8), resolver=resolver,
+                cancel_event=cancellation, connection_factory=connection_factory,
+                deadline=absolute_deadline,
+            )
+    results: list[ProbeResult] = []
+    for url in candidates:
+        if url in measured:
+            result = measured[url]
+            initial = screened[url]
+            result = ProbeResult(
+                result.url, result.checked_at, result.probe_mbps,
+                result.bytes_read + initial.bytes_read, result.success, result.error,
+                result.success_rate, result.worst_mbps, result.attempts, result.successful_probes,
+                result.stage,
+            )
+        else:
+            initial = screened.get(url)
+            error = "interrupted" if cancellation.is_set() else (
+                initial.error if initial and not initial.success else "not shortlisted or publication deadline exceeded"
+            )
+            result = ProbeResult(url, datetime.now(timezone.utc), 0, initial.bytes_read if initial else 0, False, error)
+            result = ProbeResult(
+                result.url, result.checked_at, result.probe_mbps, result.bytes_read,
+                result.success, result.error, stage="screen" if initial and not initial.success else "shortlist",
+            )
+        results.append(result)
+    return results

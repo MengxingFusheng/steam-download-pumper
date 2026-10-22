@@ -1,0 +1,76 @@
+services:
+  dashboard:
+    build:
+      context: .
+      dockerfile: Dockerfile.dashboard
+    image: ${DASHBOARD_IMAGE:-fleet-dashboard:local}
+    restart: unless-stopped
+    init: true
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    cpus: 2
+    mem_limit: 1g
+    pids_limit: 128
+    tmpfs:
+      - /tmp:size=32m,noexec,nosuid,nodev
+    environment:
+      TZ: Asia/Shanghai
+      DASHBOARD_DB: /data/dashboard.sqlite3
+      DASHBOARD_ADMIN_USER: ${DASHBOARD_ADMIN_USER:-admin}
+      DASHBOARD_ADMIN_PASSWORD_HASH_FILE: /run/secrets/admin_password_hash
+      DASHBOARD_ENROLLMENT_TOKEN_FILE: /run/secrets/enrollment_token
+      DASHBOARD_READ_TOKEN_FILE: /run/secrets/read_token
+    volumes:
+      - dashboard_data:/data
+    secrets:
+      - admin_password_hash
+      - enrollment_token
+      - read_token
+    networks: [dashboard_backend]
+    healthcheck:
+      test: [CMD, python3, -c, "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/healthz', timeout=3)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: '3'
+  gateway:
+    image: caddy:2.10.2-alpine
+    restart: unless-stopped
+    depends_on:
+      dashboard:
+        condition: service_healthy
+    ports:
+      - '80:80'
+      - '443:443'
+    environment:
+      DASHBOARD_DOMAIN: ${DASHBOARD_DOMAIN:?Set DASHBOARD_DOMAIN}
+    volumes:
+      - ./deploy/dashboard.Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    networks: [dashboard_backend]
+    security_opt: [no-new-privileges:true]
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: '3'
+networks:
+  dashboard_backend:
+    driver: bridge
+volumes:
+  dashboard_data:
+  caddy_data:
+  caddy_config:
+secrets:
+  admin_password_hash:
+    file: ./dashboard-secrets/admin_password_hash
+  enrollment_token:
+    file: ./dashboard-secrets/enrollment_token
+  read_token:
+    file: ./dashboard-secrets/read_token

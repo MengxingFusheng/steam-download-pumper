@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import math
 import os
 import re
@@ -16,6 +17,8 @@ from urllib.parse import urlparse
 
 TIME_RE = re.compile(r"^\d{2}:\d{2}$")
 MAX_CONNECTIONS_PER_LINE = 12
+FLEET_LEGACY_FIELDS = frozenset({"per_line_mbps", "line_minimum_mbps"})
+logger = logging.getLogger(__name__)
 
 
 def default_source_pool() -> list[str]:
@@ -157,25 +160,28 @@ class FleetConfig(CommonConfig):
     source_pool: list[str] = field(default_factory=default_speedtest_source_pool)
     rolling_days: int = 15
     target_ratio: float = 2.0
-    per_line_mbps: int = 200
     rotation_minutes: int = 30
     snmp_poll_seconds: int = 60
     engine_status_seconds: int = 5
     scheduler_tick_seconds: int = 60
     upload_ceiling_mbps: int = 50
-    download_ceiling_mbps: int = 500
+    download_ceiling_mbps: int = 1_000
     snmp_direction_swap: bool = False
     line_stall_seconds: int = 90
     line_slow_window_seconds: int = 180
-    line_minimum_mbps: int = 50
     line_failure_cooldown_minutes: int = 30
+    daily_mode_enabled: bool = True
+    router_snmp_interface: str = "wan1"
+    router_limit_mbps: int = 5_000
+    router_reserve_mbps: int = 200
+    late_download_limit_mbps: int = 2_000
+    wan_stale_seconds: int = 120
     topology: str = field(init=False, default="fleet")
 
     def validate(self) -> FleetConfig:
         self.validate_common()
         _require_int("rolling_days", self.rolling_days)
         _require_finite_number("target_ratio", self.target_ratio)
-        _require_int("per_line_mbps", self.per_line_mbps)
         _require_int("rotation_minutes", self.rotation_minutes)
         _require_int("snmp_poll_seconds", self.snmp_poll_seconds)
         _require_int("engine_status_seconds", self.engine_status_seconds)
@@ -185,14 +191,27 @@ class FleetConfig(CommonConfig):
         _require_bool("snmp_direction_swap", self.snmp_direction_swap)
         _require_int("line_stall_seconds", self.line_stall_seconds)
         _require_int("line_slow_window_seconds", self.line_slow_window_seconds)
-        _require_int("line_minimum_mbps", self.line_minimum_mbps)
         _require_int("line_failure_cooldown_minutes", self.line_failure_cooldown_minutes)
+        _require_bool("daily_mode_enabled", self.daily_mode_enabled)
+        if not self.daily_mode_enabled:
+            raise ValueError("daily_mode_enabled cannot be disabled; Fleet uses daily scheduling")
+        _require_string("router_snmp_interface", self.router_snmp_interface)
+        for name in ("router_limit_mbps", "router_reserve_mbps", "late_download_limit_mbps", "wan_stale_seconds"):
+            _require_int(name, getattr(self, name))
+        if not self.router_snmp_interface.strip():
+            raise ValueError("router_snmp_interface must not be empty")
+        if not 1 <= self.router_limit_mbps <= 5_000:
+            raise ValueError("router_limit_mbps must be between 1 and 5000")
+        if not 0 <= self.router_reserve_mbps < self.router_limit_mbps:
+            raise ValueError("router_reserve_mbps must be below router_limit_mbps")
+        if not 1 <= self.late_download_limit_mbps <= 2_000:
+            raise ValueError("late_download_limit_mbps must be between 1 and 2000")
+        if not 60 <= self.wan_stale_seconds <= 120:
+            raise ValueError("wan_stale_seconds must be between 60 and 120")
         if not 1 <= self.rolling_days <= 31:
             raise ValueError("rolling_days must be between 1 and 31")
         if not 1.0 <= self.target_ratio <= 10.0:
             raise ValueError("target_ratio must be between 1 and 10")
-        if not 1 <= self.per_line_mbps <= 1_000:
-            raise ValueError("per_line_mbps must be between 1 and 1000")
         if not 1 <= self.rotation_minutes <= 240:
             raise ValueError("rotation_minutes must be between 1 and 240")
         if not 15 <= self.snmp_poll_seconds <= 900:
@@ -209,8 +228,6 @@ class FleetConfig(CommonConfig):
             raise ValueError("line_stall_seconds must be between 30 and 900")
         if not self.line_stall_seconds <= self.line_slow_window_seconds <= 1_800:
             raise ValueError("line_slow_window_seconds must be between line_stall_seconds and 1800")
-        if not 1 <= self.line_minimum_mbps <= self.per_line_mbps:
-            raise ValueError("line_minimum_mbps must be between 1 and per_line_mbps")
         if not 1 <= self.line_failure_cooldown_minutes <= 1_440:
             raise ValueError("line_failure_cooldown_minutes must be between 1 and 1440")
         return self
@@ -315,7 +332,6 @@ TOPOLOGY_ENV_MAP = {
     "fleet": {
         "ROLLING_DAYS": ("rolling_days", int),
         "TARGET_RATIO": ("target_ratio", float),
-        "PER_LINE_MBPS": ("per_line_mbps", int),
         "ROTATION_MINUTES": ("rotation_minutes", int),
         "SNMP_POLL_SECONDS": ("snmp_poll_seconds", int),
         "ENGINE_STATUS_SECONDS": ("engine_status_seconds", int),
@@ -325,8 +341,13 @@ TOPOLOGY_ENV_MAP = {
         "SNMP_DIRECTION_SWAP": ("snmp_direction_swap", _parse_bool),
         "LINE_STALL_SECONDS": ("line_stall_seconds", int),
         "LINE_SLOW_WINDOW_SECONDS": ("line_slow_window_seconds", int),
-        "LINE_MINIMUM_MBPS": ("line_minimum_mbps", int),
         "LINE_FAILURE_COOLDOWN_MINUTES": ("line_failure_cooldown_minutes", int),
+        "DAILY_MODE_ENABLED": ("daily_mode_enabled", _parse_bool),
+        "ROUTER_SNMP_INTERFACE": ("router_snmp_interface", str),
+        "ROUTER_LIMIT_MBPS": ("router_limit_mbps", int),
+        "ROUTER_RESERVE_MBPS": ("router_reserve_mbps", int),
+        "LATE_DOWNLOAD_LIMIT_MBPS": ("late_download_limit_mbps", int),
+        "WAN_STALE_SECONDS": ("wan_stale_seconds", int),
     },
 }
 
@@ -360,10 +381,13 @@ def load_config(
             raise ValueError("persisted config must be a JSON object")
         data.update(_validated_saved_data(topology_name, config_type, saved))
 
+    if topology_name == "fleet" and data.get("daily_mode_enabled") is False:
+        logger.warning("Migrating Fleet legacy scheduling configuration to daily scheduling")
+        data["daily_mode_enabled"] = True
     return config_type(**data).validate()
 
 
-def save_config(path: str | Path, cfg: IkuaiLineConfig | MultiIPConfig) -> None:
+def save_config(path: str | Path, cfg: CommonConfig) -> None:
     config_path = Path(path)
     config_path.parent.mkdir(parents=True, exist_ok=True)
     data = cfg.validate().to_dict()
@@ -429,6 +453,11 @@ def _validated_saved_data(
         raise ValueError(
             f"persisted topology {persisted_topology!r} does not match requested topology {topology_name!r}"
         )
+
+    if topology_name == "fleet":
+        for key in sorted(FLEET_LEGACY_FIELDS & validated.keys()):
+            validated.pop(key)
+            logger.warning("Ignoring removed Fleet scheduling field: %s", key)
 
     allowed = {name for name, config_field in config_type.__dataclass_fields__.items() if config_field.init}
     for key in validated:

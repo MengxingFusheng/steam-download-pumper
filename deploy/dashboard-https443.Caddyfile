@@ -1,0 +1,26 @@
+{
+    default_sni {$DASHBOARD_IP}
+    auto_https off
+}
+
+:443 {
+    tls /etc/letsencrypt/live/{$DASHBOARD_IP}/fullchain.pem /etc/letsencrypt/live/{$DASHBOARD_IP}/privkey.pem
+    encode gzip
+    header Strict-Transport-Security "max-age=31536000"
+    reverse_proxy jusha:3000
+}
+
+:3000 {
+    tls /etc/letsencrypt/live/{$DASHBOARD_IP}/fullchain.pem /etc/letsencrypt/live/{$DASHBOARD_IP}/privkey.pem
+    header Strict-Transport-Security "max-age=31536000"
+    redir https://{$DASHBOARD_IP}{uri} 308
+}
+
+:8443 {
+    tls /etc/letsencrypt/live/{$DASHBOARD_IP}/fullchain.pem /etc/letsencrypt/live/{$DASHBOARD_IP}/privkey.pem
+    encode gzip
+    header Strict-Transport-Security "max-age=31536000"
+    @web path / /assets/*
+    redir @web https://{$DASHBOARD_IP}/#/fleet 302
+    reverse_proxy dashboard:8080
+}

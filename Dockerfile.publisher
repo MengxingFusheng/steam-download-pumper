@@ -5,8 +5,10 @@ ARG TARGETARCH
 WORKDIR /src
 COPY go.mod ./
 COPY cmd/manifestctl ./cmd/manifestctl
+COPY cmd/discarder ./cmd/discarder
 RUN CGO_ENABLED=0 GOOS=linux GOARCH="${TARGETARCH}" \
-    go build -trimpath -ldflags="-s -w" -o /out/manifestctl ./cmd/manifestctl
+    go build -trimpath -ldflags="-s -w" -o /out/manifestctl ./cmd/manifestctl \
+    && CGO_ENABLED=0 GOOS=linux GOARCH="${TARGETARCH}" go build -trimpath -ldflags="-s -w" -o /out/discarder ./cmd/discarder
 
 FROM debian:bookworm-slim AS ossutil-downloader
 ARG TARGETARCH
@@ -28,7 +30,8 @@ RUN case "${TARGETARCH}" in \
 FROM python:3.13-slim
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
-    TZ=Asia/Shanghai
+    TZ=Asia/Shanghai \
+    GOMAXPROCS=2
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates tzdata \
     && rm -rf /var/lib/apt/lists/* \
@@ -37,6 +40,7 @@ RUN apt-get update \
     && install -d -o 10001 -g 10001 -m 0700 /state \
     && install -d -o 10001 -g 10001 -m 0755 /app
 COPY --from=manifest-builder /out/manifestctl /usr/local/bin/manifestctl
+COPY --from=manifest-builder /out/discarder /usr/local/bin/discarder
 COPY --from=ossutil-downloader /out-ossutil /usr/local/bin/ossutil
 COPY --chown=10001:10001 source_publisher /app/source_publisher
 COPY --chown=10001:10001 bin/publisher /usr/local/bin/publisher

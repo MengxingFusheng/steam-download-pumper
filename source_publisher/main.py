@@ -47,6 +47,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "status": "valid",
                 "revision": result.revision,
                 "healthy_sources": result.source_count,
+                "diagnostics": result.diagnostics,
             }, separators=(",", ":")))
             return int(ExitCode.OK)
 
@@ -64,11 +65,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         service = PublicationService(config, secrets)
         with exclusive_lock(config.state_dir / "publish.lock"):
             if args.command == "publish-once":
-                result = service.run(datetime.now(config.timezone))
+                result = service.run(datetime.now(config.timezone), force_republish=True)
                 print(json.dumps({
                     "status": "published",
                     "revision": result.revision,
                     "healthy_sources": result.source_count,
+                    "diagnostics": result.diagnostics,
                 }, separators=(",", ":")))
                 return int(ExitCode.OK)
 

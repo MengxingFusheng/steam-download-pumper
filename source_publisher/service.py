@@ -1,20 +1,27 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import tempfile
 import threading
 import time
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Callable
+from functools import partial
+from urllib.parse import urlsplit
+from collections import Counter
 
-from .candidates import load_candidates
+from .discovery import collect_candidates
+from .dns import DoHResolver
+from .candidates import resolve_public_ipv4
 from .config import PublisherConfig, PublisherSecrets
 from .manifest import build_payload, sign_payload, verify_envelope_with_private_key
 from .oss import OSSClient, OSSFailure, OSSNotFound
-from .probe import ProbeResult, probe_candidates
+from .probe import ProbeResult, pinned_request, probe_candidates, rank_result
+from .ookla import is_ookla_download
 
 
 class InsufficientSources(RuntimeError):
@@ -45,6 +52,7 @@ class PublicationResult:
     source_count: int
     payload: bytes
     envelope: bytes | None
+    diagnostics: dict[str, object] | None = None
 
 
 def atomic_write(path: Path, data: bytes, mode: int = 0o600) -> None:
@@ -108,6 +116,7 @@ class PublicationService:
         self.probe_fn = probe_fn
         self.sign_fn = sign_fn
         self.verify_fn = verify_fn
+        self.last_diagnostics: dict[str, object] = {}
 
     def run(
         self,
@@ -116,12 +125,18 @@ class PublicationService:
         validate_only: bool = False,
         cancel_event: threading.Event | None = None,
         deadline: float | None = None,
+        force_republish: bool = False,
     ) -> PublicationResult:
+        run_started = time.monotonic()
+
+        def completion_time() -> datetime:
+            return now + timedelta(seconds=max(0.0, time.monotonic() - run_started))
+
         cancellation = cancel_event or threading.Event()
         absolute_deadline = (
             deadline
             if deadline is not None
-            else time.monotonic() + PUBLICATION_TIMEOUT_SECONDS
+            else run_started + PUBLICATION_TIMEOUT_SECONDS
         )
         _ensure_active(cancellation, absolute_deadline)
         state_path = self.config.state_dir / "state.json"
@@ -145,38 +160,89 @@ class PublicationService:
                 remote_generated = datetime.fromisoformat(
                     json.loads(recovered.payload)["generated_at"]
                 )
-                if remote_generated.astimezone(self.config.timezone).date() == now.astimezone(
+                if not force_republish and remote_generated.astimezone(self.config.timezone).date() == now.astimezone(
                     self.config.timezone
                 ).date():
-                    self._write_success_state(state_path, now, recovered)
+                    self._write_success_state(state_path, completion_time(), recovered)
                     return recovered
 
-        urls = load_candidates(self.config.candidates_path)
-        probe_deadline = min(absolute_deadline, time.monotonic() + 25.0)
+        started = time.monotonic()
+        resolver = DoHResolver(self.config.doh_url, cancel_event=cancellation, deadline=absolute_deadline) if self.config.doh_url else resolve_public_ipv4
+        accepted_urls = [item["url"] for item in json.loads(recovered.payload)["sources"]] if recovered else []
+        discovered = collect_candidates(
+            self.config.candidates_path, self.config.state_dir,
+            accepted_urls=accepted_urls, enabled=self.config.discovery_enabled,
+            ookla_enabled=self.config.ookla_discovery_enabled,
+            ookla_search_terms=self.config.ookla_search_terms,
+            deadline=absolute_deadline, cancel_event=cancellation,
+            request_fn=partial(pinned_request, resolver=resolver),
+        )
         results = self.probe_fn(
-            urls,
+            discovered.urls,
             timeout=self.config.probe_timeout_seconds,
             concurrency=self.config.probe_concurrency,
             cancel_event=cancellation,
-            deadline=probe_deadline,
+            deadline=absolute_deadline,
+            resolver=resolver,
+            engine_path=self.config.discarder_path,
         )
         _ensure_active(cancellation, absolute_deadline)
-        healthy = [
+        eligible = [
             result for result in results
-            if result.success and result.probe_mbps >= self.config.min_probe_mbps
+            if result.success and math.isfinite(result.probe_mbps) and result.probe_mbps >= 0
+            and result.probe_mbps >= self.config.min_probe_mbps
         ]
+        healthy: list[ProbeResult] = []
+        hosts: Counter[str] = Counter()
+        # Give every host its fastest measured endpoint before adding redundancy.
+        ranked = sorted(eligible, key=rank_result)
+        best_hosts: set[str] = set()
+        first, additional = [], []
+        for result in ranked:
+            host = urlsplit(result.url).hostname or ""
+            (additional if host in best_hosts else first).append(result)
+            best_hosts.add(host)
+        for result in [*first, *additional]:
+            host = urlsplit(result.url).hostname or ""
+            if hosts[host] >= 2 or any(item.url == result.url for item in healthy):
+                continue
+            hosts[host] += 1
+            healthy.append(result)
+            if len(healthy) >= self.config.max_healthy_sources:
+                break
+        diagnostics = {
+            **discovered.diagnostics,
+            "eligible_count": len(eligible), "published_count": len(healthy),
+            "ookla_published_count": sum(is_ookla_download(result.url) for result in healthy),
+            "host_count": len(hosts), "quantity_target_met": len(healthy) >= 12 and len(hosts) >= 8,
+            "redundancy_degraded": len(hosts) < 3,
+            "bytes_read": sum(result.bytes_read for result in results),
+            "elapsed_seconds": round(time.monotonic() - started, 3),
+            "failures": dict(Counter(result.error for result in results if not result.success)),
+            "stage_failures": dict(Counter(result.stage + ": " + result.error for result in results if not result.success)),
+            "low_speed_count": sum(result.success and result.probe_mbps < self.config.min_probe_mbps for result in results),
+        }
+        self.last_diagnostics = diagnostics
+        atomic_write(self.config.state_dir / "last-probes.json", json.dumps({
+            "attempted_at": now.isoformat(timespec="seconds"), **diagnostics,
+            "sources": [{"url": r.url, "success": r.success, "probe_mbps": r.probe_mbps,
+                         "worst_mbps": r.worst_mbps, "success_rate": r.success_rate,
+                         "bytes_read": r.bytes_read, "error": r.error, "stage": r.stage,
+                         "attempts": r.attempts, "successful_probes": r.successful_probes} for r in results],
+        }, separators=(",", ":")).encode())
         if len(healthy) < self.config.min_healthy_sources:
             raise InsufficientSources("fewer than the required healthy sources")
         if recovered is not None:
             previous_revision = max(previous_revision, recovered.revision)
         payload, revision = build_payload(
             healthy,
-            now,
+            completion_time(),
             max_sources=self.config.max_healthy_sources,
             previous_revision=previous_revision,
+            preserve_order=True,
         )
         if validate_only:
-            return PublicationResult(revision, len(healthy), payload, None)
+            return PublicationResult(revision, len(json.loads(payload)["sources"]), payload, None, diagnostics)
         assert private_key_path is not None
         assert client is not None
         envelope = self.sign_fn(
@@ -264,9 +330,9 @@ class PublicationService:
             cancellation,
         )
 
-        result = PublicationResult(revision, len(healthy), payload, envelope)
+        result = PublicationResult(revision, len(json.loads(payload)["sources"]), payload, envelope, diagnostics)
         _ensure_active(cancellation, absolute_deadline)
-        self._write_success_state(state_path, now, result)
+        self._write_success_state(state_path, completion_time(), result)
         return result
 
     def _write_success_state(
@@ -280,6 +346,7 @@ class PublicationService:
             "last_error": "",
             "consecutive_failures": 0,
             "next_retry_at": "",
+            "diagnostics": result.diagnostics or {},
         }
         atomic_write(
             state_path,

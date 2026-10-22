@@ -30,7 +30,7 @@ class PublisherImageTests(unittest.TestCase):
 
     def test_repository_has_the_supported_dockerfiles(self):
         self.assertEqual(sorted(path.name for path in ROOT.glob("Dockerfile*")), [
-            "Dockerfile.fleet", "Dockerfile.ikuai-line", "Dockerfile.multi-ip", "Dockerfile.publisher"
+            "Dockerfile.dashboard", "Dockerfile.fleet", "Dockerfile.ikuai-line", "Dockerfile.multi-ip", "Dockerfile.publisher"
         ])
 
 

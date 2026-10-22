@@ -235,7 +235,7 @@ class FleetScheduleTests(unittest.TestCase):
             self.assertEqual(metrics["rolling_debt_bytes"], 50)
             self.assertAlmostEqual(metrics["rolling_ratio"], 1.5)
             self.assertAlmostEqual(metrics["rolling_ratio_progress_percent"], 75.0)
-            self.assertGreater(metrics["target_percent"], 0)
+            self.assertEqual(metrics["target_percent"], 0)
             controller.shutdown()
 
     def test_local_source_status_reports_the_effective_pool(self):
@@ -260,25 +260,23 @@ class FleetScheduleTests(unittest.TestCase):
         from steam_pumper.config import FleetConfig
         from steam_pumper.fleet import FleetController
 
-        class FakeEngine:
-            def __init__(self):
-                self.applied = []
-
-            def set_sources(self, sources):
-                self.applied.append(list(sources))
-
-            def stop(self):
-                pass
+        from steam_pumper.engine import EngineProcess
+        from steam_pumper.topology import LogicalLine
 
         with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {"APPLY_LAN_IPS": "0"}, clear=False):
             controller = FleetController(Path(directory) / "config.json", FleetConfig().validate(), snmp_reader=None)
-            engine = FakeEngine()
-            controller.active["a1"] = SimpleNamespace(engine=engine)
+            engine = EngineProcess(controller.cfg, LogicalLine("a1", 200), controller.effective_source_pool,
+                                   controller.log, sources_file=Path(directory) / "a1.sources.json",
+                                   source_generation=controller.source_generation)
+            from steam_pumper.fleet import ActiveLine, FleetAccount
+            controller.active["a1"] = ActiveLine(FleetAccount("a1", "127.0.0.1", "a1", weight=1), engine, datetime.now(ZoneInfo("Asia/Shanghai")))
             sources = ["https://example.net/speedtest/random4000x4000.jpg"]
             controller.update_config({"source_pool": sources})
+            controller._advance_source_update(0)
             self.assertEqual(controller.effective_source_pool, sources)
             self.assertEqual(controller.effective_source_origin, "local-config")
-            self.assertEqual(engine.applied, [sources])
+            self.assertEqual(engine.sources, sources)
+            self.assertEqual(controller.source_list_status()["apply_state"], "applied")
             controller.shutdown()
 
     def test_empty_bootstrap_inventory_waits_for_web_import(self):
@@ -342,34 +340,51 @@ class FleetScheduleTests(unittest.TestCase):
             self.assertIn("collection will retry", controller.logs[-1])
             controller.shutdown()
 
-    def test_schedule_uses_ten_twenty_ten_base_slots(self):
+    @staticmethod
+    def ready_for_schedule(controller, now):
+        controller.manual_enabled = True
+        controller.snmp_quality = {account.account_id: "ok" for account in controller.store.accounts()}
+        controller.wan_budget.valid_at = now
+        controller.wan_budget.status = "ok"
+        controller.wan_budget.down_mbps = 0
+
+    def test_daily_schedule_uses_budget_across_daytime_and_late_windows(self):
         from steam_pumper.config import FleetConfig
         from steam_pumper.fleet import FleetController, parse_accounts_csv
 
-        with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {"APPLY_LAN_IPS": "0"}, clear=False):
+        accounts = "account_id,bind_ip,snmp_interface,weight\n" + "".join(
+            f"a{i},192.168.2.{i+10},pppoe-a{i},1\n" for i in range(25))
+        with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {"APPLY_LAN_IPS": "0"}):
             controller = FleetController(Path(directory) / "config.json", FleetConfig().validate(), snmp_reader=None)
-            controller.store.import_accounts(parse_accounts_csv("account_id,bind_ip,snmp_interface\na1,192.168.1.10,pppoe-a1\n"))
-            account = controller.store.accounts()
+            controller.store.import_accounts(parse_accounts_csv(accounts))
             zone = ZoneInfo("Asia/Shanghai")
-            self.assertEqual(controller._desired_count(datetime(2026, 8, 1, 0, 30, tzinfo=zone), account), 10)
-            self.assertEqual(controller._desired_count(datetime(2026, 8, 1, 2, 0, tzinfo=zone), account), 20)
-            self.assertEqual(controller._desired_count(datetime(2026, 8, 1, 12, 0, tzinfo=zone), account), 10)
-            self.assertEqual(controller._desired_count(datetime(2026, 8, 1, 17, 59, 59, tzinfo=zone), account), 10)
-            self.assertEqual(controller._desired_count(datetime(2026, 8, 1, 18, 0, tzinfo=zone), account), 0)
-            self.assertEqual(controller._desired_count(datetime(2026, 8, 1, 23, 59, 59, tzinfo=zone), account), 0)
+            for hour, minute, expected, phase in [(0,30,20,"daytime"),(2,0,20,"daytime"),
+                    (12,0,20,"daytime"),(17,59,20,"daytime"),(18,0,0,"upload_only"),
+                    (22,59,0,"upload_only"),(23,0,10,"late_makeup")]:
+                now = datetime(2026, 8, 1, hour, minute, tzinfo=zone)
+                self.ready_for_schedule(controller, now)
+                with self.subTest(hour=hour, minute=minute), patch.object(controller, "_start") as start:
+                    controller._schedule(now)
+                    self.assertEqual(start.call_count, expected)
+                    self.assertEqual(controller._daily_phase(now), phase)
+                    self.assertLessEqual(sum(controller.daily_allocation.values()), 4000 if hour < 18 else 2000)
             controller.shutdown()
 
-    def test_evening_window_never_downloads_even_when_accounts_have_debt(self):
+    def test_upload_only_window_never_downloads_even_when_accounts_have_debt(self):
         from steam_pumper.config import FleetConfig
         from steam_pumper.fleet import FleetController, parse_accounts_csv
 
         zone = ZoneInfo("Asia/Shanghai")
         now = datetime(2026, 8, 1, 20, 0, tzinfo=zone)
-        with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {"APPLY_LAN_IPS": "0"}, clear=False):
+        with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {"APPLY_LAN_IPS": "0"}):
             controller = FleetController(Path(directory) / "config.json", FleetConfig().validate(), snmp_reader=None)
-            controller.store.import_accounts(parse_accounts_csv("account_id,bind_ip,snmp_interface\na1,192.168.2.11,pppoe-a1\n"))
-            with patch.object(controller.store, "rolling", side_effect=AssertionError("evening must not calculate debt")):
-                self.assertEqual(controller._desired_count(now, controller.store.accounts()), 0)
+            controller.store.import_accounts(parse_accounts_csv("account_id,bind_ip,snmp_interface,weight\na1,192.168.2.11,pppoe-a1,1\n"))
+            self.ready_for_schedule(controller, now)
+            with patch.object(controller, "_start") as start:
+                controller._schedule(now)
+                start.assert_not_called()
+            self.assertEqual(controller.daily_allocation, {})
+            self.assertGreater(controller.store.daily_forecasts(now)["a1"]["remaining_download_bytes"], 0)
             controller.shutdown()
 
     def test_unusable_snmp_account_is_removed_from_candidates(self):
@@ -379,18 +394,18 @@ class FleetScheduleTests(unittest.TestCase):
         zone = ZoneInfo("Asia/Shanghai")
         now = datetime(2026, 8, 1, 12, 0, tzinfo=zone)
         csv_text = (
-            "account_id,bind_ip,snmp_interface\n"
-            "a1,192.168.2.11,pppoe-a1\n"
-            "a2,192.168.2.12,pppoe-a2\n"
+            "account_id,bind_ip,snmp_interface,weight\n"
+            "a1,192.168.2.11,pppoe-a1,1\n"
+            "a2,192.168.2.12,pppoe-a2,1\n"
         )
         with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {"APPLY_LAN_IPS": "0"}, clear=False):
             controller = FleetController(Path(directory) / "config.json", FleetConfig().validate(), snmp_reader=None)
             controller.store.import_accounts(parse_accounts_csv(csv_text))
-            controller.manual_enabled = True
+            self.ready_for_schedule(controller, now)
             for unusable in ("offline", "missing", "ambiguous"):
                 controller.snmp_quality = {"a1": unusable, "a2": "ok"}
                 started = []
-                with patch.object(controller, "_start", side_effect=lambda account, _now: started.append(account.account_id)):
+                with patch.object(controller, "_start", side_effect=lambda account, _now, _rate: started.append(account.account_id)):
                     controller._schedule(now)
                 self.assertEqual(started, ["a2"])
             controller.shutdown()
@@ -415,16 +430,16 @@ class FleetScheduleTests(unittest.TestCase):
         started = datetime(2026, 8, 1, 12, 0, tzinfo=zone)
         now = started + timedelta(seconds=91)
         csv_text = (
-            "account_id,bind_ip,snmp_interface\n"
-            "a1,192.168.2.11,pppoe-a1\n"
-            "a2,192.168.2.12,pppoe-a2\n"
+            "account_id,bind_ip,snmp_interface,weight\n"
+            "a1,192.168.2.11,pppoe-a1,1\n"
+            "a2,192.168.2.12,pppoe-a2,1\n"
         )
         with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {"APPLY_LAN_IPS": "0"}, clear=False):
             controller = FleetController(Path(directory) / "config.json", FleetConfig().validate(), snmp_reader=None)
             controller.store.import_accounts(parse_accounts_csv(csv_text))
             first = controller.store.accounts()[0]
             engine = FakeEngine()
-            controller.active[first.account_id] = ActiveLine(first, engine, started, last_progress_at=started)
+            controller.active[first.account_id] = ActiveLine(first, engine, started, last_progress_at=started, assigned_mbps=200)
 
             self.assertTrue(controller._poll_engines(now))
             self.assertNotIn("a1", controller.active)
@@ -432,13 +447,13 @@ class FleetScheduleTests(unittest.TestCase):
             self.assertGreater(controller.account_cooldowns["a1"], now)
 
             started_accounts = []
-            controller.manual_enabled = True
-            with patch.object(controller, "_start", side_effect=lambda account, _now: started_accounts.append(account.account_id)):
+            self.ready_for_schedule(controller, now)
+            with patch.object(controller, "_start", side_effect=lambda account, _now, _rate: started_accounts.append(account.account_id)):
                 controller._schedule(now)
             self.assertEqual(started_accounts, ["a2"])
             controller.shutdown()
 
-    def test_sustained_slow_line_is_unhealthy_even_when_it_makes_progress(self):
+    def test_sustained_slow_line_keeps_running_while_sources_recover(self):
         from collections import deque
 
         from steam_pumper.config import FleetConfig
@@ -449,14 +464,28 @@ class FleetScheduleTests(unittest.TestCase):
         now = started + timedelta(seconds=180)
         active = ActiveLine(
             FleetAccount("a1", "192.168.2.11", "pppoe-a1"),
-            SimpleNamespace(),
+            SimpleNamespace(
+                state=SimpleNamespace(total_bytes=100_000_000, status="downloading", connections=12),
+                poll=lambda: None,
+            ),
             started,
+            assigned_mbps=200,
             last_bytes=100_000_000,
             last_progress_at=now,
             rate_samples=deque([(started, 0), (now, 100_000_000)], maxlen=400),
         )
         with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {"APPLY_LAN_IPS": "0"}, clear=False):
             controller = FleetController(Path(directory) / "config.json", FleetConfig().validate(), snmp_reader=None)
-            reason = controller._line_health_failure(active, now)
-            self.assertIn("below 50Mbps", reason)
+            controller.active["a1"] = active
+            with patch.object(controller, "log") as log:
+                self.assertFalse(controller._poll_engines(now))
+                self.assertIs(controller.active["a1"], active)
+                self.assertNotIn("a1", controller.account_cooldowns)
+                self.assertEqual(active.engine.state.status, "downloading")
+                self.assertIn("automatic source recovery", log.call_args[0][0])
+                controller._poll_engines(now + timedelta(seconds=5))
+                self.assertEqual(log.call_count, 1)
+                # A subsequent complete stall must still trigger protection.
+                self.assertIn("no download progress", controller._line_health_failure(active, now + timedelta(seconds=91)))
+            controller.active.clear()
             controller.shutdown()

@@ -1,0 +1,15 @@
+# Optional overlay: use with docker-compose.fleet.yml and the same .env.fleet.
+services:
+  fleet-pumper:
+    environment:
+      DASHBOARD_URL: ${DASHBOARD_URL:-}
+      DASHBOARD_NODE_ID: ${DASHBOARD_NODE_ID:-}
+      DASHBOARD_COMPONENT_ID: ${DASHBOARD_COMPONENT_ID:-}
+      DASHBOARD_NODE_NAME: ${DASHBOARD_NODE_NAME:?Set unique descriptive node name}
+      DASHBOARD_EXTERNAL_NODE_ID: ${DASHBOARD_EXTERNAL_NODE_ID:-}
+      DASHBOARD_ENROLLMENT_TOKEN_FILE: /run/secrets/dashboard_enrollment_token
+    secrets:
+      - dashboard_enrollment_token
+secrets:
+  dashboard_enrollment_token:
+    file: ./fleet-secrets/dashboard_enrollment_token

@@ -1,0 +1,3 @@
+account_id,bind_ip,snmp_interface,enabled,weight,group_id
+pppoe-001,192.168.2.11,pppoe-wan001,true,1,standard
+pppoe-002,192.168.2.12,pppoe-wan002,true,10,symmetric500
